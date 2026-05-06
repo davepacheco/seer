@@ -200,6 +200,10 @@ Rules of the layer line:
 - Neither `engine` nor `storage` knows about ratatui.
 - When these stop being true, that's the signal to extract crates.
 
+All files should have the 3-line MPL-2.0 header.
+
+Most Rust files should have a Rustdoc comment for the file.
+
 ## Risks called out by Claude
 
 - **Render performance.**  ratatui re-renders every frame; only build line widgets for visible rows.  Compute the visible window from the cursor, do not materialize all lines.
