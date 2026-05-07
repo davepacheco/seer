@@ -17,8 +17,9 @@
 //!
 //! Tokens are split with [`shlex`], so values containing spaces can be
 //! double-quoted.  Each token is one predicate; the supported operators
-//! are `>=` (level only), `==` and `=` (equality), and `=~` (regex,
-//! today only on `msg`).  Level names are case-insensitive.
+//! are `>=` (level only), `==` and `=` (equality), `!=` (negated
+//! equality), `=~` (regex, today only on `msg`), and `!~` (negated
+//! regex, msg only).  Level names are case-insensitive.
 //!
 //! Both [`Filter`] and [`Predicate`] are also `serde`-serializable so
 //! they can ride along in a persisted session; the regex's source string
@@ -52,30 +53,55 @@ impl Filter {
 }
 
 /// A single predicate over an [`Event`].
+///
+/// The equality and regex variants carry a `negated` flag so that
+/// `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`)
+/// are the same variant differing only in polarity.  `LevelAtLeast` has
+/// no useful negation (the user can write `level>=` at the threshold
+/// they want), so it is left as a single variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Predicate {
     /// `event.level >= threshold`
     LevelAtLeast(Level),
-    /// `event.level == level`
-    LevelEquals(Level),
-    /// Named field has the given exact-string value.
+    /// `event.level == level` (or `!=` when `negated`)
+    LevelEquals {
+        level: Level,
+        #[serde(default)]
+        negated: bool,
+    },
+    /// Named field has (or, when `negated`, does not have) the given
+    /// exact-string value.
     ///
     /// Matches the bunyan core fields (`name`, `hostname`, `pid`, `msg`)
     /// or any key in `event.extra`.
-    FieldEquals { name: String, value: String },
-    /// `event.msg` matches the regex.
-    MsgMatches(#[serde(with = "regex_serde")] Regex),
+    FieldEquals {
+        name: String,
+        value: String,
+        #[serde(default)]
+        negated: bool,
+    },
+    /// `event.msg` matches (or, when `negated`, does not match) the regex.
+    MsgMatches {
+        #[serde(with = "regex_serde")]
+        regex: Regex,
+        #[serde(default)]
+        negated: bool,
+    },
 }
 
 impl Predicate {
     pub fn matches(&self, event: &Event) -> bool {
         match self {
             Self::LevelAtLeast(threshold) => event.level >= *threshold,
-            Self::LevelEquals(level) => event.level == *level,
-            Self::FieldEquals { name, value } => {
-                field_matches(event, name, value)
+            Self::LevelEquals { level, negated } => {
+                (event.level == *level) ^ *negated
             }
-            Self::MsgMatches(re) => re.is_match(&event.msg),
+            Self::FieldEquals { name, value, negated } => {
+                field_matches(event, name, value) ^ *negated
+            }
+            Self::MsgMatches { regex, negated } => {
+                regex.is_match(&event.msg) ^ *negated
+            }
         }
     }
 }
@@ -136,20 +162,14 @@ impl FromStr for Filter {
 }
 
 fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
-    // Order matters: =~ and >= and == must be probed before =, since
-    // each contains an `=`.
+    // Order matters: multi-char operators that overlap with shorter ones
+    // must be probed first.  `!=` and `!~` come before `=`; `=~` and
+    // `==` and `>=` likewise.
     if let Some((lhs, rhs)) = tok.split_once("=~") {
-        require_nonempty_name(tok, lhs)?;
-        return if lhs == "msg" {
-            Regex::new(rhs)
-                .map(Predicate::MsgMatches)
-                .map_err(|e| FilterParseError::BadRegex(e.to_string()))
-        } else {
-            Err(FilterParseError::UnsupportedFieldOp {
-                name: lhs.to_string(),
-                op: "=~".to_string(),
-            })
-        };
+        return parse_msg_regex(tok, lhs, rhs, /* negated = */ false);
+    }
+    if let Some((lhs, rhs)) = tok.split_once("!~") {
+        return parse_msg_regex(tok, lhs, rhs, /* negated = */ true);
     }
     if let Some((lhs, rhs)) = tok.split_once(">=") {
         require_nonempty_name(tok, lhs)?;
@@ -163,26 +183,49 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
         };
     }
     if let Some((lhs, rhs)) = tok.split_once("==") {
-        return field_or_level(tok, lhs, rhs);
+        return field_or_level(tok, lhs, rhs, /* negated = */ false);
+    }
+    if let Some((lhs, rhs)) = tok.split_once("!=") {
+        return field_or_level(tok, lhs, rhs, /* negated = */ true);
     }
     if let Some((lhs, rhs)) = tok.split_once('=') {
-        return field_or_level(tok, lhs, rhs);
+        return field_or_level(tok, lhs, rhs, /* negated = */ false);
     }
     Err(FilterParseError::NoOperator { token: tok.to_string() })
+}
+
+fn parse_msg_regex(
+    tok: &str,
+    lhs: &str,
+    rhs: &str,
+    negated: bool,
+) -> Result<Predicate, FilterParseError> {
+    require_nonempty_name(tok, lhs)?;
+    if lhs != "msg" {
+        return Err(FilterParseError::UnsupportedFieldOp {
+            name: lhs.to_string(),
+            op: if negated { "!~" } else { "=~" }.to_string(),
+        });
+    }
+    let regex = Regex::new(rhs)
+        .map_err(|e| FilterParseError::BadRegex(e.to_string()))?;
+    Ok(Predicate::MsgMatches { regex, negated })
 }
 
 fn field_or_level(
     tok: &str,
     lhs: &str,
     rhs: &str,
+    negated: bool,
 ) -> Result<Predicate, FilterParseError> {
     require_nonempty_name(tok, lhs)?;
     if lhs == "level" {
-        Ok(Predicate::LevelEquals(parse_level(rhs)?))
+        Ok(Predicate::LevelEquals { level: parse_level(rhs)?, negated })
     } else {
         Ok(Predicate::FieldEquals {
             name: lhs.to_string(),
             value: rhs.to_string(),
+            negated,
         })
     }
 }
@@ -230,14 +273,17 @@ impl fmt::Display for Predicate {
             Self::LevelAtLeast(l) => {
                 write!(f, "level>={}", level_token(*l))
             }
-            Self::LevelEquals(l) => {
-                write!(f, "level={}", level_token(*l))
+            Self::LevelEquals { level, negated } => {
+                let op = if *negated { "!=" } else { "=" };
+                write!(f, "level{}{}", op, level_token(*level))
             }
-            Self::FieldEquals { name, value } => {
-                write!(f, "{}={}", name, quote(value))
+            Self::FieldEquals { name, value, negated } => {
+                let op = if *negated { "!=" } else { "=" };
+                write!(f, "{}{}{}", name, op, quote(value))
             }
-            Self::MsgMatches(re) => {
-                write!(f, "msg=~{}", quote(re.as_str()))
+            Self::MsgMatches { regex, negated } => {
+                let op = if *negated { "!~" } else { "=~" };
+                write!(f, "msg{}{}", op, quote(regex.as_str()))
             }
         }
     }
@@ -336,8 +382,14 @@ mod tests {
     #[test]
     fn level_equals_only_exact() {
         let e = base_event(); // info
-        assert!(Predicate::LevelEquals(Level::Info).matches(&e));
-        assert!(!Predicate::LevelEquals(Level::Warn).matches(&e));
+        assert!(
+            Predicate::LevelEquals { level: Level::Info, negated: false }
+                .matches(&e)
+        );
+        assert!(
+            !Predicate::LevelEquals { level: Level::Warn, negated: false }
+                .matches(&e)
+        );
     }
 
     #[test]
@@ -346,21 +398,25 @@ mod tests {
         assert!(Predicate::FieldEquals {
             name: "name".into(),
             value: "Nexus".into(),
+            negated: false,
         }
         .matches(&e));
         assert!(!Predicate::FieldEquals {
             name: "name".into(),
             value: "SledAgent".into(),
+            negated: false,
         }
         .matches(&e));
         assert!(Predicate::FieldEquals {
             name: "hostname".into(),
             value: "sled-01".into(),
+            negated: false,
         }
         .matches(&e));
         assert!(Predicate::FieldEquals {
             name: "pid".into(),
             value: "1234".into(),
+            negated: false,
         }
         .matches(&e));
     }
@@ -371,11 +427,13 @@ mod tests {
         assert!(Predicate::FieldEquals {
             name: "component".into(),
             value: "nexus".into(),
+            negated: false,
         }
         .matches(&e));
         assert!(!Predicate::FieldEquals {
             name: "component".into(),
             value: "sled-agent".into(),
+            negated: false,
         }
         .matches(&e));
     }
@@ -386,6 +444,7 @@ mod tests {
         assert!(!Predicate::FieldEquals {
             name: "nope".into(),
             value: "anything".into(),
+            negated: false,
         }
         .matches(&e));
     }
@@ -394,16 +453,25 @@ mod tests {
     fn msg_matches_regex() {
         let e = base_event();
         assert!(
-            Predicate::MsgMatches(Regex::new("blueprint").unwrap())
-                .matches(&e)
+            Predicate::MsgMatches {
+                regex: Regex::new("blueprint").unwrap(),
+                negated: false,
+            }
+            .matches(&e)
         );
         assert!(
-            Predicate::MsgMatches(Regex::new("^blueprint exec").unwrap())
-                .matches(&e)
+            Predicate::MsgMatches {
+                regex: Regex::new("^blueprint exec").unwrap(),
+                negated: false,
+            }
+            .matches(&e)
         );
         assert!(
-            !Predicate::MsgMatches(Regex::new("nope").unwrap())
-                .matches(&e)
+            !Predicate::MsgMatches {
+                regex: Regex::new("nope").unwrap(),
+                negated: false,
+            }
+            .matches(&e)
         );
     }
 
@@ -422,6 +490,7 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
+                    negated: false,
                 },
             ],
         };
@@ -433,6 +502,7 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Other".into(),
+                    negated: false,
                 },
             ],
         };
@@ -472,7 +542,10 @@ mod tests {
             let f = parse(src);
             assert!(matches!(
                 f.predicates()[0],
-                Predicate::LevelEquals(Level::Error)
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    negated: false
+                },
             ));
         }
     }
@@ -492,9 +565,10 @@ mod tests {
     fn parse_field_equals() {
         let f = parse("name=Nexus");
         match &f.predicates()[0] {
-            Predicate::FieldEquals { name, value } => {
+            Predicate::FieldEquals { name, value, negated } => {
                 assert_eq!(name, "name");
                 assert_eq!(value, "Nexus");
+                assert!(!negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -504,8 +578,9 @@ mod tests {
     fn parse_msg_regex() {
         let f = parse("msg=~oh.*no");
         match &f.predicates()[0] {
-            Predicate::MsgMatches(r) => {
-                assert_eq!(r.as_str(), "oh.*no");
+            Predicate::MsgMatches { regex, negated } => {
+                assert_eq!(regex.as_str(), "oh.*no");
+                assert!(!negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -515,8 +590,9 @@ mod tests {
     fn parse_quoted_value_preserves_spaces() {
         let f = parse(r#"msg=~"oh no""#);
         match &f.predicates()[0] {
-            Predicate::MsgMatches(r) => {
-                assert_eq!(r.as_str(), "oh no");
+            Predicate::MsgMatches { regex, negated } => {
+                assert_eq!(regex.as_str(), "oh no");
+                assert!(!negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -527,6 +603,185 @@ mod tests {
         let f = parse("level>=warn name=Nexus msg=~boom");
         assert_eq!(f.predicates().len(), 3);
     }
+
+    // ---------- negation ----------
+
+    #[test]
+    fn level_equals_negated_inverts() {
+        let e = base_event(); // info
+        assert!(
+            !Predicate::LevelEquals { level: Level::Info, negated: true }
+                .matches(&e)
+        );
+        assert!(
+            Predicate::LevelEquals { level: Level::Warn, negated: true }
+                .matches(&e)
+        );
+    }
+
+    #[test]
+    fn field_equals_negated_inverts() {
+        let e = base_event();
+        assert!(!Predicate::FieldEquals {
+            name: "name".into(),
+            value: "Nexus".into(),
+            negated: true,
+        }
+        .matches(&e));
+        assert!(Predicate::FieldEquals {
+            name: "name".into(),
+            value: "Other".into(),
+            negated: true,
+        }
+        .matches(&e));
+    }
+
+    #[test]
+    fn field_equals_negated_missing_field_matches() {
+        // `field_matches` is false when the field is missing; negated,
+        // that becomes true.  This is the natural reading of "every
+        // event without an `nope` field" but worth pinning down with a
+        // test since it's a behavior that's easy to flip accidentally.
+        let e = base_event();
+        assert!(Predicate::FieldEquals {
+            name: "nope".into(),
+            value: "anything".into(),
+            negated: true,
+        }
+        .matches(&e));
+    }
+
+    #[test]
+    fn msg_matches_negated_inverts() {
+        let e = base_event();
+        assert!(!Predicate::MsgMatches {
+            regex: Regex::new("blueprint").unwrap(),
+            negated: true,
+        }
+        .matches(&e));
+        assert!(Predicate::MsgMatches {
+            regex: Regex::new("nope").unwrap(),
+            negated: true,
+        }
+        .matches(&e));
+    }
+
+    #[test]
+    fn parse_field_not_equals() {
+        let f = parse("name!=Nexus");
+        match &f.predicates()[0] {
+            Predicate::FieldEquals { name, value, negated } => {
+                assert_eq!(name, "name");
+                assert_eq!(value, "Nexus");
+                assert!(negated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_level_not_equals() {
+        let f = parse("level!=warn");
+        match &f.predicates()[0] {
+            Predicate::LevelEquals { level, negated } => {
+                assert_eq!(*level, Level::Warn);
+                assert!(negated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_msg_not_matches() {
+        let f = parse("msg!~oh.*no");
+        match &f.predicates()[0] {
+            Predicate::MsgMatches { regex, negated } => {
+                assert_eq!(regex.as_str(), "oh.*no");
+                assert!(negated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unsupported_negated_regex_field_errors() {
+        let err = "name!~foo".parse::<Filter>().unwrap_err();
+        assert!(matches!(
+            err,
+            FilterParseError::UnsupportedFieldOp { ref name, ref op }
+                if name == "name" && op == "!~"
+        ));
+    }
+
+    #[test]
+    fn display_negated_forms() {
+        let f = Filter {
+            predicates: vec![
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    negated: true,
+                },
+                Predicate::FieldEquals {
+                    name: "name".into(),
+                    value: "Nexus".into(),
+                    negated: true,
+                },
+                Predicate::MsgMatches {
+                    regex: Regex::new("foo.*").unwrap(),
+                    negated: true,
+                },
+            ],
+        };
+        assert_eq!(
+            f.to_string(),
+            "level!=error name!=Nexus msg!~foo.*",
+        );
+    }
+
+    #[test]
+    fn display_then_parse_round_trip_negated() {
+        let inputs =
+            ["level!=warn", "name!=Nexus", "msg!~foo.*bar"];
+        for src in inputs {
+            let parsed: Filter = src.parse().unwrap();
+            let displayed = parsed.to_string();
+            let reparsed: Filter = displayed.parse().unwrap();
+            assert_eq!(
+                displayed,
+                reparsed.to_string(),
+                "round-trip drifted for {src:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_payload_without_negated_field_defaults_false() {
+        // `#[serde(default)]` lets payloads omit `negated`; it reads as
+        // false.  Useful so a future predicate-schema bump that adds
+        // another flag can be made backward-compatible the same way.
+        let json = r#"{
+            "predicates": [
+                { "FieldEquals": { "name": "name", "value": "Nexus" } },
+                { "MsgMatches": { "regex": "boom" } },
+                { "LevelEquals": { "level": 40 } }
+            ]
+        }"#;
+        let f: Filter = serde_json::from_str(json).unwrap();
+        match &f.predicates()[0] {
+            Predicate::FieldEquals { negated, .. } => assert!(!negated),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &f.predicates()[1] {
+            Predicate::MsgMatches { negated, .. } => assert!(!negated),
+            other => panic!("unexpected: {other:?}"),
+        }
+        match &f.predicates()[2] {
+            Predicate::LevelEquals { negated, .. } => assert!(!negated),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ---------- parser errors ----------
 
     #[test]
     fn parse_unknown_level_errors() {
@@ -578,12 +833,19 @@ mod tests {
         let f = Filter {
             predicates: vec![
                 Predicate::LevelAtLeast(Level::Warn),
-                Predicate::LevelEquals(Level::Error),
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    negated: false,
+                },
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
+                    negated: false,
                 },
-                Predicate::MsgMatches(Regex::new("foo.*").unwrap()),
+                Predicate::MsgMatches {
+                    regex: Regex::new("foo.*").unwrap(),
+                    negated: false,
+                },
             ],
         };
         assert_eq!(
@@ -598,6 +860,7 @@ mod tests {
             predicates: vec![Predicate::FieldEquals {
                 name: "msg".into(),
                 value: "oh no".into(),
+                negated: false,
             }],
         };
         // Some shlex versions emit single quotes, some emit double; we
@@ -644,8 +907,12 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
+                    negated: false,
                 },
-                Predicate::MsgMatches(Regex::new("boom").unwrap()),
+                Predicate::MsgMatches {
+                    regex: Regex::new("boom").unwrap(),
+                    negated: false,
+                },
             ],
         };
         let json = serde_json::to_string(&f).unwrap();
