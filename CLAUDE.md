@@ -226,34 +226,52 @@ It seems like maybe not all the fields of each entry are being rendered.  Take a
 
 The `source_id` for each file should already be the canonical path to the file.  Users should be able to filter on this as a regex.
 
-### Bookmarks
-
-Let's add the concept of bookmarks.  A bookmark identifies a log stream and a position within that stream.  If the stream's filter changes, the bookmark should still refer to the same location in the log.
-
-Each tab implicitly has a bookmark, which is where that tab is currently looking.
-
-Users should be able to create bookmarks, (optionally) name them, list them, and delete them.  I'm thinking:
-
-- `b`: creates a named bookmark, using a flow similar to `x`.  When you hit
-  enter/return, pops up a dialog to type in the name.  If you leave it blank, you get an unnamed bookmark.
-- Once you create a bookmark, the Bookmarks tab appears for listing bookmarks
-  and navigating to them.
-  - The tab appears if and only if you have any bookmarks.  It cannot be explicitly opened or closed.
-  - Each entry here shows time created, filename (basename only), timestamp of the log entry, and a few characters of the log's message.
-  - When in this tab, there is a selection, similar to the `x` mode we've built.
-  - With any bookmark selected, `enter`/`return navigates to that bookmark.  If the bookmark's log stream is already open in some tab, then this takes you to that tab and navigates to the bookmark.  If not, it opens a new tab with that logstream and navigates to that bookmark.
-  - With any bookmark selected, `x` deletes the bookmark.  This should prompt
-    for a "Cancel" / "Confirm" conformation.
-
-Bookmarks are stored in the session state.
-
-What do you think?
-
 ### Summarizing fields in the view
 
 When we process each log, keep track of distinct top-level JSON field names.  Keep only the top 10.
 
 Let's add a summary view.  If the user hits `S` in the main view, a dialog pops up that lists the different available fields.  The user selects one.  Then the dialog shows the top N values for that field, whatever N fits in the box.  Alongside the values, print a little histogram.
+
+Imagine something like this:
+
+```
+              key  ------------- Distribution ------------- count
+           getpid |                                         1
+        getrandom |                                         1
+        getrlimit |                                         1
+         lwp_exit |                                         1
+           munmap |                                         1
+        nanosleep |                                         1
+            rexit |                                         1
+         schedctl |                                         1
+           sysi86 |                                         1
+ lwp_cond_broadcast |                                         3
+             mmap |                                         4
+         readlink |                                         4
+      resolvepath |                                         4
+             stat |                                         4
+        sigaction |                                         5
+        sysconfig |                                         5
+              brk |                                         9
+             open |                                         10
+       setcontext |                                         12
+            gtime |                                         15
+            pread |                                         39
+             read |                                         84
+            write |▏                                        96
+         lwp_park |▏                                        152
+          pollsys |▏                                        168
+         p_online |▎                                        256
+      lwp_sigmask |▋                                        505
+            fcntl |█▉                                       1370
+           openat |█▉                                       1370
+            fstat |█▉                                       1378
+            close |█▉                                       1379
+         getdents |█▉                                       1382
+            ioctl |█████▍                                   3836
+          fstatat |██████████▍                              7310
+            lstat |████████████▍                            8754
+```
 
 "Time" should be treated specially.  Summary by time should show the count of log entries for each distinct minute in the log file.  This should similarly show a histogram.
 

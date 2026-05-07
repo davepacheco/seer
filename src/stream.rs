@@ -10,6 +10,9 @@
 //! source the engine knows about" — the same as `Engine::query_events`.
 //! Filters and source-set restrictions land here next.
 
+use crate::filter::Filter;
+use crate::source::SourceId;
+use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
 use iddqd::{IdOrdItem, id_upcast};
 use serde::{Deserialize, Serialize};
@@ -40,45 +43,85 @@ impl LogStreamId {
     }
 }
 
-/// Position within a log stream.
+/// Position within a log stream — a stable anchor that survives filter
+/// changes.
 ///
-/// For now this is just the 0-based ordinal of the event in the stream.
-/// We will likely need a richer representation once filters and re-parses
-/// can shift event ordinals; the type is opaque here so callers don't
-/// depend on the current shape.
+/// A position pins down a specific event by `(source, time,
+/// ordinal_within_time)`.  Same-time tiebreaking happens via
+/// `ordinal_within_time`: the first event with a given `(source, time)`
+/// has ordinal 0, the next has 1, and so on.  This shape was chosen so
+/// that adding/removing predicates from the active filter never moves
+/// what a saved position refers to: only the row index that position
+/// resolves to in a filtered view changes.
+///
+/// The fields are private so future representations (e.g. a content
+/// fingerprint to survive file rewrites) can be added without breaking
+/// callers.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    Display,
-    From,
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
-#[serde(transparent)]
-pub struct LogStreamPosition(u64);
+pub struct LogStreamPosition {
+    source: SourceId,
+    time: DateTime<Utc>,
+    /// 0-based count of events from the same `source` with this exact
+    /// `time`.
+    ordinal_within_time: u64,
+}
+
+impl LogStreamPosition {
+    /// Builds a position from its component parts.
+    pub fn new(
+        source: SourceId,
+        time: DateTime<Utc>,
+        ordinal_within_time: u64,
+    ) -> Self {
+        Self { source, time, ordinal_within_time }
+    }
+
+    /// Returns the source this position refers to.
+    pub fn source(&self) -> &SourceId {
+        &self.source
+    }
+
+    /// Returns the timestamp of the event at this position.
+    pub fn time(&self) -> DateTime<Utc> {
+        self.time
+    }
+
+    /// Returns the within-source same-timestamp tiebreaker for this
+    /// position.
+    pub fn ordinal_within_time(&self) -> u64 {
+        self.ordinal_within_time
+    }
+}
 
 /// A log stream.
 ///
-/// Today it just carries its id; eventually it will own a filter and
-/// the set of sources it draws from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Owns its identity, display name, and active filter.  The set of
+/// sources a stream draws from will join the struct once
+/// per-stream source restrictions land; for now every stream sees every
+/// source the engine knows about.
+///
+/// Filter ownership lives here (rather than on the display tab) so that
+/// when a bookmark targets a stream that has no tab open, opening a
+/// fresh tab for that stream restores the user's filter alongside the
+/// position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogStream {
     pub id: LogStreamId,
+    pub name: String,
+    #[serde(default)]
+    pub filter: Filter,
 }
 
 impl LogStream {
-    /// Returns a new log stream with a freshly-generated id.
+    /// Returns a new log stream with a freshly-generated id, the given
+    /// display name, and an empty filter.
     // No `Default` impl: each call mints a distinct id, so a default
     // value would silently produce non-equal objects.
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self { id: LogStreamId::new_v4() }
+    pub fn new(name: String) -> Self {
+        Self { id: LogStreamId::new_v4(), name, filter: Filter::default() }
     }
 }
 

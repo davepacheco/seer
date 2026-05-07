@@ -36,15 +36,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for result in engine.query_events(&filter) {
         match result {
-            Ok(event) => println!(
-                "{} [{}] {}/{}/{}: {}",
-                event.time.to_rfc3339(),
-                event.level,
-                event.name,
-                event.hostname,
-                event.pid,
-                event.msg,
-            ),
+            Ok(ee) => {
+                let event = &ee.event;
+                println!(
+                    "{} [{}] {}/{}/{}: {}",
+                    event.time.to_rfc3339(),
+                    event.level,
+                    event.name,
+                    event.hostname,
+                    event.pid,
+                    event.msg,
+                );
+            }
             // SourceError's Display already says "I/O error: ...",
             // "failed to parse ...", or "warning: ..." as appropriate;
             // don't add another prefix here.

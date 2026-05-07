@@ -23,7 +23,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use regex::Regex;
-use seer::{Engine, Event as LogEvent, Filter, Predicate};
+#[cfg(test)]
+use seer::SourceId;
+use seer::{
+    Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Event as LogEvent,
+    Filter, LogStream, LogStreamId, LogStreamPosition, Predicate,
+    ResolvePosition, Session,
+};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -42,9 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.add_file_source(path)?;
     }
 
+    let session = load_session();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    let mut app = App::new(engine);
+    let mut app = App::new_with_session(engine, session);
     while !app.quit {
         terminal.draw(|frame| render(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))?
@@ -53,7 +60,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.handle_key(key);
         }
     }
+    if let Err(err) = save_session(&app.session) {
+        // Best-effort: failing to persist shouldn't prevent quit.  The
+        // user has already asked to leave; surface the failure on
+        // stderr so they can investigate after the TUI tears down.
+        eprintln!("warning: failed to save session: {err}");
+    }
     Ok(())
+}
+
+/// Path used for the persisted [`Session`].  Returns `None` when
+/// `$HOME` is unset, in which case persistence is silently skipped.
+/// We intentionally don't fall back to `/tmp` or similar; a missing
+/// `$HOME` means we don't know where the user wants their state.
+fn session_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".seer").join("session.json"))
+}
+
+/// Loads the persisted session, falling back to an empty one on any
+/// failure (missing file, unreadable, parse error).  Failures are
+/// surfaced to stderr but never abort startup — bookmarks and (later)
+/// open tabs are nice-to-have, not critical, and a corrupt session
+/// shouldn't lock the user out of the tool.
+fn load_session() -> Session {
+    let Some(path) = session_path() else {
+        return Session::new();
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Session::new();
+        }
+        Err(err) => {
+            eprintln!("warning: could not read {}: {err}", path.display());
+            return Session::new();
+        }
+    };
+    match serde_json::from_str::<Session>(&contents) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!(
+                "warning: ignoring unreadable session file {}: {err}",
+                path.display()
+            );
+            Session::new()
+        }
+    }
+}
+
+/// Writes `session` to [`session_path`] in pretty-printed JSON,
+/// creating the parent directory if needed.  Errors propagate; the
+/// caller decides how to surface them.
+fn save_session(session: &Session) -> std::io::Result<()> {
+    let Some(path) = session_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(session)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, json)
 }
 
 /// Restores the terminal on drop so panics and `?`-returns don't leave
@@ -71,18 +139,19 @@ impl Drop for TerminalGuard {
 /// two vecs are the same length and indexed identically; an `events`
 /// entry is `None` exactly where the corresponding row was a parse/I/O
 /// error.  Keeping the events lets callers (e.g. exclude mode) build
-/// new filter predicates from the row under the cursor.
+/// new filter predicates from the row under the cursor and the
+/// bookmark flow extract a stable position for the row.
 fn render_rows(
     engine: &Engine,
     filter: &Filter,
-) -> (Vec<Option<LogEvent>>, Vec<String>) {
+) -> (Vec<Option<EngineEvent>>, Vec<String>) {
     let mut events = Vec::new();
     let mut formatted = Vec::new();
     for r in engine.query_events(filter) {
         match r {
-            Ok(e) => {
-                formatted.push(format_event(&e));
-                events.push(Some(e));
+            Ok(ee) => {
+                formatted.push(format_event(&ee.event));
+                events.push(Some(ee));
             }
             Err(err) => {
                 // SourceError's Display already says "I/O error: ...",
@@ -163,20 +232,31 @@ struct LastSearch {
     direction: SearchDirection,
 }
 
-/// One independent view: name, filter, the rows produced by querying
-/// the engine with that filter, and the scroll offset within those
+/// One independent view: name, the rows produced by querying the engine
+/// with the host stream's filter, and the scroll offset within those
 /// rows.
 ///
 /// `events` and `formatted` have identical length and are indexed the
 /// same way.  `events[i]` is `None` exactly when that row came from a
 /// parse or I/O error rather than a real log record; the stringified
 /// error sits in `formatted[i]`.  Keeping the parsed events around lets
-/// in-place actions (e.g. exclude mode's "filter out entries like this")
-/// inspect the record under the cursor without re-parsing.
+/// in-place actions (e.g. exclude mode's "filter out entries like this"
+/// or `b`'s "bookmark this row") inspect the record under the cursor
+/// without re-parsing, and gives the bookmark flow access to each
+/// event's stable [`LogStreamPosition`].
+///
+/// The active filter is owned by the [`LogStream`] this tab is viewing
+/// (looked up in [`Session::streams`] by `stream`); two tabs that target
+/// the same stream therefore share a filter — that's the model that
+/// makes "open a bookmark whose stream is already shown in some tab"
+/// give the user a consistent view.
 struct Tab {
     name: String,
-    filter: Filter,
-    events: Vec<Option<LogEvent>>,
+    /// Identifier of the [`LogStream`] this tab views.  The stream owns
+    /// the filter and other persisted configuration; the display tab
+    /// holds the transient render state.
+    stream: LogStreamId,
+    events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
     /// Index of the row at the top of the viewport.
     viewport_top: usize,
@@ -185,31 +265,46 @@ struct Tab {
     /// otherwise dangle.
     search: Option<TabSearch>,
     /// When `Some`, select mode is active.  The contained value carries
-    /// the row index currently highlighted and the polarity (`x` →
-    /// exclude, `X` → include) used to build the predicate on commit.
-    /// Cleared whenever `formatted` is re-queried so the index can't
-    /// dangle.
+    /// the row index currently highlighted and the action (`x` exclude,
+    /// `X` include, `b` bookmark) the Enter key will commit.  Cleared
+    /// whenever `formatted` is re-queried so the index can't dangle.
     select: Option<Selection>,
 }
 
-/// State of an in-progress `x`/`X` selection.
+/// What a select-mode commit will do.
 ///
-/// `row` is an absolute index into [`Tab::formatted`].  `negated` is
-/// the polarity that will be baked into the predicate when the user
-/// hits Enter — `true` for `x` (exclude: `msg!=value`), `false` for
-/// `X` (include: `msg=value`).
+/// `x` → exclude (build `msg != <selected>`); `X` → include (build
+/// `msg = <selected>`); `b` → bookmark (open the name dialog).  Stored
+/// on [`Selection`] so the rendering and dispatch paths agree on what
+/// kind of mode the user is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionAction {
+    Exclude,
+    Include,
+    Bookmark,
+}
+
+/// State of an in-progress `x`/`X`/`b` selection.
+///
+/// `row` is an absolute index into [`Tab::formatted`].  `action` is
+/// what Enter will do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
     row: usize,
-    negated: bool,
+    action: SelectionAction,
 }
 
 impl Tab {
-    fn new(name: String, engine: &Engine, filter: Filter) -> Self {
-        let (events, formatted) = render_rows(engine, &filter);
+    fn new(
+        name: String,
+        engine: &Engine,
+        stream: LogStreamId,
+        filter: &Filter,
+    ) -> Self {
+        let (events, formatted) = render_rows(engine, filter);
         Self {
             name,
-            filter,
+            stream,
             events,
             formatted,
             viewport_top: 0,
@@ -218,11 +313,14 @@ impl Tab {
         }
     }
 
-    fn apply_filter(&mut self, engine: &Engine, filter: Filter) {
-        let (events, formatted) = render_rows(engine, &filter);
+    /// Re-runs the host stream's filter against the engine and refreshes
+    /// the cached rows, viewport, and transient selection/search state.
+    /// Call after the [`LogStream::filter`] for `self.stream` has been
+    /// mutated.
+    fn refresh(&mut self, engine: &Engine, filter: &Filter) {
+        let (events, formatted) = render_rows(engine, filter);
         self.events = events;
         self.formatted = formatted;
-        self.filter = filter;
         self.viewport_top = 0;
         self.search = None;
         self.select = None;
@@ -311,6 +409,7 @@ impl Tab {
         let anchor_time = self.events[anchor_idx]
             .as_ref()
             .expect("time_anchor_idx returns indices of real events")
+            .event
             .time;
         let target = anchor_time + delta;
         let new_top = if go_forward {
@@ -319,7 +418,7 @@ impl Tab {
                 .enumerate()
                 .skip(anchor_idx)
                 .find_map(|(i, e)| {
-                    e.as_ref().filter(|ev| ev.time >= target).map(|_| i)
+                    e.as_ref().filter(|ee| ee.event.time >= target).map(|_| i)
                 })
                 .unwrap_or_else(|| self.max_top(viewport_height))
         } else {
@@ -329,7 +428,7 @@ impl Tab {
                 .take(anchor_idx + 1)
                 .rev()
                 .find_map(|(i, e)| {
-                    e.as_ref().filter(|ev| ev.time <= target).map(|_| i)
+                    e.as_ref().filter(|ee| ee.event.time <= target).map(|_| i)
                 })
                 .unwrap_or(0)
         };
@@ -367,12 +466,23 @@ const DEFAULT_TIME_STEP_IDX: usize = 5;
 
 /// All TUI state.  Pure with respect to I/O so [`App::handle_key`] can
 /// be unit-tested by feeding synthetic key events.
+///
+/// `tabs` holds the display state for currently-open tabs; `session`
+/// holds everything that survives a restart (open streams' filters, the
+/// user's bookmarks, eventually saved cursors and named filter sets).
+/// The two stay in sync: every `tabs[i]` references a `LogStream` that
+/// lives in `session.streams`.
 struct App {
     engine: Engine,
+    /// Persistent session state.  When non-empty bookmarks live here a
+    /// synthetic Bookmarks tab is rendered after the regular tabs.
+    session: Session,
     /// Open tabs, in display order.  Invariant: never empty (closing
     /// the last tab pushes a fresh one to maintain this).
     tabs: Vec<Tab>,
-    /// Index into `tabs` of the currently visible one.
+    /// Index into the *virtual* tab list of the currently visible
+    /// pane.  When this equals `tabs.len()` the synthetic Bookmarks
+    /// tab is active; otherwise it indexes into `tabs`.
     active: usize,
     /// Monotonically-increasing counter used to name new tabs.  Never
     /// reused — closing "Tab 2" leaves the next new tab named "Tab 4"
@@ -393,12 +503,39 @@ struct App {
     /// applies wherever they navigate next, mirroring how `last_search`
     /// is shared across tabs.
     time_step_idx: usize,
+    /// Currently highlighted bookmark id when the Bookmarks tab is
+    /// active.  Cleared (set to `None`) when the bookmark it pointed at
+    /// is deleted or no bookmarks remain.
+    bookmark_cursor: Option<BookmarkId>,
+    /// One-shot status text shown in the footer for one render — used
+    /// to tell the user "the bookmarked entry is hidden by the active
+    /// filter" or "the bookmarked entry is gone" after a navigation.
+    /// Cleared by the next user keystroke.
+    notice: Option<String>,
 }
 
 impl App {
+    /// Convenience constructor for tests that don't care about the
+    /// session.  Production code goes through [`Self::new_with_session`]
+    /// so a previously-saved session is honored.
+    #[cfg(test)]
     fn new(engine: Engine) -> Self {
+        Self::new_with_session(engine, Session::new())
+    }
+
+    /// Constructs an [`App`] reusing a previously-loaded [`Session`].
+    /// Carries over the user's bookmarks (and the streams those
+    /// bookmarks reference), but always opens a fresh display tab —
+    /// auto-restoring the user's prior tab set is a separate piece of
+    /// work, and dropping into an unfiltered fresh tab is a sensible
+    /// default until then.  Loaded session may include `tabs` from a
+    /// future schema; we leave that field intact so a later
+    /// auto-resume can pick it up without a save round-trip
+    /// re-emptying it.
+    fn new_with_session(engine: Engine, session: Session) -> Self {
         let mut a = Self {
             engine,
+            session,
             tabs: Vec::new(),
             active: 0,
             next_tab_number: 1,
@@ -407,18 +544,50 @@ impl App {
             dialog: None,
             last_search: None,
             time_step_idx: DEFAULT_TIME_STEP_IDX,
+            bookmark_cursor: None,
+            notice: None,
         };
         a.push_tab(Filter::default());
         a
     }
 
-    /// Pushes a new tab with the given filter and switches focus to
-    /// it.  Does *not* open the filter dialog — callers that want that
-    /// (e.g. Ctrl-T) do it explicitly after.
+    /// Pushes a new tab backed by a fresh [`LogStream`] with the given
+    /// filter.  Does *not* open the filter dialog — callers that want
+    /// that (e.g. Ctrl-T) do it explicitly after.  Switches focus to
+    /// the new tab.
     fn push_tab(&mut self, filter: Filter) {
         let name = format!("Tab {}", self.next_tab_number);
         self.next_tab_number += 1;
-        let tab = Tab::new(name, &self.engine, filter);
+        let mut stream = LogStream::new(name.clone());
+        stream.filter = filter;
+        let stream_id = stream.id;
+        self.session
+            .streams
+            .insert_unique(stream)
+            .expect("freshly-minted LogStreamId is unique");
+        let tab = Tab::new(
+            name,
+            &self.engine,
+            stream_id,
+            &self.session.streams.get(&stream_id).unwrap().filter,
+        );
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Pushes a new tab targeting an existing [`LogStream`] (looked up
+    /// in `session.streams`).  Used when navigating to a bookmark
+    /// whose stream isn't currently shown in any tab — the new tab
+    /// inherits the stream's persisted filter.
+    fn push_tab_for_existing_stream(&mut self, stream_id: LogStreamId) {
+        let name = format!("Tab {}", self.next_tab_number);
+        self.next_tab_number += 1;
+        let stream = self
+            .session
+            .streams
+            .get(&stream_id)
+            .expect("caller verified the stream exists");
+        let tab = Tab::new(name, &self.engine, stream_id, &stream.filter);
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
     }
@@ -431,16 +600,192 @@ impl App {
         &mut self.tabs[self.active]
     }
 
-    /// Replaces the active tab's filter, re-queries the engine, and
-    /// resets that tab's viewport to the top.  Other tabs are
-    /// untouched.
+    /// True iff the synthetic Bookmarks tab is the currently active
+    /// pane.  The Bookmarks tab is implicit (rendered iff there are
+    /// any bookmarks, never explicitly opened or closed) and slots in
+    /// at index `tabs.len()` in the virtual tab list.
+    fn bookmarks_active(&self) -> bool {
+        self.has_bookmarks_tab() && self.active == self.tabs.len()
+    }
+
+    /// True iff the synthetic Bookmarks tab should be rendered at all
+    /// — gated entirely on whether the user has any bookmarks.
+    fn has_bookmarks_tab(&self) -> bool {
+        self.session.bookmark_count() > 0
+    }
+
+    /// Total number of panes in the virtual tab list (regular tabs +
+    /// the Bookmarks tab when present).
+    fn pane_count(&self) -> usize {
+        self.tabs.len() + usize::from(self.has_bookmarks_tab())
+    }
+
+    /// Replaces the active stream's filter, re-queries the engine,
+    /// and resets every tab targeting that stream to the top.  Two
+    /// tabs sharing a stream therefore share their filter — that's the
+    /// model that lets a bookmark-driven "open in a new tab" carry the
+    /// stream's filter forward.
     fn apply_filter(&mut self, filter: Filter) {
-        let engine = &self.engine;
-        self.tabs[self.active].apply_filter(engine, filter);
+        let stream_id = self.tabs[self.active].stream;
+        // Mutate the persisted filter, then re-derive every tab whose
+        // stream is the one we just changed.
+        let Some(mut stream) = self.session.streams.remove(&stream_id) else {
+            return;
+        };
+        stream.filter = filter;
+        let new_filter = stream.filter.clone();
+        self.session
+            .streams
+            .insert_unique(stream)
+            .expect("removed-then-reinserted id is unique");
+        for tab in self.tabs.iter_mut() {
+            if tab.stream == stream_id {
+                tab.refresh(&self.engine, &new_filter);
+            }
+        }
+    }
+
+    /// Returns the active stream's filter.  Convenience for the few
+    /// places that need to display or clone it (footer, dialog
+    /// pre-fill, Ctrl-T new-tab).
+    fn active_filter(&self) -> &Filter {
+        let stream_id = self.tabs[self.active].stream;
+        &self.session.streams.get(&stream_id).expect("stream exists").filter
     }
 
     fn rename_active_tab(&mut self, name: String) {
         self.tabs[self.active].name = name;
+    }
+
+    /// Adds a bookmark to the session, filed under the active tab's
+    /// stream.  If this is the user's first bookmark the synthetic
+    /// Bookmarks tab will appear in the next render; we leave the
+    /// active pane on the current tab — opening Bookmarks
+    /// automatically would surprise users who just made one bookmark
+    /// and want to keep reading.
+    fn add_bookmark(
+        &mut self,
+        name: Option<BookmarkName>,
+        position: LogStreamPosition,
+        display_time: chrono::DateTime<chrono::Utc>,
+        display_msg: String,
+    ) {
+        let stream_id = self.tabs[self.active].stream;
+        let bookmark = Bookmark {
+            id: BookmarkId::new_v4(),
+            created_at: chrono::Utc::now(),
+            position,
+            name,
+            display_time,
+            display_msg,
+        };
+        self.session.add_bookmark(stream_id, bookmark);
+    }
+
+    /// Removes a bookmark by id.  When this empties the user's
+    /// bookmarks the Bookmarks tab disappears next render; if it was
+    /// the active pane, fall back to the last regular tab.
+    fn delete_bookmark(&mut self, id: BookmarkId) {
+        let was_bookmarks_active = self.bookmarks_active();
+        self.session.remove_bookmark(id);
+        if Some(id) == self.bookmark_cursor {
+            self.bookmark_cursor = None;
+        }
+        // If we removed the last bookmark and the user was looking at
+        // the Bookmarks tab, snap them back to the last regular tab so
+        // they don't end up looking at a vanished pane.
+        if was_bookmarks_active && !self.has_bookmarks_tab() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+    }
+
+    /// All user bookmarks, flattened across streams in the same order
+    /// the Bookmarks tab renders them: streams in BTreeMap order, each
+    /// stream's bucket in insertion order.  Used by selection-cursor
+    /// movement and rendering.
+    fn flat_bookmarks(&self) -> Vec<&Bookmark> {
+        self.session.user_bookmarks.values().flat_map(|v| v.iter()).collect()
+    }
+
+    /// Index of `bookmark_cursor` in [`Self::flat_bookmarks`], if it
+    /// still exists.  Returns `None` if the cursor refers to a
+    /// since-deleted bookmark or no cursor is set.
+    fn bookmark_cursor_idx(&self) -> Option<usize> {
+        let target = self.bookmark_cursor?;
+        self.flat_bookmarks().iter().position(|b| b.id == target)
+    }
+
+    /// Moves the bookmark-pane cursor by `delta` rows (positive ==
+    /// down).  When no cursor is set, this initializes it at the first
+    /// bookmark.  No-op when the bookmark list is empty.
+    fn move_bookmark_cursor(&mut self, delta: isize) {
+        let bookmarks = self.flat_bookmarks();
+        if bookmarks.is_empty() {
+            self.bookmark_cursor = None;
+            return;
+        }
+        let last = bookmarks.len() - 1;
+        let cur = self.bookmark_cursor_idx().unwrap_or_default();
+        let new = (cur as isize + delta).clamp(0, last as isize) as usize;
+        self.bookmark_cursor = Some(bookmarks[new].id);
+    }
+
+    /// Navigates to the bookmark at the bookmark-pane cursor.  Switches
+    /// to the existing tab if its stream is open, otherwise opens a
+    /// new tab targeting that stream.  Resolves the bookmarked
+    /// position against the active filter; on `FilteredOut` or `Gone`
+    /// stashes a one-shot footer notice so the user knows what
+    /// happened.
+    fn navigate_to_bookmark_cursor(&mut self) {
+        let Some(idx) = self.bookmark_cursor_idx() else {
+            return;
+        };
+        let bookmarks = self.flat_bookmarks();
+        let bm = bookmarks[idx];
+        let target_stream = self
+            .session
+            .user_bookmarks
+            .iter()
+            .find(|(_, v)| v.iter().any(|b| b.id == bm.id))
+            .map(|(s, _)| *s)
+            .expect("bookmark belongs to some stream");
+        let position = bm.position.clone();
+        // Switch to the tab showing the target stream, opening one if
+        // none exists.
+        let existing = self.tabs.iter().position(|t| t.stream == target_stream);
+        let tab_idx = match existing {
+            Some(i) => i,
+            None => {
+                self.push_tab_for_existing_stream(target_stream);
+                self.tabs.len() - 1
+            }
+        };
+        self.active = tab_idx;
+        // Resolve the bookmark to a row in the now-active tab and
+        // update the viewport.  resolve_position needs a borrow on the
+        // engine, so unwrap the filter first.
+        let filter =
+            self.session.streams.get(&target_stream).unwrap().filter.clone();
+        match self.engine.resolve_position(&filter, &position) {
+            ResolvePosition::Found(row) => {
+                self.tabs[tab_idx].viewport_top = row;
+            }
+            ResolvePosition::FilteredOut(row) => {
+                self.tabs[tab_idx].viewport_top = row;
+                self.notice = Some(
+                    "bookmarked entry is hidden by the active filter; \
+                     jumped to the nearest visible entry"
+                        .to_string(),
+                );
+            }
+            ResolvePosition::Gone => {
+                self.notice = Some(
+                    "bookmarked entry is no longer present in any \
+                     loaded source"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     /// Installs `regex` as the active search on the current tab,
@@ -458,11 +803,8 @@ impl App {
         let matches =
             compute_matches(&self.tabs[self.active].formatted, &regex);
         let tab = &mut self.tabs[self.active];
-        tab.search = Some(TabSearch {
-            pattern: pattern.clone(),
-            regex,
-            matches,
-        });
+        tab.search =
+            Some(TabSearch { pattern: pattern.clone(), regex, matches });
         self.last_search = Some(LastSearch { pattern, direction });
         self.jump_to_match(direction, /* exclusive = */ false);
     }
@@ -514,22 +856,15 @@ impl App {
             return;
         };
         let matches = compute_matches(&tab.formatted, &regex);
-        tab.search = Some(TabSearch {
-            pattern: pattern.to_string(),
-            regex,
-            matches,
-        });
+        tab.search =
+            Some(TabSearch { pattern: pattern.to_string(), regex, matches });
     }
 
     /// Move `viewport_top` to the next match in `direction`.  When
     /// `exclusive`, a match exactly at `viewport_top` is skipped (used
     /// for repeats — otherwise `/<enter>` would re-land on the current
     /// match forever).  Stays put if no further match exists.
-    fn jump_to_match(
-        &mut self,
-        direction: SearchDirection,
-        exclusive: bool,
-    ) {
+    fn jump_to_match(&mut self, direction: SearchDirection, exclusive: bool) {
         let tab = &self.tabs[self.active];
         let Some(search) = &tab.search else {
             return;
@@ -591,18 +926,27 @@ impl App {
     }
 
     fn next_tab(&mut self) {
-        self.active = (self.active + 1) % self.tabs.len();
+        let n = self.pane_count();
+        self.active = (self.active + 1) % n;
+        // Switching panes resets a one-shot notice so it doesn't spook
+        // the user on an unrelated screen.
+        self.notice = None;
     }
 
     fn prev_tab(&mut self) {
-        self.active =
-            (self.active + self.tabs.len() - 1) % self.tabs.len();
+        let n = self.pane_count();
+        self.active = (self.active + n - 1) % n;
+        self.notice = None;
     }
 
-    /// Removes the active tab.  When the last tab is closed, a fresh
-    /// default tab is created so the `!tabs.is_empty()` invariant
-    /// holds.
+    /// Removes the active tab.  When the last regular tab is closed a
+    /// fresh default tab is created so the `!tabs.is_empty()`
+    /// invariant holds.  No-op when the synthetic Bookmarks tab is
+    /// active: that pane is implicit and cannot be explicitly closed.
     fn close_active_tab(&mut self) {
+        if self.bookmarks_active() {
+            return;
+        }
         self.tabs.remove(self.active);
         if self.tabs.is_empty() {
             self.push_tab(Filter::default());
@@ -611,15 +955,87 @@ impl App {
         }
     }
 
-    /// Enters select mode on the active tab with the given polarity.
-    /// `negated` is `true` for `x` (exclude on commit) and `false` for
-    /// `X` (include on commit).  No-op when the tab has no rows.
-    fn start_selection(&mut self, negated: bool) {
+    /// Enters select mode on the active tab with the given action.
+    /// No-op when the tab has no rows.
+    fn start_selection(&mut self, action: SelectionAction) {
         let tab = self.active_tab_mut();
         if tab.formatted.is_empty() {
             return;
         }
-        tab.select = Some(Selection { row: tab.viewport_top, negated });
+        tab.select = Some(Selection { row: tab.viewport_top, action });
+    }
+
+    /// Routes a keystroke while the Bookmarks pane is active.
+    ///
+    /// Supported keys: j/k (move bookmark cursor), Enter (navigate to
+    /// the bookmark — switches tabs or opens a new one), x (open the
+    /// delete-confirmation dialog), Tab/BackTab (cycle panes), q/Esc/
+    /// Ctrl-C (quit).  Everything else is dropped: filter edits,
+    /// search, time-step navigation, and Ctrl-T/Ctrl-W make no sense
+    /// in a list of bookmarks and would leave the user in a confusing
+    /// state if half-handled.
+    fn handle_bookmarks_key(&mut self, key: KeyEvent) {
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.quit = true;
+            }
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.next_tab(),
+            KeyEvent { code: KeyCode::BackTab, .. }
+            | KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.prev_tab(),
+            KeyEvent {
+                code: KeyCode::Char('j') | KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_bookmark_cursor(1),
+            KeyEvent {
+                code: KeyCode::Char('k') | KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.move_bookmark_cursor(-1),
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.navigate_to_bookmark_cursor(),
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if let Some(idx) = self.bookmark_cursor_idx() {
+                    let bm = self.flat_bookmarks()[idx];
+                    let label = match &bm.name {
+                        Some(n) => format!("\"{}\"", n),
+                        None => preview_msg(&bm.display_msg),
+                    };
+                    self.dialog =
+                        Some(Dialog::confirm_delete_bookmark(bm.id, label));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Routes a keystroke while select mode is active on the current
@@ -662,30 +1078,55 @@ impl App {
         }
     }
 
-    /// Build a `msg=<selected msg>` (or `msg!=<selected msg>`,
-    /// depending on the selection's polarity) predicate from the row
-    /// under the highlight, append it to the active filter, and
-    /// re-query.  When the selected row is an error (no parsed event)
-    /// this is a no-op: there's no `msg` to extract, and silently
-    /// exiting the mode would be more confusing than just doing nothing
-    /// and letting the user pick a different row or Esc out.
+    /// Commits the in-progress selection.
+    ///
+    /// For `Exclude` / `Include`: build a `msg=<selected msg>` (or
+    /// `msg!=<selected msg>`) predicate from the row under the
+    /// highlight, append it to the host stream's filter, and re-query.
+    /// For `Bookmark`: open the bookmark-name dialog with the row's
+    /// position pinned (committed when the dialog applies).
+    ///
+    /// When the selected row is an error (no parsed event) this is a
+    /// no-op: there's no `msg` to extract or position to anchor, and
+    /// silently exiting the mode would be more confusing than just
+    /// doing nothing and letting the user pick a different row or Esc
+    /// out.
     fn commit_selection(&mut self) {
         let tab = &self.tabs[self.active];
         let Some(sel) = tab.select else {
             return;
         };
-        let Some(Some(event)) = tab.events.get(sel.row) else {
+        let Some(Some(ee)) = tab.events.get(sel.row) else {
             return;
         };
-        let new_pred = Predicate::FieldEquals {
-            name: "msg".to_string(),
-            value: event.msg.clone(),
-            negated: sel.negated,
-        };
-        let mut new_filter = tab.filter.clone();
-        new_filter.add_predicate(new_pred);
-        // apply_filter resets viewport_top, search, and select.
-        self.apply_filter(new_filter);
+        match sel.action {
+            SelectionAction::Exclude | SelectionAction::Include => {
+                let negated = matches!(sel.action, SelectionAction::Exclude);
+                let new_pred = Predicate::FieldEquals {
+                    name: "msg".to_string(),
+                    value: ee.event.msg.clone(),
+                    negated,
+                };
+                let mut new_filter = self.active_filter().clone();
+                new_filter.add_predicate(new_pred);
+                // apply_filter resets viewport_top, search, and select.
+                self.apply_filter(new_filter);
+            }
+            SelectionAction::Bookmark => {
+                // Snapshot what the bookmark needs at creation time so
+                // the Bookmarks-tab row can render even when the source
+                // isn't currently loaded.
+                let position = ee.position.clone();
+                let display_time = ee.event.time;
+                let display_msg = preview_msg(&ee.event.msg);
+                self.dialog = Some(Dialog::bookmark_name(
+                    position,
+                    display_time,
+                    display_msg,
+                ));
+                self.active_tab_mut().select = None;
+            }
+        }
     }
 
     /// Test constructor that skips the engine entirely.  The scroll
@@ -711,6 +1152,7 @@ impl App {
         assert_eq!(events.len(), formatted.len());
         let mut a = Self {
             engine: Engine::new(),
+            session: Session::new(),
             tabs: Vec::new(),
             active: 0,
             // The first push_tab below consumes "Tab 1".
@@ -720,13 +1162,36 @@ impl App {
             dialog: None,
             last_search: None,
             time_step_idx: DEFAULT_TIME_STEP_IDX,
+            bookmark_cursor: None,
+            notice: None,
         };
-        // Manually push so we can override the row data (the engine
-        // has no sources, so a real push_tab would yield empty vecs).
+        // Manually push so we can override the row data (the engine has
+        // no sources, so a real push_tab would yield empty vecs).
+        // Wrap each pre-built `LogEvent` in an `EngineEvent` so the
+        // bookmark/exclude paths can reach `.event` and `.position`
+        // uniformly.  The synthetic position uses a fixed source id and
+        // the event's own time; tests that don't bookmark don't care.
+        let stream = LogStream::new(format!("Tab {}", a.next_tab_number));
+        let stream_id = stream.id;
+        a.session.streams.insert_unique(stream).expect("unique id");
+        let synthetic_source = SourceId::from("test".to_string());
+        let engine_events: Vec<Option<EngineEvent>> = events
+            .into_iter()
+            .map(|maybe| {
+                maybe.map(|event| EngineEvent {
+                    position: LogStreamPosition::new(
+                        synthetic_source.clone(),
+                        event.time,
+                        0,
+                    ),
+                    event,
+                })
+            })
+            .collect();
         a.tabs.push(Tab {
             name: format!("Tab {}", a.next_tab_number),
-            filter: Filter::default(),
-            events,
+            stream: stream_id,
+            events: engine_events,
             formatted,
             viewport_top: 0,
             search: None,
@@ -766,7 +1231,33 @@ impl App {
                     self.dialog = None;
                     self.repeat_last_search(direction);
                 }
+                DialogResult::ApplyBookmark {
+                    name,
+                    position,
+                    display_time,
+                    display_msg,
+                } => {
+                    self.dialog = None;
+                    self.add_bookmark(
+                        name,
+                        position,
+                        display_time,
+                        display_msg,
+                    );
+                }
+                DialogResult::ApplyDeleteBookmark(id) => {
+                    self.dialog = None;
+                    self.delete_bookmark(id);
+                }
             }
+            return;
+        }
+        // Bookmarks pane has its own narrow keymap (j/k/Enter/x +
+        // Tab cycling).  Routing it here, ahead of the regular-tab
+        // dispatch, keeps the cursor model decoupled from the
+        // log-stream tabs' viewport/selection state.
+        if self.bookmarks_active() {
+            self.handle_bookmarks_key(key);
             return;
         }
         // Exclude mode similarly intercepts every keystroke: in this
@@ -780,6 +1271,8 @@ impl App {
             self.handle_selection_key(key);
             return;
         }
+        // Any other action clears a pending one-shot notice.
+        self.notice = None;
         let page = self.viewport_height as usize;
         let half_page = page / 2;
         match key {
@@ -848,10 +1341,9 @@ impl App {
             // Different terminals report `G` with NONE or SHIFT; accept
             // both.  Don't accept CONTROL/ALT — those are unrelated
             // bindings the user might add later.
-            KeyEvent {
-                code: KeyCode::Char('G'), modifiers, ..
-            } if modifiers == KeyModifiers::NONE
-                || modifiers == KeyModifiers::SHIFT =>
+            KeyEvent { code: KeyCode::Char('G'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
             {
                 let max = self.active_tab().max_top(self.viewport_height);
                 self.active_tab_mut().viewport_top = max;
@@ -869,36 +1361,42 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog =
-                    Some(Dialog::filter(&self.active_tab().filter));
+                self.dialog = Some(Dialog::filter(self.active_filter()));
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
-            // but for *inclusion*.  Different terminals report `X` with
-            // either NONE or SHIFT modifiers (matching `G`/`?`), so we
-            // accept both.  The selection starts at `viewport_top` so
-            // the user can immediately move it through the visible
-            // rows; if the tab is empty there's nothing to select
-            // against, so this is a no-op.
+            // but for *inclusion*; `b`: same mode but for bookmarking
+            // the row under the highlight.  Different terminals report
+            // `X` with either NONE or SHIFT modifiers (matching `G`/
+            // `?`), so we accept both.  The selection starts at
+            // `viewport_top` so the user can immediately move it
+            // through the visible rows; if the tab is empty there's
+            // nothing to select against, so this is a no-op.
             KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.start_selection(/* negated = */ true);
+                self.start_selection(SelectionAction::Exclude);
             }
             KeyEvent { code: KeyCode::Char('X'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                self.start_selection(/* negated = */ false);
+                self.start_selection(SelectionAction::Include);
+            }
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.start_selection(SelectionAction::Bookmark);
             }
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog =
-                    Some(Dialog::rename(&self.active_tab().name));
+                self.dialog = Some(Dialog::rename(&self.active_tab().name));
             }
             // less-style search.  `/` opens a forward prompt, `?` a
             // backward one.  `?` only reaches here as the post-shift
@@ -909,15 +1407,13 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog =
-                    Some(Dialog::search(SearchDirection::Forward));
+                self.dialog = Some(Dialog::search(SearchDirection::Forward));
             }
             KeyEvent { code: KeyCode::Char('?'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                self.dialog =
-                    Some(Dialog::search(SearchDirection::Backward));
+                self.dialog = Some(Dialog::search(SearchDirection::Backward));
             }
             // `n` repeats the last search in its stored direction; `N`
             // reverses it for one move (and does NOT update the stored
@@ -947,10 +1443,9 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                let cloned = self.active_tab().filter.clone();
+                let cloned = self.active_filter().clone();
                 self.push_tab(cloned);
-                self.dialog =
-                    Some(Dialog::filter(&self.active_tab().filter));
+                self.dialog = Some(Dialog::filter(self.active_filter()));
             }
             // Tab cycles forward; Shift-Tab cycles back.  Some
             // terminals send Shift-Tab as `BackTab`, others as `Tab`
@@ -962,9 +1457,7 @@ impl App {
             } => {
                 self.next_tab();
             }
-            KeyEvent {
-                code: KeyCode::BackTab, ..
-            }
+            KeyEvent { code: KeyCode::BackTab, .. }
             | KeyEvent {
                 code: KeyCode::Tab,
                 modifiers: KeyModifiers::SHIFT,
@@ -1060,15 +1553,11 @@ impl LineEditor {
 
     fn handle_edit(&mut self, key: KeyEvent) -> EditAction {
         match key {
-            KeyEvent {
-                code: KeyCode::Backspace, ..
-            } => {
+            KeyEvent { code: KeyCode::Backspace, .. } => {
                 self.backspace();
                 EditAction::Handled
             }
-            KeyEvent {
-                code: KeyCode::Delete, ..
-            } => {
+            KeyEvent { code: KeyCode::Delete, .. } => {
                 self.delete();
                 EditAction::Handled
             }
@@ -1229,6 +1718,21 @@ enum Dialog {
         direction: SearchDirection,
         parse_error: Option<String>,
     },
+    /// Naming a new bookmark just created via the `b` flow.  Carries
+    /// the position (and its rendering preview) the bookmark will
+    /// anchor to.  Empty buffer → unnamed bookmark.  No parse feedback;
+    /// any string is a valid name.
+    BookmarkName {
+        editor: LineEditor,
+        position: LogStreamPosition,
+        display_time: chrono::DateTime<chrono::Utc>,
+        display_msg: String,
+    },
+    /// Confirming the deletion of a bookmark from the Bookmarks tab.
+    /// `id` identifies the bookmark; `label` is what to display in the
+    /// dialog title.  No editor: the user picks Cancel (Esc) or
+    /// Confirm (Enter).
+    ConfirmDeleteBookmark { id: BookmarkId, label: String },
 }
 
 /// Outcome of one keystroke routed to the dialog.
@@ -1249,6 +1753,20 @@ enum DialogResult {
     /// direction (Enter pressed with an empty buffer).  No-op if no
     /// previous search exists.
     RepeatSearch(SearchDirection),
+    /// Close the dialog and add this bookmark to the session.  The
+    /// bookmark's id and `created_at` are minted at apply time so they
+    /// reflect the moment the user actually committed the name.
+    ApplyBookmark {
+        name: Option<BookmarkName>,
+        position: LogStreamPosition,
+        display_time: chrono::DateTime<chrono::Utc>,
+        display_msg: String,
+    },
+    /// Close the dialog and delete the bookmark with this id.  If the
+    /// id is no longer present (concurrent edits aren't a thing here,
+    /// but defending against stale state is cheap) the action is a
+    /// no-op at the App layer.
+    ApplyDeleteBookmark(BookmarkId),
 }
 
 impl Dialog {
@@ -1271,11 +1789,33 @@ impl Dialog {
         }
     }
 
-    fn editor(&self) -> &LineEditor {
+    /// Builds the bookmark-name dialog for a freshly-selected row.
+    /// Empty initial buffer means "unnamed by default"; the user types
+    /// to add a name.
+    fn bookmark_name(
+        position: LogStreamPosition,
+        display_time: chrono::DateTime<chrono::Utc>,
+        display_msg: String,
+    ) -> Self {
+        Self::BookmarkName {
+            editor: LineEditor::new(String::new()),
+            position,
+            display_time,
+            display_msg,
+        }
+    }
+
+    fn confirm_delete_bookmark(id: BookmarkId, label: String) -> Self {
+        Self::ConfirmDeleteBookmark { id, label }
+    }
+
+    fn editor(&self) -> Option<&LineEditor> {
         match self {
             Self::Filter { editor, .. }
             | Self::Rename { editor }
-            | Self::Search { editor, .. } => editor,
+            | Self::Search { editor, .. }
+            | Self::BookmarkName { editor, .. } => Some(editor),
+            Self::ConfirmDeleteBookmark { .. } => None,
         }
     }
 
@@ -1283,17 +1823,34 @@ impl Dialog {
         match self {
             Self::Filter { parse_error, .. }
             | Self::Search { parse_error, .. } => parse_error.as_deref(),
-            Self::Rename { .. } => None,
+            Self::Rename { .. }
+            | Self::BookmarkName { .. }
+            | Self::ConfirmDeleteBookmark { .. } => None,
         }
     }
 
-    fn title(&self) -> &'static str {
+    fn title(&self) -> String {
         match self {
-            Self::Filter { .. } => "Filter (Esc cancel · Enter apply)",
-            Self::Rename { .. } => {
-                "Rename tab (Esc cancel · Enter apply)"
+            Self::Filter { .. } => {
+                "Filter (Esc cancel · Enter apply)".to_string()
             }
-            Self::Search { .. } => "Search (Esc cancel · Enter apply)",
+            Self::Rename { .. } => {
+                "Rename tab (Esc cancel · Enter apply)".to_string()
+            }
+            Self::Search { .. } => {
+                "Search (Esc cancel · Enter apply)".to_string()
+            }
+            Self::BookmarkName { .. } => {
+                "Bookmark name (Esc cancel · Enter save · blank for \
+                 unnamed)"
+                    .to_string()
+            }
+            Self::ConfirmDeleteBookmark { label, .. } => {
+                format!(
+                    "Delete bookmark {label}? (Esc cancel · Enter \
+                     confirm)"
+                )
+            }
         }
     }
 
@@ -1338,7 +1895,12 @@ impl Dialog {
         let editor_result = match self {
             Self::Filter { editor, .. }
             | Self::Rename { editor }
-            | Self::Search { editor, .. } => editor.handle_edit(key),
+            | Self::Search { editor, .. }
+            | Self::BookmarkName { editor, .. } => editor.handle_edit(key),
+            // Confirmation dialog has no editor; non-Esc/Enter keys are
+            // dropped on the floor so a stray `j`/`q` doesn't fall
+            // through to the underlying tab.
+            Self::ConfirmDeleteBookmark { .. } => return DialogResult::Stay,
         };
         if let EditAction::Handled = editor_result {
             self.reparse_filter();
@@ -1378,8 +1940,48 @@ impl Dialog {
                     }
                 }
             }
+            Self::BookmarkName {
+                editor,
+                position,
+                display_time,
+                display_msg,
+            } => {
+                let trimmed = editor.text.trim();
+                let name = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(BookmarkName::from(trimmed.to_string()))
+                };
+                DialogResult::ApplyBookmark {
+                    name,
+                    position: position.clone(),
+                    display_time: *display_time,
+                    display_msg: display_msg.clone(),
+                }
+            }
+            Self::ConfirmDeleteBookmark { id, .. } => {
+                DialogResult::ApplyDeleteBookmark(*id)
+            }
         }
     }
+}
+
+/// First slice of a log message, suitable for the Bookmarks-tab row
+/// preview and confirmation-dialog title.  Truncates at a generous
+/// 80-character limit so a long `msg` doesn't blow out the dialog
+/// width.
+fn preview_msg(msg: &str) -> String {
+    const LIMIT: usize = 80;
+    if msg.len() <= LIMIT {
+        return msg.to_string();
+    }
+    let mut end = LIMIT;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = msg[..end].to_string();
+    out.push('…');
+    out
 }
 
 /// Compact a [`regex::Error`]'s display into a single line, since the
@@ -1391,11 +1993,7 @@ fn regex_error_summary(e: &regex::Error) -> String {
 }
 
 fn prev_char_boundary(s: &str, byte_idx: usize) -> usize {
-    s[..byte_idx]
-        .char_indices()
-        .next_back()
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    s[..byte_idx].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
 }
 
 fn next_char_boundary(s: &str, byte_idx: usize) -> usize {
@@ -1473,6 +2071,18 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_tab_bar(frame, app, tabs_area);
 
     app.viewport_height = content_area.height;
+
+    if app.bookmarks_active() {
+        render_bookmarks_pane(frame, app, content_area);
+        render_bookmarks_footer(frame, app, bottom_area);
+        if let Some(d @ Dialog::ConfirmDeleteBookmark { .. }) =
+            app.dialog.as_ref()
+        {
+            render_dialog(frame, d, area);
+        }
+        return;
+    }
+
     // Re-clamp in case the viewport just shrank past the previous top.
     let max_top = app.active_tab().max_top(app.viewport_height);
     if app.active_tab().viewport_top > max_top {
@@ -1525,26 +2135,42 @@ fn render(frame: &mut Frame, app: &mut App) {
             // discover.  `n`/`N` repeat searches and are taught by the
             // `/` workflow, so they're omitted here to keep the live
             // footer readable on 80-column terminals.
-            let footer = if let Some(sel) = tab.select {
-                let verb = if sel.negated { "exclude" } else { "include" };
-                format!(
-                    "{verb}: j/k select · Enter {verb} msg · \
-                     Esc cancel · row {}/{}",
-                    sel.row + 1,
-                    total,
-                )
+            let footer = if let Some(notice) = app.notice.as_deref() {
+                notice.to_string()
+            } else if let Some(sel) = tab.select {
+                match sel.action {
+                    SelectionAction::Exclude | SelectionAction::Include => {
+                        let verb = match sel.action {
+                            SelectionAction::Exclude => "exclude",
+                            SelectionAction::Include => "include",
+                            SelectionAction::Bookmark => unreachable!(),
+                        };
+                        format!(
+                            "{verb}: j/k select · Enter {verb} msg · \
+                             Esc cancel · row {}/{}",
+                            sel.row + 1,
+                            total,
+                        )
+                    }
+                    SelectionAction::Bookmark => format!(
+                        "bookmark: j/k select · Enter name · \
+                         Esc cancel · row {}/{}",
+                        sel.row + 1,
+                        total,
+                    ),
+                }
             } else if total == 0 {
                 format!(
                     "q quit · f filter · / search · </> step={} · \
-                     x/X exclude/include · ^T new · ^W close · \
-                     r rename · 0/0",
+                     x/X exclude/include · b bookmark · ^T new · \
+                     ^W close · r rename · 0/0",
                     app.current_step_label(),
                 )
             } else {
                 format!(
                     "q quit · f filter · / search · </> step={} · \
-                     x/X exclude/include · ^T new · ^W close · \
-                     r rename · {}-{} of {}",
+                     x/X exclude/include · b bookmark · ^T new · \
+                     ^W close · r rename · {}-{} of {}",
                     app.current_step_label(),
                     top + 1,
                     bottom,
@@ -1555,13 +2181,82 @@ fn render(frame: &mut Frame, app: &mut App) {
         }
     }
 
-    // Centered popups (Filter, Rename) draw on top of the rest.  The
-    // Search prompt is laid out inline above and is skipped here.
-    if let Some(dialog @ (Dialog::Filter { .. } | Dialog::Rename { .. })) =
-        app.dialog.as_ref()
+    // Centered popups (Filter, Rename, BookmarkName,
+    // ConfirmDeleteBookmark) draw on top of the rest.  The Search
+    // prompt is laid out inline above and is skipped here.
+    if let Some(
+        dialog @ (Dialog::Filter { .. }
+        | Dialog::Rename { .. }
+        | Dialog::BookmarkName { .. }
+        | Dialog::ConfirmDeleteBookmark { .. }),
+    ) = app.dialog.as_ref()
     {
         render_dialog(frame, dialog, area);
     }
+}
+
+/// Renders the Bookmarks pane: one row per bookmark, with the cursor
+/// highlight on the selected row.  Each row is `created · file · time
+/// · msg-snippet`.  The Bookmarks pane has no scrolling yet (matching
+/// the existing tab content area, which doesn't either when smaller
+/// than viewport); rows below the viewport simply don't render until
+/// we add scrolling.
+fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let bookmarks = app.flat_bookmarks();
+    if bookmarks.is_empty() {
+        // Should be unreachable because `bookmarks_active()` requires
+        // `has_bookmarks_tab()` which requires count > 0.  Defensive
+        // empty state instead of a panic.
+        frame.render_widget(Paragraph::new(Line::raw("(no bookmarks)")), area);
+        return;
+    }
+    let cursor_id = app.bookmark_cursor;
+    let lines: Vec<Line<'_>> = bookmarks
+        .iter()
+        .take(area.height as usize)
+        .map(|bm| {
+            let source_str: &str = bm.position.source().as_ref();
+            let basename = std::path::Path::new(source_str)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(source_str)
+                .to_string();
+            let name =
+                bm.name.as_ref().map(|n| format!(" [{n}]")).unwrap_or_default();
+            let row = format!(
+                "{} · {} · {} · {}{}",
+                bm.created_at.to_rfc3339(),
+                basename,
+                bm.display_time.to_rfc3339(),
+                bm.display_msg,
+                name,
+            );
+            let mut line = Line::raw(row);
+            if Some(bm.id) == cursor_id {
+                line = line.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            line
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_bookmarks_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let count = app.session.bookmark_count();
+    let footer = if let Some(notice) = app.notice.as_deref() {
+        notice.to_string()
+    } else {
+        format!(
+            "q quit · j/k select · Enter open · x delete · \
+             Tab cycle · {count} bookmark{}",
+            if count == 1 { "" } else { "s" },
+        )
+    };
+    frame.render_widget(Paragraph::new(footer), area);
 }
 
 /// Splits `text` into [`Span`]s, highlighting every (non-empty) match
@@ -1604,10 +2299,7 @@ fn render_search_prompt(
     let prompt_area = Rect::new(area.x, area.y, area.width, 1);
     let prefix = direction.prompt();
     let prompt_text = format!("{prefix}{}", editor.text);
-    frame.render_widget(
-        Paragraph::new(Line::raw(prompt_text)),
-        prompt_area,
-    );
+    frame.render_widget(Paragraph::new(Line::raw(prompt_text)), prompt_area);
 
     // Cursor sits at: x + 1 (for the prefix char) + cursor offset.
     // Search patterns are ASCII in practice, so byte offset == column.
@@ -1623,26 +2315,30 @@ fn render_search_prompt(
     {
         let err_area = Rect::new(area.x, area.y + 1, area.width, 1);
         frame.render_widget(
-            Paragraph::new(Line::raw(err))
-                .style(Style::new().fg(Color::Red)),
+            Paragraph::new(Line::raw(err)).style(Style::new().fg(Color::Red)),
             err_area,
         );
     }
 }
 
 fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let titles: Vec<Line<'_>> =
+    let mut titles: Vec<Line<'_>> =
         app.tabs.iter().map(|t| Line::raw(t.name.as_str())).collect();
-    let widget = Tabs::new(titles).select(app.active).highlight_style(
-        Style::default().add_modifier(Modifier::REVERSED),
-    );
+    if app.has_bookmarks_tab() {
+        titles.push(Line::raw("Bookmarks"));
+    }
+    let widget = Tabs::new(titles)
+        .select(app.active)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(widget, area);
 }
 
 /// Carves a centered popup over `area` and draws either dialog variant.
 ///
-/// The Filter variant additionally renders any parse error in red below
-/// the edit row; the Rename variant simply leaves that row blank.
+/// Variants with an editor (Filter/Rename/Search/BookmarkName) render
+/// their text and cursor on the first row; Filter/Search additionally
+/// render any parse error in red below.  ConfirmDeleteBookmark has no
+/// editor and shows only the question encoded in its title.
 fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     let popup = popup_area(area, 70, 5);
     // Clear the underlying rows so the editor isn't drawn on top of
@@ -1653,34 +2349,32 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let [edit_area, error_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
+    let [edit_area, error_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+            .areas(inner);
 
-    let editor = dialog.editor();
-    frame.render_widget(
-        Paragraph::new(Line::raw(editor.text.as_str())),
-        edit_area,
-    );
-
-    // Cursor column: the dialog buffers are ASCII in practice (filter
-    // syntax is ASCII, tab names typically too), so the byte offset
-    // doubles as the column.  If we ever accept multibyte chars we'd
-    // need to compute the display width here instead.
-    let col = edit_area
-        .x
-        .saturating_add(u16::try_from(editor.cursor).unwrap_or(u16::MAX));
-    let col = col.min(edit_area.x.saturating_add(edit_area.width));
-    frame.set_cursor_position(Position::new(col, edit_area.y));
+    if let Some(editor) = dialog.editor() {
+        frame.render_widget(
+            Paragraph::new(Line::raw(editor.text.as_str())),
+            edit_area,
+        );
+        // Cursor column: the dialog buffers are ASCII in practice
+        // (filter syntax is ASCII, tab names and bookmark names
+        // typically too), so the byte offset doubles as the column.
+        // If we ever accept multibyte chars we'd need to compute the
+        // display width here instead.
+        let col = edit_area
+            .x
+            .saturating_add(u16::try_from(editor.cursor).unwrap_or(u16::MAX));
+        let col = col.min(edit_area.x.saturating_add(edit_area.width));
+        frame.set_cursor_position(Position::new(col, edit_area.y));
+    }
 
     if let Some(err) = dialog.parse_error()
         && error_area.height > 0
     {
         frame.render_widget(
-            Paragraph::new(Line::raw(err))
-                .style(Style::new().fg(Color::Red)),
+            Paragraph::new(Line::raw(err)).style(Style::new().fg(Color::Red)),
             error_area,
         );
     }
@@ -1928,17 +2622,17 @@ mod tests {
         // 'j' goes into the buffer, not to scroll.
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(a.active_tab().viewport_top, 0);
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "qj");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "qj");
     }
 
     #[test]
     fn dialog_prepopulates_with_current_filter() {
         let f: Filter = "level>=warn name=Nexus".parse().unwrap();
         let d = Dialog::filter(&f);
-        assert_eq!(d.editor().text, "level>=warn name=Nexus");
+        assert_eq!(d.editor().unwrap().text, "level>=warn name=Nexus");
         // Cursor is at the end so the user can extend the filter
         // without homing first.
-        assert_eq!(d.editor().cursor, d.editor().text.len());
+        assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
         assert!(d.parse_error().is_none());
     }
 
@@ -1946,8 +2640,8 @@ mod tests {
     fn dialog_typing_inserts_at_cursor() {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "name=Nexus");
-        assert_eq!(d.editor().text, "name=Nexus");
-        assert_eq!(d.editor().cursor, "name=Nexus".len());
+        assert_eq!(d.editor().unwrap().text, "name=Nexus");
+        assert_eq!(d.editor().unwrap().cursor, "name=Nexus".len());
     }
 
     #[test]
@@ -1955,8 +2649,8 @@ mod tests {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "abc");
         d.handle_key(key(KeyCode::Backspace));
-        assert_eq!(d.editor().text, "ab");
-        assert_eq!(d.editor().cursor, 2);
+        assert_eq!(d.editor().unwrap().text, "ab");
+        assert_eq!(d.editor().unwrap().cursor, 2);
     }
 
     #[test]
@@ -1964,13 +2658,13 @@ mod tests {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "abc");
         d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.editor().cursor, 2);
+        assert_eq!(d.editor().unwrap().cursor, 2);
         d.handle_key(key(KeyCode::Home));
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().cursor, 0);
         d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.editor().cursor, 1);
+        assert_eq!(d.editor().unwrap().cursor, 1);
         d.handle_key(key(KeyCode::End));
-        assert_eq!(d.editor().cursor, 3);
+        assert_eq!(d.editor().unwrap().cursor, 3);
     }
 
     #[test]
@@ -1979,8 +2673,8 @@ mod tests {
         type_into(&mut d, "abc");
         d.handle_key(key(KeyCode::Home));
         d.handle_key(key(KeyCode::Delete));
-        assert_eq!(d.editor().text, "bc");
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().text, "bc");
+        assert_eq!(d.editor().unwrap().cursor, 0);
     }
 
     #[test]
@@ -1991,10 +2685,10 @@ mod tests {
         for _ in 0..3 {
             d.handle_key(key(KeyCode::Left));
         }
-        let cursor_before = d.editor().cursor;
+        let cursor_before = d.editor().unwrap().cursor;
         d.handle_key(ctrl('u'));
-        assert_eq!(d.editor().text, "xus");
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().text, "xus");
+        assert_eq!(d.editor().unwrap().cursor, 0);
         assert!(cursor_before > 0);
     }
 
@@ -2004,8 +2698,8 @@ mod tests {
         type_into(&mut d, "abc");
         d.handle_key(key(KeyCode::Home));
         d.handle_key(ctrl('u'));
-        assert_eq!(d.editor().text, "abc");
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().text, "abc");
+        assert_eq!(d.editor().unwrap().cursor, 0);
     }
 
     #[test]
@@ -2014,8 +2708,8 @@ mod tests {
         type_into(&mut d, "level>=warn name=Nexus");
         d.handle_key(ctrl('w'));
         // The whole `name=Nexus` token disappears, plus the space.
-        assert_eq!(d.editor().text, "level>=warn ");
-        assert_eq!(d.editor().cursor, "level>=warn ".len());
+        assert_eq!(d.editor().unwrap().text, "level>=warn ");
+        assert_eq!(d.editor().unwrap().cursor, "level>=warn ".len());
     }
 
     #[test]
@@ -2023,8 +2717,8 @@ mod tests {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "name=Nexus   ");
         d.handle_key(ctrl('w'));
-        assert_eq!(d.editor().text, "");
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().text, "");
+        assert_eq!(d.editor().unwrap().cursor, 0);
     }
 
     #[test]
@@ -2032,19 +2726,25 @@ mod tests {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "level>=warn name=Nexus");
         d.handle_key(alt('b'));
-        assert_eq!(&d.editor().text[d.editor().cursor..], "Nexus");
-        d.handle_key(alt('b'));
-        assert_eq!(&d.editor().text[d.editor().cursor..], "name=Nexus");
+        assert_eq!(
+            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
+            "Nexus"
+        );
         d.handle_key(alt('b'));
         assert_eq!(
-            &d.editor().text[d.editor().cursor..],
+            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
+            "name=Nexus"
+        );
+        d.handle_key(alt('b'));
+        assert_eq!(
+            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
             "warn name=Nexus",
         );
         d.handle_key(alt('b'));
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().cursor, 0);
         // Once more: clamped at zero.
         d.handle_key(alt('b'));
-        assert_eq!(d.editor().cursor, 0);
+        assert_eq!(d.editor().unwrap().cursor, 0);
     }
 
     #[test]
@@ -2053,19 +2753,25 @@ mod tests {
         type_into(&mut d, "level>=warn name=Nexus");
         d.handle_key(key(KeyCode::Home));
         d.handle_key(alt('f'));
-        assert_eq!(&d.editor().text[..d.editor().cursor], "level");
-        d.handle_key(alt('f'));
-        assert_eq!(&d.editor().text[..d.editor().cursor], "level>=warn");
+        assert_eq!(
+            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
+            "level"
+        );
         d.handle_key(alt('f'));
         assert_eq!(
-            &d.editor().text[..d.editor().cursor],
+            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
+            "level>=warn"
+        );
+        d.handle_key(alt('f'));
+        assert_eq!(
+            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
             "level>=warn name",
         );
         d.handle_key(alt('f'));
-        assert_eq!(d.editor().cursor, d.editor().text.len());
+        assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
         // Once more: clamped.
         d.handle_key(alt('f'));
-        assert_eq!(d.editor().cursor, d.editor().text.len());
+        assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
     }
 
     #[test]
@@ -2073,7 +2779,7 @@ mod tests {
         let mut d = Dialog::filter(&Filter::default());
         type_into(&mut d, "bogus");
         assert!(d.parse_error().is_some());
-        let len = d.editor().text.len();
+        let len = d.editor().unwrap().text.len();
         for _ in 0..len {
             d.handle_key(key(KeyCode::Backspace));
         }
@@ -2098,18 +2804,18 @@ mod tests {
         type_into(a.dialog.as_mut().unwrap(), "level>=warn");
         a.handle_key(key(KeyCode::Enter));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_tab().filter.to_string(), "level>=warn");
+        assert_eq!(a.active_filter().to_string(), "level>=warn");
     }
 
     #[test]
     fn dialog_escape_discards_changes() {
         let mut a = app(10, 5);
-        let original_filter = a.active_tab().filter.to_string();
+        let original_filter = a.active_filter().to_string();
         a.handle_key(key(KeyCode::Char('f')));
         type_into(a.dialog.as_mut().unwrap(), "name=Nexus");
         a.handle_key(key(KeyCode::Esc));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_tab().filter.to_string(), original_filter);
+        assert_eq!(a.active_filter().to_string(), original_filter);
     }
 
     #[test]
@@ -2130,9 +2836,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            let drain = slog_bunyan::with_name("Nexus", file)
-                .build()
-                .fuse();
+            let drain = slog_bunyan::with_name("Nexus", file).build().fuse();
             let log = Logger::root(Mutex::new(drain).fuse(), o!());
             for _ in 0..5 {
                 info!(log, "info entry");
@@ -2195,11 +2899,11 @@ mod tests {
         a.handle_key(ctrl('t'));
         assert_eq!(a.tabs.len(), 2);
         assert_eq!(a.active, 1);
-        assert_eq!(a.active_tab().filter.to_string(), "level>=warn");
+        assert_eq!(a.active_filter().to_string(), "level>=warn");
         // Filter dialog is open with the cloned filter prefilled.
         let d = a.dialog.as_ref().expect("dialog should be open");
         assert!(matches!(d, Dialog::Filter { .. }));
-        assert_eq!(d.editor().text, "level>=warn");
+        assert_eq!(d.editor().unwrap().text, "level>=warn");
     }
 
     #[test]
@@ -2225,7 +2929,7 @@ mod tests {
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.tabs.len(), 2);
         assert_eq!(a.active, 1);
-        assert_eq!(a.active_tab().filter.to_string(), "level>=warn");
+        assert_eq!(a.active_filter().to_string(), "level>=warn");
     }
 
     #[test]
@@ -2279,7 +2983,7 @@ mod tests {
         assert_eq!(a.active, 0);
         // It's a new tab — different name (next number).
         assert_ne!(a.active_tab().name, original_name);
-        assert!(a.active_tab().filter.predicates().is_empty());
+        assert!(a.active_filter().predicates().is_empty());
     }
 
     #[test]
@@ -2304,7 +3008,10 @@ mod tests {
         a.handle_key(ctrl('w'));
         // Dialog still open, buffer lost its last word.
         assert!(a.dialog.is_some());
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "level>=warn ");
+        assert_eq!(
+            a.dialog.as_ref().unwrap().editor().unwrap().text,
+            "level>=warn "
+        );
         // Tab count unchanged.
         assert_eq!(a.tabs.len(), 1);
     }
@@ -2317,7 +3024,7 @@ mod tests {
         a.handle_key(key(KeyCode::Char('r')));
         let d = a.dialog.as_ref().expect("dialog should be open");
         assert!(matches!(d, Dialog::Rename { .. }));
-        assert_eq!(d.editor().text, "Tab 1");
+        assert_eq!(d.editor().unwrap().text, "Tab 1");
     }
 
     #[test]
@@ -2397,7 +3104,7 @@ mod tests {
             d,
             Dialog::Search { direction: SearchDirection::Forward, .. }
         ));
-        assert_eq!(d.editor().text, "");
+        assert_eq!(d.editor().unwrap().text, "");
     }
 
     #[test]
@@ -2416,7 +3123,7 @@ mod tests {
         let mut a = search_app();
         a.handle_key(key(KeyCode::Char('/')));
         type_into(a.dialog.as_mut().unwrap(), "alpha");
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "alpha");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "alpha");
     }
 
     #[test]
@@ -2430,7 +3137,7 @@ mod tests {
         // 'j' goes into the buffer, not to scroll.
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(a.active_tab().viewport_top, 0);
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "qj");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "qj");
     }
 
     #[test]
@@ -2440,7 +3147,7 @@ mod tests {
         type_into(a.dialog.as_mut().unwrap(), "alpha beta");
         a.handle_key(ctrl('w'));
         assert!(a.dialog.is_some());
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "alpha ");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "alpha ");
         assert_eq!(a.tabs.len(), 1);
     }
 
@@ -2671,11 +3378,10 @@ mod tests {
 
     #[test]
     fn compute_matches_returns_sorted_indices() {
-        let rows: Vec<String> =
-            ["foo", "bar", "foo bar", "baz", "qux foo"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let rows: Vec<String> = ["foo", "bar", "foo bar", "baz", "qux foo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let regex = Regex::new("foo").unwrap();
         assert_eq!(compute_matches(&rows, &regex), vec![0, 2, 4]);
     }
@@ -2805,11 +3511,15 @@ mod tests {
     }
 
     fn excl_sel(row: usize) -> Selection {
-        Selection { row, negated: true }
+        Selection { row, action: SelectionAction::Exclude }
     }
 
     fn incl_sel(row: usize) -> Selection {
-        Selection { row, negated: false }
+        Selection { row, action: SelectionAction::Include }
+    }
+
+    fn bm_sel(row: usize) -> Selection {
+        Selection { row, action: SelectionAction::Bookmark }
     }
 
     #[test]
@@ -2918,12 +3628,12 @@ mod tests {
     #[test]
     fn select_esc_cancels_without_changing_filter() {
         let mut a = select_app(5, 5);
-        let before = a.active_tab().filter.to_string();
+        let before = a.active_filter().to_string();
         a.handle_key(key(KeyCode::Char('x')));
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.active_tab().select, None);
-        assert_eq!(a.active_tab().filter.to_string(), before);
+        assert_eq!(a.active_filter().to_string(), before);
     }
 
     #[test]
@@ -2937,7 +3647,7 @@ mod tests {
         assert_eq!(a.active_tab().select, None);
         // The new predicate displays as `msg!="msg 2"` (quoted because
         // it contains whitespace).
-        let displayed = a.active_tab().filter.to_string();
+        let displayed = a.active_filter().to_string();
         assert!(
             displayed.contains("msg!=") && displayed.contains("msg 2"),
             "expected exclusion predicate in {displayed:?}",
@@ -2953,7 +3663,7 @@ mod tests {
         // Selection is at row 2 → "msg 2".
         a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.active_tab().select, None);
-        let displayed = a.active_tab().filter.to_string();
+        let displayed = a.active_filter().to_string();
         assert!(
             displayed.contains("msg=") && displayed.contains("msg 2"),
             "expected inclusion predicate in {displayed:?}",
@@ -2978,10 +3688,10 @@ mod tests {
         a.viewport_height = 5;
         a.handle_key(key(KeyCode::Char('x')));
         a.handle_key(key(KeyCode::Char('j'))); // selection -> row 1 (error)
-        let before = a.active_tab().filter.to_string();
+        let before = a.active_filter().to_string();
         a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.active_tab().select, Some(excl_sel(1)));
-        assert_eq!(a.active_tab().filter.to_string(), before);
+        assert_eq!(a.active_filter().to_string(), before);
     }
 
     #[test]
@@ -3243,7 +3953,7 @@ mod tests {
         a.handle_key(shift('>'));
         a.handle_key(shift('<'));
         assert_eq!(a.time_step_idx, before);
-        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "=-><");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "=-><");
     }
 
     #[test]
@@ -3259,5 +3969,244 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(dump.contains("step=5m"), "dump:\n{dump}");
+    }
+
+    // ---------- bookmarks ----------
+
+    /// Drives `b` → j/k → Enter → typed name → Enter to create one
+    /// named bookmark.  Uses [`select_app`] so `commit_selection` has
+    /// real events whose positions and msgs can be captured.
+    fn create_bookmark(a: &mut App, row: usize, name: Option<&str>) {
+        a.handle_key(key(KeyCode::Char('b')));
+        // Move the highlight from row 0 to `row`.
+        for _ in 0..row {
+            a.handle_key(key(KeyCode::Char('j')));
+        }
+        a.handle_key(key(KeyCode::Enter));
+        // Bookmark-name dialog is open; type and confirm.
+        if let Some(n) = name {
+            for c in n.chars() {
+                a.handle_key(key(KeyCode::Char(c)));
+            }
+        }
+        a.handle_key(key(KeyCode::Enter));
+    }
+
+    #[test]
+    fn b_enters_bookmark_mode_at_viewport_top() {
+        let mut a = select_app(10, 5);
+        a.active_tab_mut().viewport_top = 3;
+        a.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(a.active_tab().select, Some(bm_sel(3)));
+    }
+
+    #[test]
+    fn b_is_noop_when_no_rows() {
+        let mut a = App::with_rows(Vec::new());
+        a.viewport_height = 5;
+        a.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(a.active_tab().select, None);
+    }
+
+    #[test]
+    fn bookmark_enter_opens_name_dialog() {
+        let mut a = select_app(5, 5);
+        a.handle_key(key(KeyCode::Char('b')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(matches!(a.dialog, Some(Dialog::BookmarkName { .. })));
+        // Bookmark mode exited; selection cleared.
+        assert!(a.active_tab().select.is_none());
+    }
+
+    #[test]
+    fn bookmark_apply_with_blank_name_creates_unnamed() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 1, None);
+        assert!(a.dialog.is_none());
+        assert_eq!(a.session.bookmark_count(), 1);
+        let bm = a.flat_bookmarks()[0];
+        assert!(bm.name.is_none());
+    }
+
+    #[test]
+    fn bookmark_apply_with_name_creates_named() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 2, Some("here"));
+        assert_eq!(a.session.bookmark_count(), 1);
+        let bm = a.flat_bookmarks()[0];
+        assert_eq!(
+            bm.name.as_ref().map(|n| n.to_string()),
+            Some("here".into())
+        );
+    }
+
+    #[test]
+    fn bookmark_on_error_row_is_noop() {
+        // An error row commits to neither the exclusion path nor the
+        // bookmark path; mirror exclude-mode's silent-noop behavior.
+        let events = vec![Some(ev("first")), None, Some(ev("third"))];
+        let formatted = vec![
+            "row 0".to_string(),
+            "error: parse failure".to_string(),
+            "row 2".to_string(),
+        ];
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = 5;
+        a.handle_key(key(KeyCode::Char('b')));
+        a.handle_key(key(KeyCode::Char('j'))); // selection -> error row
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none(), "no dialog should open for an error row");
+        assert_eq!(a.session.bookmark_count(), 0);
+        // Selection should remain intact so user can pick a different row.
+        assert_eq!(a.active_tab().select, Some(bm_sel(1)));
+    }
+
+    #[test]
+    fn bookmarks_tab_appears_iff_at_least_one_bookmark() {
+        let mut a = select_app(5, 5);
+        assert!(!a.has_bookmarks_tab());
+        create_bookmark(&mut a, 0, None);
+        assert!(a.has_bookmarks_tab());
+    }
+
+    #[test]
+    fn bookmarks_tab_cycling_with_tab_key() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        // Now `tabs.len() == 1` plus the synthetic Bookmarks tab.
+        assert_eq!(a.pane_count(), 2);
+        // Active pane is still the regular tab (creating a bookmark
+        // doesn't auto-switch).
+        assert!(!a.bookmarks_active());
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        a.handle_key(key(KeyCode::Tab));
+        assert!(!a.bookmarks_active());
+    }
+
+    #[test]
+    fn bookmarks_tab_ignores_ctrl_w() {
+        // Ctrl-W cannot close the synthetic Bookmarks tab.
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        a.handle_key(ctrl('w'));
+        // Still active; tabs.len() unchanged.
+        assert!(a.bookmarks_active());
+        assert_eq!(a.tabs.len(), 1);
+    }
+
+    #[test]
+    fn bookmarks_tab_jk_moves_cursor() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        create_bookmark(&mut a, 1, None);
+        create_bookmark(&mut a, 2, None);
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        // No cursor yet → first j initializes at row 0 then advances
+        // to row 1.
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.bookmark_cursor_idx(), Some(1));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.bookmark_cursor_idx(), Some(2));
+        a.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(a.bookmark_cursor_idx(), Some(1));
+    }
+
+    #[test]
+    fn bookmark_x_opens_confirmation_dialog() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, Some("named"));
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        // First j initializes the bookmark cursor at row 0; without it
+        // `x` would no-op (no cursor → no row to delete).
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('x')));
+        assert!(
+            matches!(a.dialog, Some(Dialog::ConfirmDeleteBookmark { .. }),)
+        );
+        // Bookmark not yet deleted.
+        assert_eq!(a.session.bookmark_count(), 1);
+    }
+
+    #[test]
+    fn bookmark_x_confirm_deletes_and_hides_tab_when_last() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        assert_eq!(a.session.bookmark_count(), 0);
+        // Synthetic tab gone; user is bounced back to the last regular tab.
+        assert!(!a.has_bookmarks_tab());
+        assert_eq!(a.active, 0);
+    }
+
+    #[test]
+    fn bookmark_x_cancel_keeps_bookmark() {
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        a.handle_key(key(KeyCode::Tab));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.dialog.is_none());
+        assert_eq!(a.session.bookmark_count(), 1);
+    }
+
+    #[test]
+    fn session_persistence_round_trip_preserves_user_bookmarks() {
+        // Build an App, create a couple of bookmarks, serialize the
+        // resulting Session, deserialize, and confirm the bookmarks
+        // (and the streams they reference) round-trip.  Doesn't touch
+        // the filesystem — the actual `save_session`/`load_session`
+        // wrappers are thin glue that's covered by test isolation
+        // concerns we'd rather not introduce here.
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, Some("first"));
+        create_bookmark(&mut a, 2, None);
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.version, seer::CURRENT_SESSION_VERSION);
+        assert_eq!(restored.bookmark_count(), 2);
+        // Both bookmarks are filed under the same stream id (the only
+        // tab in this fixture).
+        let stream_id = a.tabs[0].stream;
+        let bms = restored.user_bookmarks.get(&stream_id).unwrap();
+        assert_eq!(bms.len(), 2);
+        assert_eq!(
+            bms[0].name.as_ref().map(|n| n.to_string()),
+            Some("first".to_string()),
+        );
+        assert!(bms[1].name.is_none());
+        // The stream itself made the trip too — opening a fresh App
+        // with the restored session would have access to its filter.
+        assert!(restored.streams.get(&stream_id).is_some());
+    }
+
+    #[test]
+    fn bookmark_enter_navigates_within_existing_tab() {
+        // Make a bookmark on row 2, switch to Bookmarks tab, hit Enter.
+        // The bookmark's stream is still open in tab 0, so we should
+        // switch back to it.  We can't easily verify viewport_top
+        // without a real engine (with_events synthesizes positions),
+        // but we can verify the tab switch happens.
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 2, None);
+        let original_tab = a.active;
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        // Initialize the bookmark cursor at the only entry.
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('k')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(!a.bookmarks_active());
+        assert_eq!(a.active, original_tab);
     }
 }

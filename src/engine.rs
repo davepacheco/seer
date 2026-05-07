@@ -14,9 +14,22 @@
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::source::{FileSource, Source, SourceError, SourceId};
+use crate::stream::LogStreamPosition;
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
+
+/// An [`Event`] paired with the [`LogStreamPosition`] identifying which
+/// source it came from and its position within that source.
+///
+/// The position is a stable anchor (source id + timestamp + a tiebreaker
+/// for events that share a timestamp) and survives changes to the active
+/// filter — see [`LogStreamPosition`].
+#[derive(Debug, Clone)]
+pub struct EngineEvent {
+    pub position: LogStreamPosition,
+    pub event: Event,
+}
 
 /// Tracks the current set of sources and serves event queries.
 #[derive(Default)]
@@ -58,17 +71,116 @@ impl Engine {
     pub fn query_events<'a>(
         &'a self,
         filter: &'a Filter,
-    ) -> impl Iterator<Item = Result<Event, SourceError>> + 'a {
+    ) -> impl Iterator<Item = Result<EngineEvent, SourceError>> + 'a {
         let cursors = self
             .sources
             .iter()
             .map(|s| SourceCursor::new(s.as_ref()))
             .collect();
         MergeIter { cursors }.filter(move |r| match r {
-            Ok(e) => filter.matches(e),
+            Ok(e) => filter.matches(&e.event),
             Err(_) => true,
         })
     }
+
+    /// Resolves `position` against the current sources, viewed through
+    /// `filter`, into a row index in the corresponding
+    /// `query_events(filter)` output.
+    ///
+    /// Bookmarks anchor by `(source, time, ordinal_within_time)` rather
+    /// than by ordinal in a filtered view, so this method has to walk
+    /// the unfiltered stream to find the anchored event and then count
+    /// how many filter-matching events precede it.  See
+    /// [`ResolvePosition`] for the meaning of each outcome.
+    pub fn resolve_position(
+        &self,
+        filter: &Filter,
+        position: &LogStreamPosition,
+    ) -> ResolvePosition {
+        if !self.sources.iter().any(|s| s.id() == position.source()) {
+            return ResolvePosition::Gone;
+        }
+        let mut row_in_filtered: usize = 0;
+        let mut last_visible_before: Option<usize> = None;
+        // Walk the unfiltered merge.  For each Ok event, decide three
+        // things: is it the anchor (compare positions); is it visible
+        // under `filter`; is it earlier or later than the anchor in
+        // emit order.  Errors don't appear in `query_events(filter)`
+        // either when filter rejects no errors — but our Ok-only counter
+        // is what matters here, since callers index into events, and
+        // their events vec parallels query_events output.
+        let cursors = self
+            .sources
+            .iter()
+            .map(|s| SourceCursor::new(s.as_ref()))
+            .collect();
+        let merge = MergeIter { cursors };
+        // We need to know if the anchor exists at all (to distinguish
+        // FilteredOut from Gone) and where the next visible event after
+        // the anchor sits.  Track these through a second pass over the
+        // tail.  Concretely: walk in one pass and react when we hit
+        // (or pass) the anchor.
+        let mut found_anchor = false;
+        let mut next_visible_after: Option<usize> = None;
+        for item in merge {
+            let Ok(ee) = item else { continue };
+            let visible = filter.matches(&ee.event);
+            if found_anchor {
+                if visible {
+                    next_visible_after = Some(row_in_filtered);
+                    break;
+                }
+                // Each filter-matched Ok event would advance the index;
+                // non-matched events are skipped, matching query_events.
+                continue;
+            }
+            if &ee.position == position {
+                found_anchor = true;
+                if visible {
+                    return ResolvePosition::Found(row_in_filtered);
+                }
+                // Anchor exists but is filtered out; next visible event
+                // (if any) wins.  Don't advance row_in_filtered for a
+                // filtered-out event.
+                continue;
+            }
+            if visible {
+                last_visible_before = Some(row_in_filtered);
+                row_in_filtered += 1;
+            }
+        }
+        if !found_anchor {
+            return ResolvePosition::Gone;
+        }
+        // Anchor is present but filtered out; pick the closest visible
+        // neighbor.  Prefer the next event after the anchor (closer in
+        // time when scrolling forward through bookmarks); fall back to
+        // the previous event when nothing later is visible.
+        match (next_visible_after, last_visible_before) {
+            (Some(idx), _) => ResolvePosition::FilteredOut(idx),
+            (None, Some(idx)) => ResolvePosition::FilteredOut(idx),
+            (None, None) => ResolvePosition::FilteredOut(0),
+        }
+    }
+}
+
+/// Outcome of [`Engine::resolve_position`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvePosition {
+    /// The bookmarked event is currently visible at the returned row
+    /// index in `query_events(filter)`.
+    Found(usize),
+    /// The bookmarked event still exists in the source but is hidden by
+    /// the active filter.  The returned index is the closest visible
+    /// neighbor: preferring the next visible event after the anchor,
+    /// falling back to the previous one when nothing later survives the
+    /// filter.  When no events at all survive the filter the index is
+    /// `0`, which is conventionally the top of the (empty) view.
+    FilteredOut(usize),
+    /// The source the bookmark refers to is no longer attached to this
+    /// engine, or the source is attached but the anchored event isn't
+    /// present (e.g. the file was rewritten between sessions).
+    Gone,
 }
 
 /// One-step lookahead over a single [`Source`]'s event stream, with
@@ -84,8 +196,14 @@ impl Engine {
 /// shouldn't drown its real entries in repeated warnings.
 struct SourceCursor<'a> {
     iter: Box<dyn Iterator<Item = Result<Event, SourceError>> + 'a>,
-    pending: VecDeque<Result<Event, SourceError>>,
+    pending: VecDeque<Result<EngineEvent, SourceError>>,
     last_time: Option<DateTime<Utc>>,
+    /// Number of events already emitted whose `time` matches `last_time`.
+    /// Used to compute the next event's intra-time ordinal so two events
+    /// with identical timestamps still have distinct
+    /// [`LogStreamPosition`]s.  Resets to 0 whenever the timestamp
+    /// changes.
+    intra_time_count: u64,
     source_id: SourceId,
     out_of_order_warned: bool,
 }
@@ -96,6 +214,7 @@ impl<'a> SourceCursor<'a> {
             iter: source.events(),
             pending: VecDeque::new(),
             last_time: None,
+            intra_time_count: 0,
             source_id: source.id().clone(),
             out_of_order_warned: false,
         }
@@ -112,33 +231,48 @@ impl<'a> SourceCursor<'a> {
         let Some(item) = self.iter.next() else {
             return;
         };
-        if let Ok(ev) = &item
-            && let Some(prev) = self.last_time
-            && ev.time < prev
-            && !self.out_of_order_warned
-        {
-            self.pending.push_back(Err(SourceError::OutOfOrder {
-                source_id: self.source_id.clone(),
-                seen: ev.time,
-                last_seen: prev,
-            }));
-            self.out_of_order_warned = true;
+        match item {
+            Err(e) => {
+                self.pending.push_back(Err(e));
+            }
+            Ok(event) => {
+                if let Some(prev) = self.last_time
+                    && event.time < prev
+                    && !self.out_of_order_warned
+                {
+                    self.pending.push_back(Err(SourceError::OutOfOrder {
+                        source_id: self.source_id.clone(),
+                        seen: event.time,
+                        last_seen: prev,
+                    }));
+                    self.out_of_order_warned = true;
+                }
+                let ordinal = if self.last_time == Some(event.time) {
+                    self.intra_time_count
+                } else {
+                    0
+                };
+                self.intra_time_count = ordinal + 1;
+                self.last_time = Some(event.time);
+                let position = LogStreamPosition::new(
+                    self.source_id.clone(),
+                    event.time,
+                    ordinal,
+                );
+                self.pending.push_back(Ok(EngineEvent { position, event }));
+            }
         }
-        if let Ok(ev) = &item {
-            self.last_time = Some(ev.time);
-        }
-        self.pending.push_back(item);
     }
 
     /// Returns the head of the cursor without consuming it.  Returns
     /// `None` once the source is fully drained.
-    fn peek(&mut self) -> Option<&Result<Event, SourceError>> {
+    fn peek(&mut self) -> Option<&Result<EngineEvent, SourceError>> {
         self.fill();
         self.pending.front()
     }
 
     /// Consumes and returns the head of the cursor.
-    fn pop(&mut self) -> Option<Result<Event, SourceError>> {
+    fn pop(&mut self) -> Option<Result<EngineEvent, SourceError>> {
         self.fill();
         self.pending.pop_front()
     }
@@ -158,7 +292,7 @@ struct MergeIter<'a> {
 }
 
 impl<'a> Iterator for MergeIter<'a> {
-    type Item = Result<Event, SourceError>;
+    type Item = Result<EngineEvent, SourceError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut best: Option<usize> = None;
@@ -171,7 +305,7 @@ impl<'a> Iterator for MergeIter<'a> {
             let outcome = match self.cursors[i].peek() {
                 None => None,
                 Some(Err(_)) => Some((true, None)),
-                Some(Ok(ev)) => Some((false, Some(ev.time))),
+                Some(Ok(ev)) => Some((false, Some(ev.event.time))),
             };
             let Some((is_err, time)) = outcome else {
                 continue;
@@ -232,8 +366,10 @@ mod tests {
         assert_ne!(id_a, id_b);
 
         let filter = Filter::default();
-        let msgs: Vec<_> =
-            engine.query_events(&filter).map(|e| e.unwrap().msg).collect();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|e| e.unwrap().event.msg)
+            .collect();
         assert_eq!(msgs, vec!["a1", "b1", "a2", "b2"]);
 
         dir.cleanup();
@@ -254,7 +390,7 @@ mod tests {
         engine.add_file_source(&b).unwrap();
         let msgs: Vec<_> = engine
             .query_events(&Filter::default())
-            .map(|e| e.unwrap().msg)
+            .map(|e| e.unwrap().event.msg)
             .collect();
         assert_eq!(msgs, vec!["a-tie", "b-tie"]);
 
@@ -276,7 +412,7 @@ mod tests {
         engine.add_file_source(&b).unwrap();
         let msgs: Vec<_> = engine
             .query_events(&Filter::default())
-            .map(|e| e.unwrap().msg)
+            .map(|e| e.unwrap().event.msg)
             .collect();
         assert_eq!(msgs, vec!["a1", "a2"]);
 
@@ -305,13 +441,13 @@ mod tests {
         engine.add_file_source(&b).unwrap();
         let results: Vec<_> = engine.query_events(&Filter::default()).collect();
         assert_eq!(results.len(), 4);
-        assert_eq!(results[0].as_ref().unwrap().msg, "a1");
+        assert_eq!(results[0].as_ref().unwrap().event.msg, "a1");
         assert!(matches!(
             results[1].as_ref().unwrap_err(),
             SourceError::Parse(_),
         ));
-        assert_eq!(results[2].as_ref().unwrap().msg, "b1");
-        assert_eq!(results[3].as_ref().unwrap().msg, "a2");
+        assert_eq!(results[2].as_ref().unwrap().event.msg, "b1");
+        assert_eq!(results[3].as_ref().unwrap().event.msg, "a2");
 
         dir.cleanup();
     }
@@ -335,8 +471,8 @@ mod tests {
         // is emitted just before the first regressing event, and only
         // once for the source.
         assert_eq!(results.len(), 5);
-        assert_eq!(results[0].as_ref().unwrap().msg, "first");
-        assert_eq!(results[1].as_ref().unwrap().msg, "second");
+        assert_eq!(results[0].as_ref().unwrap().event.msg, "first");
+        assert_eq!(results[1].as_ref().unwrap().event.msg, "second");
         let warning = results[2].as_ref().unwrap_err();
         match warning {
             SourceError::OutOfOrder { seen, last_seen, .. } => {
@@ -345,8 +481,8 @@ mod tests {
             }
             other => panic!("expected OutOfOrder, got {other:?}"),
         }
-        assert_eq!(results[3].as_ref().unwrap().msg, "third");
-        assert_eq!(results[4].as_ref().unwrap().msg, "fourth");
+        assert_eq!(results[3].as_ref().unwrap().event.msg, "third");
+        assert_eq!(results[4].as_ref().unwrap().event.msg, "fourth");
 
         dir.cleanup();
     }
@@ -406,8 +542,10 @@ mod tests {
         let mut engine = Engine::new();
         engine.add_file_source(&p).unwrap();
         let filter = Filter::default();
-        let levels: Vec<_> =
-            engine.query_events(&filter).map(|e| e.unwrap().level).collect();
+        let levels: Vec<_> = engine
+            .query_events(&filter)
+            .map(|e| e.unwrap().event.level)
+            .collect();
         assert_eq!(levels, vec![Level::Debug, Level::Error]);
 
         dir.cleanup();
@@ -426,8 +564,10 @@ mod tests {
         engine.add_file_source(&p).unwrap();
 
         let filter: Filter = "level>=warn".parse().unwrap();
-        let msgs: Vec<_> =
-            engine.query_events(&filter).map(|r| r.unwrap().msg).collect();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().event.msg)
+            .collect();
         assert_eq!(msgs, vec!["e"]);
 
         dir.cleanup();
@@ -446,10 +586,165 @@ mod tests {
         engine.add_file_source(&p).unwrap();
 
         let filter: Filter = "name=Nexus msg=~blueprint".parse().unwrap();
-        let msgs: Vec<_> =
-            engine.query_events(&filter).map(|r| r.unwrap().msg).collect();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().event.msg)
+            .collect();
         assert_eq!(msgs, vec!["blueprint executed", "blueprint failed"]);
 
+        dir.cleanup();
+    }
+
+    /// Build a fixture engine where each source has events at the
+    /// supplied epoch seconds (one per second, message `"<name> <i>"`).
+    /// Returns the engine plus the [`SourceId`] for each source so
+    /// tests can build anchors.
+    fn fixture_engine(
+        dir: &TestDir,
+        sources: &[(&str, &[i64])],
+    ) -> (Engine, Vec<SourceId>) {
+        let mut engine = Engine::new();
+        let mut ids = Vec::new();
+        for (name, seconds) in sources {
+            let p = dir.path().join(format!("{name}.log"));
+            for sec in *seconds {
+                append_bunyan_at(&p, "x", t(*sec), &format!("{name} {sec}"));
+            }
+            ids.push(engine.add_file_source(&p).unwrap());
+        }
+        (engine, ids)
+    }
+
+    /// Walks `engine`'s default-filter merge and returns the position of
+    /// the n-th `Ok` event.  Tests use this instead of building anchors
+    /// by hand because `LogStreamPosition` carries a tiebreaker that
+    /// would be tedious (and brittle) to mint manually.
+    fn nth_position(engine: &Engine, n: usize) -> LogStreamPosition {
+        engine
+            .query_events(&Filter::default())
+            .filter_map(|r| r.ok())
+            .nth(n)
+            .expect("event index in range")
+            .position
+    }
+
+    #[test]
+    fn resolve_position_finds_anchored_event_under_default_filter() {
+        let dir = TestDir::new();
+        let (engine, _ids) = fixture_engine(&dir, &[("a", &[10, 20, 30])]);
+        let anchor = nth_position(&engine, 1);
+        assert_eq!(
+            engine.resolve_position(&Filter::default(), &anchor),
+            ResolvePosition::Found(1),
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_survives_unrelated_filter_changes() {
+        // Anchor on a `name=Nexus` event then re-resolve under a
+        // filter that strips every `name=Other` event.  The anchor's
+        // row index should now be the first remaining row.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "Other", t(10), "a");
+        append_bunyan_at(&p, "Nexus", t(20), "b");
+        append_bunyan_at(&p, "Other", t(30), "c");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        let anchor = nth_position(&engine, 1);
+        let filter: Filter = "name=Nexus".parse().unwrap();
+        assert_eq!(
+            engine.resolve_position(&filter, &anchor),
+            ResolvePosition::Found(0),
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_when_anchored_event_is_filtered_out_picks_next() {
+        // Three events; anchor on the middle one.  Apply a filter that
+        // drops only the middle one — resolution should jump to the
+        // *next* still-visible row, which is the third event at row 1
+        // in the filtered view.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        append_bunyan_at(&p, "x", t(20), "b");
+        append_bunyan_at(&p, "x", t(30), "c");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        let anchor = nth_position(&engine, 1);
+        let filter: Filter = "msg!=b".parse().unwrap();
+        assert_eq!(
+            engine.resolve_position(&filter, &anchor),
+            ResolvePosition::FilteredOut(1),
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_falls_back_to_previous_when_no_later_visible() {
+        // Anchor on the last event, which the filter excludes.  No
+        // later visible event → fall back to the previous one.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        append_bunyan_at(&p, "x", t(20), "b");
+        append_bunyan_at(&p, "x", t(30), "tail");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        let anchor = nth_position(&engine, 2);
+        let filter: Filter = "msg!=tail".parse().unwrap();
+        assert_eq!(
+            engine.resolve_position(&filter, &anchor),
+            ResolvePosition::FilteredOut(1),
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_when_source_is_gone() {
+        // Anchor against engine A (with a source), then resolve against
+        // engine B (with no sources).  The bookmark cannot find its
+        // source.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        let mut engine_a = Engine::new();
+        engine_a.add_file_source(&p).unwrap();
+        let anchor = nth_position(&engine_a, 0);
+        let engine_b = Engine::new();
+        assert_eq!(
+            engine_b.resolve_position(&Filter::default(), &anchor),
+            ResolvePosition::Gone,
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_disambiguates_same_time_events() {
+        // Two events from the same source share a timestamp.  Anchor
+        // on the second; resolve must return its index, not the
+        // first's.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        append_bunyan_at(&p, "x", t(10), "b"); // same time
+        append_bunyan_at(&p, "x", t(20), "c");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        let first = nth_position(&engine, 0);
+        let second = nth_position(&engine, 1);
+        assert_ne!(first, second, "same-time anchors must differ");
+        assert_eq!(
+            engine.resolve_position(&Filter::default(), &second),
+            ResolvePosition::Found(1),
+        );
+        assert_eq!(
+            engine.resolve_position(&Filter::default(), &first),
+            ResolvePosition::Found(0),
+        );
         dir.cleanup();
     }
 }

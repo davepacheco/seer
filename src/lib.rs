@@ -14,9 +14,11 @@ pub mod stream;
 #[cfg(test)]
 mod test_util;
 
-pub use engine::Engine;
+pub use engine::{Engine, EngineEvent, ResolvePosition};
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
-pub use session::{Bookmark, BookmarkName, Session, Tab};
+pub use session::{
+    Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
+};
 pub use source::{FileSource, Source, SourceError, SourceId};
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
