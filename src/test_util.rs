@@ -34,16 +34,12 @@ pub(crate) struct TestDir {
 
 impl TestDir {
     pub(crate) fn new() -> Self {
-        let inner =
-            Utf8TempDir::new().expect("create test temp dir");
+        let inner = Utf8TempDir::new().expect("create test temp dir");
         Self { inner: Some(inner) }
     }
 
     pub(crate) fn path(&self) -> &Utf8Path {
-        self.inner
-            .as_ref()
-            .expect("test temp dir already cleaned up")
-            .path()
+        self.inner.as_ref().expect("test temp dir already cleaned up").path()
     }
 
     /// Removes the temporary directory.  Call only on the success path
@@ -77,11 +73,8 @@ impl Drop for TestDir {
 /// `body`.  It is `&'static str` because that is what
 /// [`slog_bunyan::with_name`] requires; in practice tests pass string
 /// literals.
-pub(crate) fn append_bunyan<F>(
-    path: &Utf8Path,
-    name: &'static str,
-    body: F,
-) where
+pub(crate) fn append_bunyan<F>(path: &Utf8Path, name: &'static str, body: F)
+where
     F: FnOnce(&Logger),
 {
     let file = File::options()

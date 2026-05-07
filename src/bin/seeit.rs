@@ -14,9 +14,7 @@ use clap::Parser;
 use seer::{Engine, Filter};
 
 #[derive(Parser)]
-#[command(
-    about = "non-interactive log explorer; companion to `seer`"
-)]
+#[command(about = "non-interactive log explorer; companion to `seer`")]
 struct Args {
     /// One or more bunyan log files to read, in order.
     #[arg(required = true)]

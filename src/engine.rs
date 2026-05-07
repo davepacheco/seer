@@ -232,10 +232,8 @@ mod tests {
         assert_ne!(id_a, id_b);
 
         let filter = Filter::default();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|e| e.unwrap().msg)
-            .collect();
+        let msgs: Vec<_> =
+            engine.query_events(&filter).map(|e| e.unwrap().msg).collect();
         assert_eq!(msgs, vec!["a1", "b1", "a2", "b2"]);
 
         dir.cleanup();
@@ -305,8 +303,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.add_file_source(&a).unwrap();
         engine.add_file_source(&b).unwrap();
-        let results: Vec<_> =
-            engine.query_events(&Filter::default()).collect();
+        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
         assert_eq!(results.len(), 4);
         assert_eq!(results[0].as_ref().unwrap().msg, "a1");
         assert!(matches!(
@@ -332,8 +329,7 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.add_file_source(&p).unwrap();
-        let results: Vec<_> =
-            engine.query_events(&Filter::default()).collect();
+        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
 
         // Output: first, second, [warning], third, fourth.  The warning
         // is emitted just before the first regressing event, and only
@@ -370,8 +366,7 @@ mod tests {
         let mut engine = Engine::new();
         let id_a = engine.add_file_source(&a).unwrap();
         let id_b = engine.add_file_source(&b).unwrap();
-        let results: Vec<_> =
-            engine.query_events(&Filter::default()).collect();
+        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
         let warnings: Vec<_> = results
             .iter()
             .filter_map(|r| match r {
@@ -411,10 +406,8 @@ mod tests {
         let mut engine = Engine::new();
         engine.add_file_source(&p).unwrap();
         let filter = Filter::default();
-        let levels: Vec<_> = engine
-            .query_events(&filter)
-            .map(|e| e.unwrap().level)
-            .collect();
+        let levels: Vec<_> =
+            engine.query_events(&filter).map(|e| e.unwrap().level).collect();
         assert_eq!(levels, vec![Level::Debug, Level::Error]);
 
         dir.cleanup();
@@ -433,10 +426,8 @@ mod tests {
         engine.add_file_source(&p).unwrap();
 
         let filter: Filter = "level>=warn".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().msg)
-            .collect();
+        let msgs: Vec<_> =
+            engine.query_events(&filter).map(|r| r.unwrap().msg).collect();
         assert_eq!(msgs, vec!["e"]);
 
         dir.cleanup();
@@ -455,10 +446,8 @@ mod tests {
         engine.add_file_source(&p).unwrap();
 
         let filter: Filter = "name=Nexus msg=~blueprint".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().msg)
-            .collect();
+        let msgs: Vec<_> =
+            engine.query_events(&filter).map(|r| r.unwrap().msg).collect();
         assert_eq!(msgs, vec!["blueprint executed", "blueprint failed"]);
 
         dir.cleanup();

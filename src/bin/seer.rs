@@ -268,7 +268,102 @@ impl Tab {
             self.viewport_top = new_row + 1 - h;
         }
     }
+
+    /// Index of the closest event to `viewport_top` in the requested
+    /// direction.  Falls back to the opposite direction so a viewport
+    /// parked on an error row at one end of the file still gets an
+    /// anchor; returns `None` only when there are no parsed events at
+    /// all.  Used by [`Self::advance_time`] to decide what timestamp
+    /// to add the step to.
+    fn time_anchor_idx(&self, prefer_forward: bool) -> Option<usize> {
+        let forward = self
+            .events
+            .iter()
+            .enumerate()
+            .skip(self.viewport_top)
+            .find_map(|(i, e)| e.as_ref().map(|_| i));
+        let backward = self
+            .events
+            .iter()
+            .enumerate()
+            .take(self.viewport_top.saturating_add(1))
+            .rev()
+            .find_map(|(i, e)| e.as_ref().map(|_| i));
+        if prefer_forward { forward.or(backward) } else { backward.or(forward) }
+    }
+
+    /// Moves `viewport_top` forward (positive `delta`) or backward
+    /// (negative `delta`) by approximately `delta` of wall-clock time.
+    ///
+    /// Concretely: pick an anchor event near `viewport_top` (in the
+    /// chosen direction, with fallback), then jump to the first event
+    /// at or past `anchor.time + delta` in the same direction.  If no
+    /// event satisfies the criterion the viewport snaps to the
+    /// corresponding end of the buffer — that's "as close as we can
+    /// get" rather than silently doing nothing, which would be
+    /// confusing when the user expects motion.  No-op when the tab
+    /// holds no parsed events.
+    fn advance_time(&mut self, delta: chrono::Duration, viewport_height: u16) {
+        let go_forward = delta.num_milliseconds() > 0;
+        let Some(anchor_idx) = self.time_anchor_idx(go_forward) else {
+            return;
+        };
+        let anchor_time = self.events[anchor_idx]
+            .as_ref()
+            .expect("time_anchor_idx returns indices of real events")
+            .time;
+        let target = anchor_time + delta;
+        let new_top = if go_forward {
+            self.events
+                .iter()
+                .enumerate()
+                .skip(anchor_idx)
+                .find_map(|(i, e)| {
+                    e.as_ref().filter(|ev| ev.time >= target).map(|_| i)
+                })
+                .unwrap_or_else(|| self.max_top(viewport_height))
+        } else {
+            self.events
+                .iter()
+                .enumerate()
+                .take(anchor_idx + 1)
+                .rev()
+                .find_map(|(i, e)| {
+                    e.as_ref().filter(|ev| ev.time <= target).map(|_| i)
+                })
+                .unwrap_or(0)
+        };
+        let max = self.max_top(viewport_height);
+        self.viewport_top = new_top.min(max);
+    }
 }
+
+/// Time-based navigation step sizes, smallest to largest.  `<` and `>`
+/// advance the active tab by the currently selected step; `=` (or `+`)
+/// moves to the next-larger step and `-` to the next-smaller, both
+/// clamped at the ends.  Stored as (display label, milliseconds) pairs
+/// so the footer can show the user-visible label without re-deriving
+/// it.
+const TIME_STEPS: &[(&str, i64)] = &[
+    ("100ms", 100),
+    ("1s", 1_000),
+    ("5s", 5_000),
+    ("10s", 10_000),
+    ("30s", 30_000),
+    ("1m", 60_000),
+    ("5m", 5 * 60_000),
+    ("10m", 10 * 60_000),
+    ("30m", 30 * 60_000),
+    ("60m", 60 * 60_000),
+    ("6h", 6 * 60 * 60_000),
+    ("12h", 12 * 60 * 60_000),
+    ("1d", 24 * 60 * 60_000),
+];
+
+/// Default starting step.  "1m" is the median of the table and a
+/// reasonable opening gambit for triaging multi-minute incidents
+/// without zooming all the way out to hours.
+const DEFAULT_TIME_STEP_IDX: usize = 5;
 
 /// All TUI state.  Pure with respect to I/O so [`App::handle_key`] can
 /// be unit-tested by feeding synthetic key events.
@@ -293,6 +388,11 @@ struct App {
     /// still work after switching tabs or editing the filter (which
     /// clears `tab.search`).
     last_search: Option<LastSearch>,
+    /// Index into [`TIME_STEPS`] of the current step used by `<` / `>`.
+    /// App-level (rather than per-tab) so the user sets it once and it
+    /// applies wherever they navigate next, mirroring how `last_search`
+    /// is shared across tabs.
+    time_step_idx: usize,
 }
 
 impl App {
@@ -306,6 +406,7 @@ impl App {
             quit: false,
             dialog: None,
             last_search: None,
+            time_step_idx: DEFAULT_TIME_STEP_IDX,
         };
         a.push_tab(Filter::default());
         a
@@ -453,6 +554,42 @@ impl App {
         }
     }
 
+    /// Display label for the current time-navigation step (e.g. `"1m"`).
+    fn current_step_label(&self) -> &'static str {
+        TIME_STEPS[self.time_step_idx].0
+    }
+
+    fn current_step_duration(&self) -> chrono::Duration {
+        chrono::Duration::milliseconds(TIME_STEPS[self.time_step_idx].1)
+    }
+
+    /// Bumps the step to the next-larger value, clamped at the largest.
+    /// Clamping (rather than wrapping) means a user mashing `=` can't
+    /// accidentally jump from "1d" back to "100ms".
+    fn increase_time_step(&mut self) {
+        if self.time_step_idx + 1 < TIME_STEPS.len() {
+            self.time_step_idx += 1;
+        }
+    }
+
+    /// Bumps the step to the next-smaller value, clamped at the smallest.
+    fn decrease_time_step(&mut self) {
+        if self.time_step_idx > 0 {
+            self.time_step_idx -= 1;
+        }
+    }
+
+    /// Advances the active tab forward (or backward) by the current
+    /// step.  No-op when the tab holds no parsed events.
+    fn advance_time(&mut self, forward: bool) {
+        let mut delta = self.current_step_duration();
+        if !forward {
+            delta = -delta;
+        }
+        let h = self.viewport_height;
+        self.active_tab_mut().advance_time(delta, h);
+    }
+
     fn next_tab(&mut self) {
         self.active = (self.active + 1) % self.tabs.len();
     }
@@ -582,6 +719,7 @@ impl App {
             quit: false,
             dialog: None,
             last_search: None,
+            time_step_idx: DEFAULT_TIME_STEP_IDX,
         };
         // Manually push so we can override the row data (the engine
         // has no sources, so a real push_tab would yield empty vecs).
@@ -843,6 +981,48 @@ impl App {
                 ..
             } => {
                 self.close_active_tab();
+            }
+            // Time-navigation step controls.  `=` and `+` grow the
+            // step; `-` shrinks it.  `=` is the unshifted character on
+            // US layouts (so the user can adjust without holding
+            // Shift); `+` is accepted as an alias since it's the more
+            // intuitive "increase" key — terminals report it with
+            // either NONE or SHIFT, mirroring how `?`/`G`/`X`/`N` are
+            // handled above.
+            KeyEvent {
+                code: KeyCode::Char('='),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.increase_time_step();
+            }
+            KeyEvent { code: KeyCode::Char('+'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.increase_time_step();
+            }
+            KeyEvent {
+                code: KeyCode::Char('-'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.decrease_time_step();
+            }
+            // `>` advances by the current step; `<` rewinds.  Both are
+            // shifted on US layouts; accept NONE or SHIFT (same
+            // pattern as `?`/`G`).
+            KeyEvent { code: KeyCode::Char('>'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.advance_time(/* forward = */ true);
+            }
+            KeyEvent { code: KeyCode::Char('<'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.advance_time(/* forward = */ false);
             }
             _ => {}
         }
@@ -1354,14 +1534,18 @@ fn render(frame: &mut Frame, app: &mut App) {
                     total,
                 )
             } else if total == 0 {
-                "q quit · f filter · / search · x/X exclude/include · \
-                 ^T new · ^W close · r rename · 0/0"
-                    .to_string()
+                format!(
+                    "q quit · f filter · / search · </> step={} · \
+                     x/X exclude/include · ^T new · ^W close · \
+                     r rename · 0/0",
+                    app.current_step_label(),
+                )
             } else {
                 format!(
-                    "q quit · f filter · / search · \
+                    "q quit · f filter · / search · </> step={} · \
                      x/X exclude/include · ^T new · ^W close · \
                      r rename · {}-{} of {}",
+                    app.current_step_label(),
                     top + 1,
                     bottom,
                     total,
@@ -1695,10 +1879,11 @@ mod tests {
 
     #[test]
     fn render_paints_rows_and_footer() {
-        // Wider than the typical 80 cols so the footer's "1-3 of 3"
-        // counter isn't truncated; the live footer is sized to be
-        // legible at 80 cols even with truncation.
-        let backend = TestBackend::new(100, 6);
+        // Wider than 80 cols so the footer's trailing dynamic info
+        // (step indicator, "1-3 of 3" counter) isn't truncated; the
+        // live footer is sized to be legible at 80 cols even with
+        // truncation.
+        let backend = TestBackend::new(120, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
             "alpha line".to_string(),
@@ -2864,5 +3049,215 @@ mod tests {
             dump.contains("Enter include msg"),
             "expected include-mode footer hint, got:\n{dump}",
         );
+    }
+
+    // ---------- time-step navigation ----------
+
+    /// Builds a fixture event with a specific timestamp (in epoch
+    /// seconds) and msg.  Counterpart to [`ev`] which always pins the
+    /// time to a fixed value; the time-step tests need controllable
+    /// spacing between rows.
+    fn ev_at(secs: i64, msg: &str) -> LogEvent {
+        let time = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+            .unwrap()
+            .to_rfc3339();
+        let json = format!(
+            r#"{{
+                "v": 0,
+                "level": 30,
+                "name": "Nexus",
+                "hostname": "sled-01",
+                "pid": 1234,
+                "time": "{}",
+                "msg": {}
+            }}"#,
+            time,
+            serde_json::Value::String(msg.to_string()),
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// App with one event per second from 0..n.
+    fn time_app(n: i64, h: u16) -> App {
+        let events: Vec<Option<LogEvent>> =
+            (0..n).map(|i| Some(ev_at(i, &format!("at {i}")))).collect();
+        let formatted: Vec<String> =
+            (0..n).map(|i| format!("row {i}")).collect();
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = h;
+        a
+    }
+
+    #[test]
+    fn default_step_is_one_minute() {
+        let a = app(0, 5);
+        assert_eq!(a.current_step_label(), "1m");
+    }
+
+    #[test]
+    fn equals_increases_step_clamped_at_top() {
+        let mut a = app(0, 5);
+        for _ in 0..TIME_STEPS.len() {
+            a.handle_key(key(KeyCode::Char('=')));
+        }
+        // Clamps at the largest entry rather than wrapping.
+        assert_eq!(a.current_step_label(), TIME_STEPS.last().unwrap().0);
+        a.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(a.current_step_label(), TIME_STEPS.last().unwrap().0);
+    }
+
+    #[test]
+    fn plus_is_alias_for_increase() {
+        let mut a = app(0, 5);
+        let before = a.time_step_idx;
+        a.handle_key(shift('+'));
+        assert_eq!(a.time_step_idx, before + 1);
+        // Same key without the SHIFT modifier — some terminals.
+        a.handle_key(key(KeyCode::Char('+')));
+        assert_eq!(a.time_step_idx, before + 2);
+    }
+
+    #[test]
+    fn minus_decreases_step_clamped_at_bottom() {
+        let mut a = app(0, 5);
+        for _ in 0..TIME_STEPS.len() {
+            a.handle_key(key(KeyCode::Char('-')));
+        }
+        assert_eq!(a.current_step_label(), TIME_STEPS[0].0);
+        a.handle_key(key(KeyCode::Char('-')));
+        assert_eq!(a.current_step_label(), TIME_STEPS[0].0);
+    }
+
+    #[test]
+    fn gt_lands_on_first_event_past_target() {
+        // 120 rows at 1s each; +1m from row 0 lands exactly on row 60.
+        let mut a = time_app(120, 10);
+        a.handle_key(shift('>'));
+        assert_eq!(a.active_tab().viewport_top, 60);
+        // Repeat: +1m from row 60 → row 120; clamped to max_top.
+        a.handle_key(shift('>'));
+        let max = a.active_tab().max_top(a.viewport_height);
+        assert_eq!(a.active_tab().viewport_top, max);
+    }
+
+    #[test]
+    fn gt_snaps_to_end_when_no_event_past_target() {
+        // 60 events at 1s; +1m from row 0 has no event at >= t=60.
+        let mut a = time_app(60, 10);
+        a.handle_key(shift('>'));
+        let max = a.active_tab().max_top(a.viewport_height);
+        assert_eq!(a.active_tab().viewport_top, max);
+    }
+
+    #[test]
+    fn gt_accepts_no_modifier_form() {
+        // Some terminals report `>` with no SHIFT modifier even though
+        // it's typed with shift.
+        let mut a = time_app(120, 10);
+        a.handle_key(key(KeyCode::Char('>')));
+        assert_eq!(a.active_tab().viewport_top, 60);
+    }
+
+    #[test]
+    fn lt_rewinds_by_current_step() {
+        // Start at row 90 (t=90s); -1m lands at t=30s → row 30.
+        let mut a = time_app(120, 10);
+        a.active_tab_mut().viewport_top = 90;
+        a.handle_key(shift('<'));
+        assert_eq!(a.active_tab().viewport_top, 30);
+        // Another `<` from t=30 → t=-30, no event satisfies → top.
+        a.handle_key(shift('<'));
+        assert_eq!(a.active_tab().viewport_top, 0);
+    }
+
+    #[test]
+    fn step_change_then_advance_uses_new_step() {
+        // 30 rows at 1s.  Drop step to 5s, then `>` should land at
+        // row 5 (t=5s).
+        let mut a = time_app(30, 10);
+        // Default is "1m" (idx 5); four `-` presses → "1s" (idx 1).
+        for _ in 0..4 {
+            a.handle_key(key(KeyCode::Char('-')));
+        }
+        assert_eq!(a.current_step_label(), "1s");
+        // One step up → "5s".
+        a.handle_key(key(KeyCode::Char('=')));
+        assert_eq!(a.current_step_label(), "5s");
+        a.handle_key(shift('>'));
+        assert_eq!(a.active_tab().viewport_top, 5);
+    }
+
+    #[test]
+    fn advance_with_no_events_is_noop() {
+        let mut a = App::with_events(Vec::new(), Vec::new());
+        a.viewport_height = 5;
+        a.handle_key(shift('>'));
+        a.handle_key(shift('<'));
+        assert_eq!(a.active_tab().viewport_top, 0);
+    }
+
+    #[test]
+    fn advance_with_only_error_rows_is_noop() {
+        // No parsed events means there's no anchor time to add the
+        // step to; both `>` and `<` should be no-ops rather than
+        // jumping to an arbitrary row.
+        let events = vec![None, None, None];
+        let formatted = vec!["err 0".into(), "err 1".into(), "err 2".into()];
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = 5;
+        a.active_tab_mut().viewport_top = 1;
+        a.handle_key(shift('>'));
+        a.handle_key(shift('<'));
+        assert_eq!(a.active_tab().viewport_top, 1);
+    }
+
+    #[test]
+    fn advance_anchors_through_error_row() {
+        // Events at t=0, [error], t=120s.  Park viewport on the error
+        // row in the middle and press `>` (default step 1m): the
+        // anchor falls forward to t=120, target is t=180, no event
+        // satisfies → snap to max_top.  Then `<` from there should
+        // anchor backward and land on row 0 (t=0 ≤ t=120-60=60).
+        let events = vec![Some(ev_at(0, "a")), None, Some(ev_at(120, "b"))];
+        let formatted = vec!["a".into(), "err".into(), "b".into()];
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = 5;
+        a.active_tab_mut().viewport_top = 1;
+        a.handle_key(shift('>'));
+        let max = a.active_tab().max_top(a.viewport_height);
+        assert_eq!(a.active_tab().viewport_top, max);
+        a.handle_key(shift('<'));
+        assert_eq!(a.active_tab().viewport_top, 0);
+    }
+
+    #[test]
+    fn step_keys_inside_dialog_dont_affect_step() {
+        // While a dialog is open, `=`/`-`/`<`/`>` should be consumed
+        // by the editor (typing them into the buffer) rather than
+        // changing the step or scrolling.
+        let mut a = app(10, 5);
+        let before = a.time_step_idx;
+        a.handle_key(key(KeyCode::Char('f')));
+        a.handle_key(key(KeyCode::Char('=')));
+        a.handle_key(key(KeyCode::Char('-')));
+        a.handle_key(shift('>'));
+        a.handle_key(shift('<'));
+        assert_eq!(a.time_step_idx, before);
+        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "=-><");
+    }
+
+    #[test]
+    fn render_footer_shows_current_step() {
+        let backend = TestBackend::new(120, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["r".to_string()]);
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("step=1m"), "dump:\n{dump}");
+        // Bumping the step is reflected on the next render.
+        a.handle_key(key(KeyCode::Char('=')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("step=5m"), "dump:\n{dump}");
     }
 }

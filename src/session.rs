@@ -109,10 +109,7 @@ mod tests {
                     position: LogStreamPosition::from(0),
                     name: Some(BookmarkName::from("start".to_string())),
                 },
-                Bookmark {
-                    position: LogStreamPosition::from(100),
-                    name: None,
-                },
+                Bookmark { position: LogStreamPosition::from(100), name: None },
             ],
         );
 
@@ -121,10 +118,7 @@ mod tests {
 
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.tabs[0].stream, stream_id);
-        assert_eq!(
-            back.tabs[0].cursor.position,
-            LogStreamPosition::from(42)
-        );
+        assert_eq!(back.tabs[0].cursor.position, LogStreamPosition::from(42));
         assert!(back.tabs[0].cursor.name.is_none());
 
         assert_eq!(back.streams.len(), 1);

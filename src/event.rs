@@ -37,9 +37,7 @@ pub struct Event {
 ///
 /// Variants are ordered from least to most severe so derived `Ord` matches
 /// severity (e.g. `Level::Warn > Level::Info`).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
     Trace,
     Debug,
@@ -113,10 +111,7 @@ impl<'de> Deserialize<'de> for Level {
 }
 
 impl serde::Serialize for Level {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_u8(self.as_bunyan_number())
     }
 }

@@ -21,9 +21,7 @@ use std::io::{BufRead, BufReader};
 /// Wraps a string so different `Source` impls can choose the most useful
 /// shape for their identifier (canonicalized path, archive entry name,
 /// URL, etc.) without forcing a single representation on the type.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Display, From, AsRef,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Display, From, AsRef)]
 #[as_ref(forward)]
 pub struct SourceId(String);
 

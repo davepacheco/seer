@@ -63,9 +63,7 @@ enum Mode {
 fn main() -> io::Result<()> {
     match Args::parse().mode {
         Mode::Single { output } => write_single(&output),
-        Mode::Multi { output_dir, count } => {
-            write_multi(&output_dir, count)
-        }
+        Mode::Multi { output_dir, count } => write_multi(&output_dir, count),
     }
 }
 
@@ -90,10 +88,8 @@ fn write_single(path: &Utf8Path) -> io::Result<()> {
 }
 
 fn open_drain(path: &Utf8Path, name: &'static str) -> Logger {
-    let file = File::options()
-        .append(true)
-        .open(path)
-        .expect("open output file");
+    let file =
+        File::options().append(true).open(path).expect("open output file");
     let drain = slog_bunyan::with_name(name, file).build().fuse();
     let drain = Mutex::new(drain).fuse();
     Logger::root(drain, o!())
@@ -147,10 +143,7 @@ fn nexus_block(path: &Utf8Path) -> io::Result<()> {
     Ok(())
 }
 
-fn sled_agent_block(
-    path: &Utf8Path,
-    sled: &'static str,
-) -> io::Result<()> {
+fn sled_agent_block(path: &Utf8Path, sled: &'static str) -> io::Result<()> {
     let log = open_drain(path, "SledAgent").new(o!("sled" => sled));
     info!(log, "sled-agent starting up");
     info!(log, "rack initialized");
@@ -254,9 +247,13 @@ struct ScheduledRecord {
 fn write_multi(dir: &Utf8Path, count: usize) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
 
-    // Three sleds with start offsets that interleave: every ~10s window
-    // contains records from two or three different sleds.  Verify by
-    // eye that the `sled` field weaves through the merged output.
+    // Three sleds with tightly-staggered start offsets so the merged
+    // stream is visibly interleaved from the very first row, not just
+    // after the slowest source's first event finally lands.  The sleds
+    // share the same schedule shape — only the per-file `sled` and
+    // `hostname` constants and the timestamp anchors differ — so the
+    // merge produces a tight A/B/C cadence the reader can verify by
+    // eye.
     let sleds = [
         SledSpec {
             sled: "sled-01",
@@ -266,12 +263,12 @@ fn write_multi(dir: &Utf8Path, count: usize) -> io::Result<()> {
         SledSpec {
             sled: "sled-02",
             hostname: "oxz-sled-02.oxide.test",
-            start_offset_s: 8,
+            start_offset_s: 1,
         },
         SledSpec {
             sled: "sled-03",
             hostname: "oxz-sled-03.oxide.test",
-            start_offset_s: 16,
+            start_offset_s: 2,
         },
     ];
 
@@ -293,17 +290,13 @@ fn write_sled_log(
     schedule: &[ScheduledRecord],
 ) -> io::Result<usize> {
     let mut file = File::create(path)?;
-    let base =
-        Utc.timestamp_opt(MULTI_EPOCH, 0).single().expect("valid epoch");
+    let base = Utc.timestamp_opt(MULTI_EPOCH, 0).single().expect("valid epoch");
     for entry in schedule {
-        let time = base
-            + Duration::seconds(spec.start_offset_s + entry.delta_s);
+        let time =
+            base + Duration::seconds(spec.start_offset_s + entry.delta_s);
         let mut extras = entry.extras.clone();
         // The two fields that distinguish files at a glance.
-        extras.push((
-            "sled".to_string(),
-            Value::String(spec.sled.to_string()),
-        ));
+        extras.push(("sled".to_string(), Value::String(spec.sled.to_string())));
         write_record(
             &mut file,
             "SledAgent",
@@ -343,14 +336,7 @@ fn build_schedule(count: usize) -> Vec<ScheduledRecord> {
         "sled-agent starting up",
         vec![],
     );
-    push_record(
-        &mut records,
-        &mut delta,
-        2,
-        INFO,
-        "rack initialized",
-        vec![],
-    );
+    push_record(&mut records, &mut delta, 2, INFO, "rack initialized", vec![]);
 
     // Repeated instance lifecycles; periodic warns/errors interspersed.
     let mut inst: u32 = 0;
@@ -497,8 +483,7 @@ fn write_record(
         "time": time.to_rfc3339(),
         "msg": msg,
     });
-    let object =
-        record.as_object_mut().expect("constructed object literal");
+    let object = record.as_object_mut().expect("constructed object literal");
     for (k, v) in extras {
         object.insert(k.clone(), v.clone());
     }
