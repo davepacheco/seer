@@ -7,6 +7,7 @@
 pub mod engine;
 pub mod event;
 pub mod filter;
+pub mod render;
 pub mod session;
 pub mod source;
 pub mod stream;
@@ -17,6 +18,7 @@ mod test_util;
 pub use engine::{Engine, EngineEvent, ResolvePosition};
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
+pub use render::format_event;
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
 };

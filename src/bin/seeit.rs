@@ -11,7 +11,7 @@
 
 use camino::Utf8PathBuf;
 use clap::Parser;
-use seer::{Engine, Filter};
+use seer::{Engine, Filter, format_event};
 
 #[derive(Parser)]
 #[command(about = "non-interactive log explorer; companion to `seer`")]
@@ -37,16 +37,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in engine.query_events(&filter) {
         match result {
             Ok(ee) => {
-                let event = &ee.event;
-                println!(
-                    "{} [{}] {}/{}/{}: {}",
-                    event.time.to_rfc3339(),
-                    event.level,
-                    event.name,
-                    event.hostname,
-                    event.pid,
-                    event.msg,
-                );
+                for line in format_event(&ee.event) {
+                    println!("{line}");
+                }
             }
             // SourceError's Display already says "I/O error: ...",
             // "failed to parse ...", or "warning: ..." as appropriate;

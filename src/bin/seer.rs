@@ -26,10 +26,12 @@ use regex::Regex;
 #[cfg(test)]
 use seer::SourceId;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Event as LogEvent,
-    Filter, LogStream, LogStreamId, LogStreamPosition, Predicate,
-    ResolvePosition, Session,
+    Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
+    LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
+    format_event,
 };
+#[cfg(test)]
+use seer::Event as LogEvent;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -135,22 +137,43 @@ impl Drop for TerminalGuard {
 }
 
 /// Materializes the active filter against the engine, returning the
-/// underlying events alongside their pre-formatted display strings.  The
-/// two vecs are the same length and indexed identically; an `events`
-/// entry is `None` exactly where the corresponding row was a parse/I/O
-/// error.  Keeping the events lets callers (e.g. exclude mode) build
-/// new filter predicates from the row under the cursor and the
-/// bookmark flow extract a stable position for the row.
-fn render_rows(
-    engine: &Engine,
-    filter: &Filter,
-) -> (Vec<Option<EngineEvent>>, Vec<String>) {
+/// records alongside their multi-line display rendering.
+///
+/// `events` is one entry per record produced by [`Engine::query_events`]:
+/// `Some(EngineEvent)` for an `Ok` result, `None` for a parse/I/O error
+/// or out-of-order warning.  `formatted` is one entry per *display line*
+/// — an event with `n` extra fields contributes `1 + n` lines (header
+/// plus indented `key = value` rows), and an error contributes a single
+/// line carrying its `Display` message.  `formatted.len() >=
+/// events.len()`, with equality only when no event has any extras.
+///
+/// `event_for_line[i]` is the index into `events` of the record that
+/// produced display line `i`.  `first_line_for_event[i]` is the inverse:
+/// the first line index for record `i`.  Together they let callers
+/// translate freely between "scroll position" (a line index) and "the
+/// record under the cursor" (an event index) without rescanning.
+struct RenderedRows {
+    events: Vec<Option<EngineEvent>>,
+    formatted: Vec<String>,
+    event_for_line: Vec<usize>,
+    first_line_for_event: Vec<usize>,
+}
+
+fn render_rows(engine: &Engine, filter: &Filter) -> RenderedRows {
     let mut events = Vec::new();
     let mut formatted = Vec::new();
+    let mut event_for_line = Vec::new();
+    let mut first_line_for_event = Vec::new();
     for r in engine.query_events(filter) {
+        let event_idx = events.len();
+        first_line_for_event.push(formatted.len());
         match r {
             Ok(ee) => {
-                formatted.push(format_event(&ee.event));
+                let lines = format_event(&ee.event);
+                for line in lines {
+                    formatted.push(line);
+                    event_for_line.push(event_idx);
+                }
                 events.push(Some(ee));
             }
             Err(err) => {
@@ -158,23 +181,12 @@ fn render_rows(
                 // "failed to parse ...", or "warning: ..." as
                 // appropriate; don't add another prefix.
                 formatted.push(err.to_string());
+                event_for_line.push(event_idx);
                 events.push(None);
             }
         }
     }
-    (events, formatted)
-}
-
-fn format_event(e: &LogEvent) -> String {
-    format!(
-        "{} [{}] {}/{}/{}: {}",
-        e.time.to_rfc3339(),
-        e.level,
-        e.name,
-        e.hostname,
-        e.pid,
-        e.msg,
-    )
+    RenderedRows { events, formatted, event_for_line, first_line_for_event }
 }
 
 /// Indices of every row in `rows` containing at least one match for
@@ -236,14 +248,18 @@ struct LastSearch {
 /// with the host stream's filter, and the scroll offset within those
 /// rows.
 ///
-/// `events` and `formatted` have identical length and are indexed the
-/// same way.  `events[i]` is `None` exactly when that row came from a
+/// `events` is one entry per record (an event or an error); `formatted`
+/// is one entry per *display line*, where a single event with extra
+/// fields contributes its header plus one indented `key = value` line
+/// per extra.  `event_for_line` and `first_line_for_event` translate
+/// between the two indexings: the former says which record produced a
+/// given display line, the latter says where each record's first line
+/// lives.  `events[i]` is `None` exactly when that record came from a
 /// parse or I/O error rather than a real log record; the stringified
-/// error sits in `formatted[i]`.  Keeping the parsed events around lets
-/// in-place actions (e.g. exclude mode's "filter out entries like this"
-/// or `b`'s "bookmark this row") inspect the record under the cursor
-/// without re-parsing, and gives the bookmark flow access to each
-/// event's stable [`LogStreamPosition`].
+/// error sits in `formatted[first_line_for_event[i]]`.  Keeping the
+/// parsed events around lets in-place actions (e.g. exclude mode's
+/// "filter out entries like this" or `b`'s "bookmark this entry")
+/// inspect the record under the cursor without re-parsing.
 ///
 /// The active filter is owned by the [`LogStream`] this tab is viewing
 /// (looked up in [`Session::streams`] by `stream`); two tabs that target
@@ -258,16 +274,27 @@ struct Tab {
     stream: LogStreamId,
     events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
-    /// Index of the row at the top of the viewport.
+    /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
+    event_for_line: Vec<usize>,
+    /// `first_line_for_event[event] = line`.  `events.len()` long.
+    /// Maintained so the (event_idx → line_idx) translation is O(1) on
+    /// every selection move and bookmark navigation.
+    first_line_for_event: Vec<usize>,
+    /// Index of the *display line* at the top of the viewport.  The
+    /// viewport scrolls in line steps so users can see (and search) the
+    /// extra-field rows independently from their headers.
     viewport_top: usize,
-    /// Active highlighted search, if any.  Cleared when `formatted` is
-    /// re-queried (filter change), because match indices would
-    /// otherwise dangle.
+    /// Active highlighted search, if any.  Match indices are line
+    /// indices into `formatted`; cleared when the rows are re-queried
+    /// (filter change), because the indices would otherwise dangle.
     search: Option<TabSearch>,
     /// When `Some`, select mode is active.  The contained value carries
-    /// the row index currently highlighted and the action (`x` exclude,
-    /// `X` include, `b` bookmark) the Enter key will commit.  Cleared
-    /// whenever `formatted` is re-queried so the index can't dangle.
+    /// the *event* (record) currently highlighted and the action (`x`
+    /// exclude, `X` include, `b` bookmark) the Enter key will commit.
+    /// Selection sits at record granularity, not display-line, because
+    /// the actions all want a single record (build a `msg` predicate,
+    /// pin a bookmark to a position).  Cleared whenever the rows are
+    /// re-queried so the index can't dangle.
     select: Option<Selection>,
 }
 
@@ -286,11 +313,11 @@ enum SelectionAction {
 
 /// State of an in-progress `x`/`X`/`b` selection.
 ///
-/// `row` is an absolute index into [`Tab::formatted`].  `action` is
-/// what Enter will do.
+/// `event_idx` is an index into [`Tab::events`] (i.e., a record, not a
+/// display line).  `action` is what Enter will do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
-    row: usize,
+    event_idx: usize,
     action: SelectionAction,
 }
 
@@ -301,12 +328,14 @@ impl Tab {
         stream: LogStreamId,
         filter: &Filter,
     ) -> Self {
-        let (events, formatted) = render_rows(engine, filter);
+        let rendered = render_rows(engine, filter);
         Self {
             name,
             stream,
-            events,
-            formatted,
+            events: rendered.events,
+            formatted: rendered.formatted,
+            event_for_line: rendered.event_for_line,
+            first_line_for_event: rendered.first_line_for_event,
             viewport_top: 0,
             search: None,
             select: None,
@@ -318,16 +347,33 @@ impl Tab {
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
     fn refresh(&mut self, engine: &Engine, filter: &Filter) {
-        let (events, formatted) = render_rows(engine, filter);
-        self.events = events;
-        self.formatted = formatted;
+        let rendered = render_rows(engine, filter);
+        self.events = rendered.events;
+        self.formatted = rendered.formatted;
+        self.event_for_line = rendered.event_for_line;
+        self.first_line_for_event = rendered.first_line_for_event;
         self.viewport_top = 0;
         self.search = None;
         self.select = None;
     }
 
-    /// Largest valid `viewport_top`: the row index that places the last
-    /// row of `formatted` flush with the bottom of the viewport.
+    /// Last *display line* index belonging to record `event_idx`,
+    /// inclusive.  A header-only record has its first and last on the
+    /// same line.
+    fn last_line_for_event(&self, event_idx: usize) -> usize {
+        let next_first = self
+            .first_line_for_event
+            .get(event_idx + 1)
+            .copied()
+            .unwrap_or(self.formatted.len());
+        // `next_first` is exclusive; the last line for this event is
+        // one before it.  Records always contribute at least one line
+        // so the subtraction never underflows.
+        next_first - 1
+    }
+
+    /// Largest valid `viewport_top`: the line index that places the last
+    /// line of `formatted` flush with the bottom of the viewport.
     fn max_top(&self, viewport_height: u16) -> usize {
         self.formatted.len().saturating_sub(viewport_height as usize)
     }
@@ -341,50 +387,73 @@ impl Tab {
         self.viewport_top = self.viewport_top.saturating_sub(n);
     }
 
-    /// Moves the select-mode highlight by `delta` rows (positive ==
-    /// down) and scrolls the viewport just enough to keep the new
+    /// Moves the select-mode highlight by `delta` *records* (positive
+    /// == later) and scrolls the viewport just enough to keep the new
     /// selection visible.  No-op if select mode is not active or if
-    /// there are no rows.
+    /// there are no records.
+    ///
+    /// When the newly-selected record's display lines extend past the
+    /// viewport bottom we pin the record's *last* line to the bottom
+    /// (matching less-style minimal scrolling for single-line records);
+    /// records taller than the viewport pin their first line to the top
+    /// instead, since clipping the header is more confusing than
+    /// clipping the trailing extras.
     fn move_selection(&mut self, delta: isize, viewport_height: u16) {
         let Some(sel) = self.select else {
             return;
         };
-        if self.formatted.is_empty() {
+        if self.events.is_empty() {
             return;
         }
-        let last = self.formatted.len() - 1;
-        let new_row =
-            (sel.row as isize + delta).clamp(0, last as isize) as usize;
-        self.select = Some(Selection { row: new_row, ..sel });
-        // Re-anchor the viewport.  `viewport_height` is sometimes 0 in
-        // tests that don't render — saturating math keeps that case
-        // sensible (selection visible at viewport_top).
-        let h = viewport_height as usize;
-        if new_row < self.viewport_top {
-            self.viewport_top = new_row;
-        } else if h > 0 && new_row >= self.viewport_top + h {
-            self.viewport_top = new_row + 1 - h;
+        let last = self.events.len() - 1;
+        let new_idx =
+            (sel.event_idx as isize + delta).clamp(0, last as isize) as usize;
+        self.select = Some(Selection { event_idx: new_idx, ..sel });
+        let first = self.first_line_for_event[new_idx];
+        let last_line = self.last_line_for_event(new_idx);
+        let height = viewport_height as usize;
+        if first < self.viewport_top {
+            self.viewport_top = first;
+        } else if height > 0 && last_line >= self.viewport_top + height {
+            let event_height = last_line - first + 1;
+            self.viewport_top = if event_height >= height {
+                first
+            } else {
+                last_line + 1 - height
+            };
         }
     }
 
-    /// Index of the closest event to `viewport_top` in the requested
-    /// direction.  Falls back to the opposite direction so a viewport
-    /// parked on an error row at one end of the file still gets an
-    /// anchor; returns `None` only when there are no parsed events at
-    /// all.  Used by [`Self::advance_time`] to decide what timestamp
+    /// Record index of the closest event to `viewport_top` in the
+    /// requested direction.  Falls back to the opposite direction so a
+    /// viewport parked on an error row at one end of the file still gets
+    /// an anchor; returns `None` only when there are no parsed events
+    /// at all.  Used by [`Self::advance_time`] to decide what timestamp
     /// to add the step to.
     fn time_anchor_idx(&self, prefer_forward: bool) -> Option<usize> {
+        // Translate the line-indexed viewport_top to its enclosing
+        // record so the search range matches the user's visual
+        // position.  When the viewport is parked past the last line
+        // (only possible if `formatted` is empty, in which case events
+        // is too) `event_for_line` would index out of range — check
+        // length first.
+        let pivot = if self.viewport_top < self.event_for_line.len() {
+            self.event_for_line[self.viewport_top]
+        } else {
+            self.events.len()
+        };
         let forward = self
             .events
             .iter()
             .enumerate()
-            .skip(self.viewport_top)
+            .skip(pivot)
             .find_map(|(i, e)| e.as_ref().map(|_| i));
+        let backward_take = pivot.saturating_add(1).min(self.events.len());
         let backward = self
             .events
             .iter()
             .enumerate()
-            .take(self.viewport_top.saturating_add(1))
+            .take(backward_take)
             .rev()
             .find_map(|(i, e)| e.as_ref().map(|_| i));
         if prefer_forward { forward.or(backward) } else { backward.or(forward) }
@@ -412,15 +481,13 @@ impl Tab {
             .event
             .time;
         let target = anchor_time + delta;
-        let new_top = if go_forward {
-            self.events
-                .iter()
-                .enumerate()
-                .skip(anchor_idx)
-                .find_map(|(i, e)| {
+        let max = self.max_top(viewport_height);
+        let new_event = if go_forward {
+            self.events.iter().enumerate().skip(anchor_idx).find_map(
+                |(i, e)| {
                     e.as_ref().filter(|ee| ee.event.time >= target).map(|_| i)
-                })
-                .unwrap_or_else(|| self.max_top(viewport_height))
+                },
+            )
         } else {
             self.events
                 .iter()
@@ -430,9 +497,12 @@ impl Tab {
                 .find_map(|(i, e)| {
                     e.as_ref().filter(|ee| ee.event.time <= target).map(|_| i)
                 })
-                .unwrap_or(0)
         };
-        let max = self.max_top(viewport_height);
+        let new_top = match new_event {
+            Some(idx) => self.first_line_for_event[idx],
+            None if go_forward => max,
+            None => 0,
+        };
         self.viewport_top = new_top.min(max);
     }
 }
@@ -767,11 +837,22 @@ impl App {
         let filter =
             self.session.streams.get(&target_stream).unwrap().filter.clone();
         match self.engine.resolve_position(&filter, &position) {
-            ResolvePosition::Found(row) => {
-                self.tabs[tab_idx].viewport_top = row;
+            ResolvePosition::Found(event_idx) => {
+                let line = self.tabs[tab_idx].first_line_for_event[event_idx];
+                self.tabs[tab_idx].viewport_top = line;
             }
-            ResolvePosition::FilteredOut(row) => {
-                self.tabs[tab_idx].viewport_top = row;
+            ResolvePosition::FilteredOut(event_idx) => {
+                // resolve_position guarantees the index is in range
+                // when at least one event matches the filter; if the
+                // filter strips everything the convention is `0`,
+                // which is a valid line index for the empty viewport.
+                let line = self
+                    .tabs[tab_idx]
+                    .first_line_for_event
+                    .get(event_idx)
+                    .copied()
+                    .unwrap_or(0);
+                self.tabs[tab_idx].viewport_top = line;
                 self.notice = Some(
                     "bookmarked entry is hidden by the active filter; \
                      jumped to the nearest visible entry"
@@ -956,13 +1037,24 @@ impl App {
     }
 
     /// Enters select mode on the active tab with the given action.
-    /// No-op when the tab has no rows.
+    /// The selection starts on the record at the top of the viewport
+    /// (or the record whose extras the user is currently scrolled
+    /// into).  No-op when the tab has no records.
     fn start_selection(&mut self, action: SelectionAction) {
         let tab = self.active_tab_mut();
-        if tab.formatted.is_empty() {
+        if tab.events.is_empty() {
             return;
         }
-        tab.select = Some(Selection { row: tab.viewport_top, action });
+        // event_for_line is empty iff formatted is empty iff events is
+        // empty (handled above).  Anything past the last line is
+        // similarly impossible after the empty check, but be defensive
+        // against a viewport_top set out of range by a future caller.
+        let event_idx = tab
+            .event_for_line
+            .get(tab.viewport_top)
+            .copied()
+            .unwrap_or(tab.events.len() - 1);
+        tab.select = Some(Selection { event_idx, action });
     }
 
     /// Routes a keystroke while the Bookmarks pane is active.
@@ -1096,7 +1188,7 @@ impl App {
         let Some(sel) = tab.select else {
             return;
         };
-        let Some(Some(ee)) = tab.events.get(sel.row) else {
+        let Some(Some(ee)) = tab.events.get(sel.event_idx) else {
             return;
         };
         match sel.action {
@@ -1144,6 +1236,11 @@ impl App {
     /// Test constructor that lets the caller supply both events and
     /// pre-formatted display strings.  Required for exclude-mode tests,
     /// which read `Event::msg` to build the new predicate.
+    ///
+    /// Each `formatted[i]` is treated as the single display line for
+    /// `events[i]` — the multi-line render path runs only through
+    /// [`render_rows`], so synthetic-input tests stay 1:1 between
+    /// records and lines.
     #[cfg(test)]
     fn with_events(
         events: Vec<Option<LogEvent>>,
@@ -1188,11 +1285,16 @@ impl App {
                 })
             })
             .collect();
+        let event_for_line: Vec<usize> = (0..formatted.len()).collect();
+        let first_line_for_event: Vec<usize> =
+            (0..engine_events.len()).collect();
         a.tabs.push(Tab {
             name: format!("Tab {}", a.next_tab_number),
             stream: stream_id,
             events: engine_events,
             formatted,
+            event_for_line,
+            first_line_for_event,
             viewport_top: 0,
             search: None,
             select: None,
@@ -2094,20 +2196,27 @@ fn render(frame: &mut Frame, app: &mut App) {
     let top = tab.viewport_top;
     let bottom = (top + content_area.height as usize).min(total);
 
+    let selected_event = tab.select.map(|s| s.event_idx);
     let lines: Vec<Line<'_>> = tab.formatted[top..bottom]
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let row_index = top + i;
+            let line_index = top + i;
             let mut line = match &tab.search {
                 Some(search) => highlight_line(s, &search.regex),
                 None => Line::raw(s.as_str()),
             };
-            if tab.select.map(|s| s.row) == Some(row_index) {
-                // Distinct from the search highlight (REVERSED on
-                // matched runs); a row-wide background reads as "this
-                // is the line you're about to act on" without fighting
-                // search styling on the same row.
+            // Highlight every display line that belongs to the
+            // selected record so users see the full record they're
+            // about to exclude/include/bookmark, not just its header
+            // row.  Distinct from the search highlight (REVERSED on
+            // matched runs); a row-wide background reads as "this is
+            // the entry you're about to act on" without fighting
+            // search styling.
+            let selected = selected_event.is_some_and(|target| {
+                tab.event_for_line.get(line_index).copied() == Some(target)
+            });
+            if selected {
                 line = line.style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -2138,6 +2247,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             let footer = if let Some(notice) = app.notice.as_deref() {
                 notice.to_string()
             } else if let Some(sel) = tab.select {
+                let entry_total = tab.events.len();
                 match sel.action {
                     SelectionAction::Exclude | SelectionAction::Include => {
                         let verb = match sel.action {
@@ -2147,16 +2257,16 @@ fn render(frame: &mut Frame, app: &mut App) {
                         };
                         format!(
                             "{verb}: j/k select · Enter {verb} msg · \
-                             Esc cancel · row {}/{}",
-                            sel.row + 1,
-                            total,
+                             Esc cancel · entry {}/{}",
+                            sel.event_idx + 1,
+                            entry_total,
                         )
                     }
                     SelectionAction::Bookmark => format!(
                         "bookmark: j/k select · Enter name · \
-                         Esc cancel · row {}/{}",
-                        sel.row + 1,
-                        total,
+                         Esc cancel · entry {}/{}",
+                        sel.event_idx + 1,
+                        entry_total,
                     ),
                 }
             } else if total == 0 {
@@ -3510,16 +3620,16 @@ mod tests {
         a
     }
 
-    fn excl_sel(row: usize) -> Selection {
-        Selection { row, action: SelectionAction::Exclude }
+    fn excl_sel(event_idx: usize) -> Selection {
+        Selection { event_idx, action: SelectionAction::Exclude }
     }
 
-    fn incl_sel(row: usize) -> Selection {
-        Selection { row, action: SelectionAction::Include }
+    fn incl_sel(event_idx: usize) -> Selection {
+        Selection { event_idx, action: SelectionAction::Include }
     }
 
-    fn bm_sel(row: usize) -> Selection {
-        Selection { row, action: SelectionAction::Bookmark }
+    fn bm_sel(event_idx: usize) -> Selection {
+        Selection { event_idx, action: SelectionAction::Bookmark }
     }
 
     #[test]
@@ -4208,5 +4318,169 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         assert!(!a.bookmarks_active());
         assert_eq!(a.active, original_tab);
+    }
+
+    // ---------- multi-line rendering ----------
+    //
+    // These tests exercise the line/event split that `render_rows` and
+    // `Tab` use to support looker-style "header + indented extras"
+    // output.  They build a real on-disk fixture (rather than going
+    // through `App::with_events`) so the line→event mapping is built
+    // by the production path.
+
+    /// Writes one bunyan line per `(time_secs, msg, extras)` triple to a
+    /// fresh temp file and returns the resulting App + path.  Each
+    /// `extras` is a slice of `(key, json_value_string)` pairs joined
+    /// into the JSON record verbatim — caller picks the right JSON
+    /// shape for the value (e.g. `r#""0.1.0""#`, `42`).
+    type RecordSpec<'a> = (i64, &'a str, &'a [(&'a str, &'a str)]);
+
+    fn multi_line_app(
+        records: &[RecordSpec<'_>],
+    ) -> (App, camino_tempfile::Utf8TempDir) {
+        use camino_tempfile::tempdir;
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        for (secs, msg, extras) in records {
+            let time = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                *secs, 0,
+            )
+            .unwrap()
+            .to_rfc3339();
+            let mut line = format!(
+                r#"{{"v":0,"level":30,"name":"Nexus","hostname":"h","pid":1,"time":"{time}","msg":{}"#,
+                serde_json::Value::String(msg.to_string()),
+            );
+            for (k, v) in *extras {
+                line.push_str(&format!(",\"{k}\":{v}"));
+            }
+            line.push('}');
+            line.push('\n');
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+        }
+        let mut engine = Engine::new();
+        engine.add_file_source(&path).unwrap();
+        let mut a = App::new(engine);
+        a.viewport_height = 10;
+        (a, dir)
+    }
+
+    #[test]
+    fn render_emits_multiple_lines_per_event_with_extras() {
+        let (a, _dir) = multi_line_app(&[
+            (10, "starting", &[("build", r#""0.1.0""#)]),
+            (20, "tick", &[]),
+            (30, "loaded", &[("zones", "4"), ("ms", "12")]),
+        ]);
+        let tab = a.active_tab();
+        // 3 events, but 6 display lines: 2 + 1 + 3.
+        assert_eq!(tab.events.len(), 3);
+        assert_eq!(tab.formatted.len(), 6);
+        assert_eq!(tab.first_line_for_event, vec![0, 2, 3]);
+        assert_eq!(tab.event_for_line, vec![0, 0, 1, 2, 2, 2]);
+        // Spot-check the indented-extras layout.
+        assert!(tab.formatted[0].ends_with(": starting"));
+        assert_eq!(tab.formatted[1], r#"    build = "0.1.0""#);
+        assert!(tab.formatted[2].ends_with(": tick"));
+        assert!(tab.formatted[3].ends_with(": loaded"));
+        assert_eq!(tab.formatted[4], "    ms = 12");
+        assert_eq!(tab.formatted[5], "    zones = 4");
+    }
+
+    #[test]
+    fn select_j_moves_to_next_event_skipping_extra_lines() {
+        // First event has two extras (3 lines total); second has none
+        // (1 line).  A single `j` in select mode must land on the
+        // *second event*, not on one of the first event's extra rows.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[("a", "1"), ("b", "2")]),
+            (20, "second", &[]),
+        ]);
+        a.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(a.active_tab().select.unwrap().event_idx, 0);
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.active_tab().select.unwrap().event_idx, 1);
+    }
+
+    #[test]
+    fn render_highlights_all_lines_of_selected_event() {
+        // Event 1 spans lines 1, 2, 3 (header + 2 extras).  Selecting
+        // it must paint the dark-gray bg on every one of those rows.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[("a", "1"), ("b", "2")]),
+            (30, "third", &[]),
+        ]);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j'))); // selection -> event 1
+        let backend = TestBackend::new(80, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Layout: row 0 = tab bar, rows 1..6 = content (6 display
+        // lines), row 6 = footer.  The selected event is at lines 1,
+        // 2, 3 of the formatted vec → screen rows 2, 3, 4.
+        for y in [2u16, 3, 4] {
+            assert!(
+                buf[(0, y)].style().bg == Some(Color::DarkGray),
+                "expected DarkGray bg on line {y} of selected event",
+            );
+        }
+        // The header above (event 0) and the line below (event 2)
+        // must not be highlighted.
+        assert!(buf[(0, 1)].style().bg != Some(Color::DarkGray));
+        assert!(buf[(0, 5)].style().bg != Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn time_anchor_works_when_viewport_parks_on_extras_line() {
+        // Park `viewport_top` on an extras row of event 0 (line 1) and
+        // press `>` with the default 1-minute step.  The anchor must
+        // resolve to event 0's timestamp (not crash with an out-of-
+        // range index), and we should land on the first line of the
+        // next event whose time ≥ anchor.time + 60s.  Tail events
+        // ensure max_top is far enough below the target that the
+        // result isn't accidentally clamped.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[("k", "1")]), // lines 0, 1
+            (80, "later", &[]),           // line 2 — 70s after first
+            (90, "filler", &[]),          // line 3
+            (100, "filler", &[]),         // line 4
+            (110, "filler", &[]),         // line 5
+        ]);
+        a.viewport_height = 2;
+        a.active_tab_mut().viewport_top = 1; // an extras row of event 0
+        a.handle_key(shift('>'));
+        // step is 1m; from t=10 + 60s = 70 → next event at t=80 wins.
+        // Its first display line is line 2; max_top with 6 lines and
+        // height 2 is 4, so the result is not clamped.
+        assert_eq!(a.active_tab().viewport_top, 2);
+    }
+
+    #[test]
+    fn footer_reports_entry_count_in_select_mode() {
+        // 3 events but 6 display lines: footer in select mode should
+        // say "entry 1/3", not "row 1/6".
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[("k", "1")]),
+            (20, "second", &[]),
+            (30, "third", &[("k", "1"), ("z", "9")]),
+        ]);
+        a.handle_key(key(KeyCode::Char('x')));
+        let backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("entry 1/3"),
+            "expected entry count in footer, got:\n{dump}",
+        );
     }
 }

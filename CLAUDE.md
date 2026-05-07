@@ -218,9 +218,9 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## TODO list
 
-### Rendering all fields
+### Option to hide fields, maybe hide fields by default
 
-It seems like maybe not all the fields of each entry are being rendered.  Take a look at what the `looker` tool outputs for a log file.  (One note: looker abbreviates timestamps.  I don't want to do that here.  It also uses color.  I don't want to do that here.)
+Let's actually hide the extra fields by default.  A user can toggle whether they're shown by hitting the `F` key.
 
 ### Make `source_id` something you can filter on.
 
