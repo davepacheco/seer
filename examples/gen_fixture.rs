@@ -52,13 +52,20 @@ enum Mode {
         /// `*.log` files in this directory are truncated.
         #[arg(default_value = "tests/fixtures/multi")]
         output_dir: Utf8PathBuf,
+        /// Records to write *per file*.  Each sled's file gets the
+        /// same count; default is enough to exercise the merge under a
+        /// realistic load.
+        #[arg(short = 'n', long, default_value_t = 1000)]
+        count: usize,
     },
 }
 
 fn main() -> io::Result<()> {
     match Args::parse().mode {
         Mode::Single { output } => write_single(&output),
-        Mode::Multi { output_dir } => write_multi(&output_dir),
+        Mode::Multi { output_dir, count } => {
+            write_multi(&output_dir, count)
+        }
     }
 }
 
@@ -236,13 +243,15 @@ struct ScheduledRecord {
     /// Offset in seconds from this sled's `start_offset_s`.
     delta_s: i64,
     level: u8,
-    msg: &'static str,
-    /// Extra structured fields beyond the bunyan core.  Built per-call
-    /// so the schedule stays a `'static` table.
-    extras: fn() -> Vec<(&'static str, Value)>,
+    msg: String,
+    /// Extra structured fields beyond the bunyan core.  Owned because
+    /// the schedule mixes static keys with values computed per record
+    /// (e.g. instance ids); keeping these as plain `String`/`Value`
+    /// pairs avoids gymnastics for an example program.
+    extras: Vec<(String, Value)>,
 }
 
-fn write_multi(dir: &Utf8Path) -> io::Result<()> {
+fn write_multi(dir: &Utf8Path, count: usize) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;
 
     // Three sleds with start offsets that interleave: every ~10s window
@@ -266,13 +275,13 @@ fn write_multi(dir: &Utf8Path) -> io::Result<()> {
         },
     ];
 
-    let schedule = sled_schedule();
+    let schedule = build_schedule(count);
     let mut total = 0;
     for spec in &sleds {
         let path = dir.join(format!("{}.log", spec.sled));
-        let count = write_sled_log(&path, spec, &schedule)?;
-        total += count;
-        println!("wrote {count} records to {path}");
+        let written = write_sled_log(&path, spec, &schedule)?;
+        total += written;
+        println!("wrote {written} records to {path}");
     }
     println!("total: {total} records across {} files", sleds.len());
     Ok(())
@@ -289,133 +298,178 @@ fn write_sled_log(
     for entry in schedule {
         let time = base
             + Duration::seconds(spec.start_offset_s + entry.delta_s);
-        let mut extras = (entry.extras)();
+        let mut extras = entry.extras.clone();
         // The two fields that distinguish files at a glance.
-        extras.push(("sled", Value::String(spec.sled.to_string())));
+        extras.push((
+            "sled".to_string(),
+            Value::String(spec.sled.to_string()),
+        ));
         write_record(
             &mut file,
             "SledAgent",
             spec.hostname,
             time,
             entry.level,
-            entry.msg,
-            extras,
+            &entry.msg,
+            &extras,
         )?;
     }
     Ok(schedule.len())
 }
 
-/// Common per-sled record schedule.  Every sled's file goes through the
-/// same sequence of operations; what differs between files is the
-/// timestamp anchor (so files overlap in time) and the per-file
-/// `sled` / `hostname` constants (so the merged output is easy to
-/// verify by eye).
-fn sled_schedule() -> Vec<ScheduledRecord> {
+/// Builds a sled-agent record schedule of exactly `count` entries.
+///
+/// The schedule starts with two boot-time records and then loops over
+/// instance-lifecycle cycles (ensure → starting → running), peppered
+/// with periodic warnings (disk capacity, NTP drift), follow-up infos
+/// (NTP sync), and an occasional fault.  Time advances monotonically;
+/// the spacing is deterministic so the merge across sleds produces
+/// stable, visually-checkable interleavings.
+///
+/// The generator over-emits and then truncates to `count`, so callers
+/// can request any size from 0 records up.
+fn build_schedule(count: usize) -> Vec<ScheduledRecord> {
     use slog_levels::*;
-    vec![
-        ScheduledRecord {
-            delta_s: 0,
-            level: INFO,
-            msg: "sled-agent starting up",
-            extras: || vec![],
-        },
-        ScheduledRecord {
-            delta_s: 2,
-            level: INFO,
-            msg: "rack initialized",
-            extras: || vec![],
-        },
-        ScheduledRecord {
-            delta_s: 5,
-            level: DEBUG,
-            msg: "received instance ensure",
-            extras: || {
+
+    let mut records: Vec<ScheduledRecord> = Vec::with_capacity(count);
+    let mut delta: i64 = 0;
+
+    // Boot preamble.
+    push_record(
+        &mut records,
+        &mut delta,
+        0,
+        INFO,
+        "sled-agent starting up",
+        vec![],
+    );
+    push_record(
+        &mut records,
+        &mut delta,
+        2,
+        INFO,
+        "rack initialized",
+        vec![],
+    );
+
+    // Repeated instance lifecycles; periodic warns/errors interspersed.
+    let mut inst: u32 = 0;
+    while records.len() < count {
+        let inst_id = format!("inst-{inst:04}");
+
+        push_record(
+            &mut records,
+            &mut delta,
+            3,
+            DEBUG,
+            "received instance ensure",
+            vec![
+                ("instance_id".to_string(), inst_id.clone().into()),
+                ("kind".to_string(), "running".into()),
+            ],
+        );
+        push_record(
+            &mut records,
+            &mut delta,
+            1,
+            INFO,
+            "instance starting",
+            vec![
+                ("instance_id".to_string(), inst_id.clone().into()),
+                ("image".to_string(), "alpine-3.19".into()),
+            ],
+        );
+        push_record(
+            &mut records,
+            &mut delta,
+            2,
+            INFO,
+            "instance running",
+            vec![
+                ("instance_id".to_string(), inst_id.clone().into()),
+                ("vcpus".to_string(), 2.into()),
+                ("memory_mib".to_string(), 1024.into()),
+            ],
+        );
+
+        // Every 30th instance fails to start; provides occasional
+        // ERROR rows for filtering exercises.
+        if inst.is_multiple_of(30) && inst > 0 {
+            push_record(
+                &mut records,
+                &mut delta,
+                2,
+                ERROR,
+                "instance failed to start",
                 vec![
-                    ("instance_id", "inst-0001".into()),
-                    ("kind", "running".into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 6,
-            level: INFO,
-            msg: "instance starting",
-            extras: || {
+                    ("instance_id".to_string(), inst_id.clone().into()),
+                    ("reason".to_string(), "image not found".into()),
+                ],
+            );
+        }
+
+        // Every 25th instance triggers an NTP drift warn followed by a
+        // sync-complete info, modelling a typical recovery pair.
+        if inst.is_multiple_of(25) && inst > 0 {
+            push_record(
+                &mut records,
+                &mut delta,
+                4,
+                WARN,
+                "ntp drift exceeded threshold",
+                vec![("drift_ms".to_string(), Value::from(122))],
+            );
+            push_record(
+                &mut records,
+                &mut delta,
+                3,
+                INFO,
+                "ntp sync complete",
+                vec![("drift_ms".to_string(), Value::from(2))],
+            );
+        }
+
+        // Every 40th instance: disk-capacity warning.
+        if inst.is_multiple_of(40) && inst > 0 {
+            push_record(
+                &mut records,
+                &mut delta,
+                5,
+                WARN,
+                "disk near capacity",
                 vec![
-                    ("instance_id", "inst-0001".into()),
-                    ("image", "alpine-3.19".into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 8,
-            level: INFO,
-            msg: "instance running",
-            extras: || {
-                vec![
-                    ("instance_id", "inst-0001".into()),
-                    ("vcpus", 2.into()),
-                    ("memory_mib", 1024.into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 15,
-            level: INFO,
-            msg: "ntp sync complete",
-            extras: || vec![("drift_ms", 3.into())],
-        },
-        ScheduledRecord {
-            delta_s: 20,
-            level: WARN,
-            msg: "disk near capacity",
-            extras: || {
-                vec![
-                    ("disk", "M.2_0".into()),
-                    ("free_pct", 14.into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 26,
-            level: DEBUG,
-            msg: "received instance ensure",
-            extras: || {
-                vec![
-                    ("instance_id", "inst-0002".into()),
-                    ("kind", "running".into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 27,
-            level: INFO,
-            msg: "instance starting",
-            extras: || {
-                vec![
-                    ("instance_id", "inst-0002".into()),
-                    ("image", "alpine-3.19".into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 30,
-            level: ERROR,
-            msg: "instance failed to start",
-            extras: || {
-                vec![
-                    ("instance_id", "inst-0002".into()),
-                    ("reason", "image not found".into()),
-                ]
-            },
-        },
-        ScheduledRecord {
-            delta_s: 38,
-            level: INFO,
-            msg: "ntp sync complete",
-            extras: || vec![("drift_ms", 1.into())],
-        },
-    ]
+                    ("disk".to_string(), "M.2_0".into()),
+                    ("free_pct".to_string(), 14.into()),
+                ],
+            );
+        }
+
+        // Idle gap between instances so the timeline isn't packed.
+        delta += 2;
+        inst += 1;
+    }
+
+    records.truncate(count);
+    records
+}
+
+/// Advances `delta` by `bump`, then appends a record at the new offset.
+/// Helper to keep [`build_schedule`]'s call sites readable.
+fn push_record(
+    records: &mut Vec<ScheduledRecord>,
+    delta: &mut i64,
+    bump: i64,
+    level: u8,
+    msg: &str,
+    extras: Vec<(String, Value)>,
+) {
+    *delta += bump;
+    records.push(ScheduledRecord {
+        delta_s: *delta,
+        level,
+        msg: msg.to_string(),
+        extras,
+    });
 }
 
 mod slog_levels {
@@ -432,7 +486,7 @@ fn write_record(
     time: DateTime<Utc>,
     level: u8,
     msg: &str,
-    extras: Vec<(&str, Value)>,
+    extras: &[(String, Value)],
 ) -> io::Result<()> {
     let mut record = json!({
         "v": 0,
@@ -446,7 +500,7 @@ fn write_record(
     let object =
         record.as_object_mut().expect("constructed object literal");
     for (k, v) in extras {
-        object.insert(k.to_string(), v);
+        object.insert(k.clone(), v.clone());
     }
     writeln!(file, "{record}")
 }
