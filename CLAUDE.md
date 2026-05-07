@@ -209,3 +209,79 @@ Most Rust files should have a Rustdoc comment for the file.
 - **Render performance.**  ratatui re-renders every frame; only build line widgets for visible rows.  Compute the visible window from the cursor, do not materialize all lines.
 - **Session-file rot.**  When changing the schema format for session configuration, ask if we want to do a migration.
 - **Index correctness vs. speed.**  The substring/regex `time` extractor must agree with the full parser for the same line.  Add a property test: pick random parsed entries, re-extract via the index path, assert equal.
+
+## Next steps
+
+- Parsing real files -- doesn't work
+- Is it rendering all the fields?
+- Performance
+
+## TODO list
+
+### Rendering all fields
+
+It seems like maybe not all the fields of each entry are being rendered.  Take a look at what the `looker` tool outputs for a log file.  (One note: looker abbreviates timestamps.  I don't want to do that here.  It also uses color.  I don't want to do that here.)
+
+### Make `source_id` something you can filter on.
+
+The `source_id` for each file should already be the canonical path to the file.  Users should be able to filter on this as a regex.
+
+### Bookmarks
+
+Let's add the concept of bookmarks.  A bookmark identifies a log stream and a position within that stream.  If the stream's filter changes, the bookmark should still refer to the same location in the log.
+
+Each tab implicitly has a bookmark, which is where that tab is currently looking.
+
+Users should be able to create bookmarks, (optionally) name them, list them, and delete them.  I'm thinking:
+
+- `b`: creates a named bookmark, using a flow similar to `x`.  When you hit
+  enter/return, pops up a dialog to type in the name.  If you leave it blank, you get an unnamed bookmark.
+- Once you create a bookmark, the Bookmarks tab appears for listing bookmarks
+  and navigating to them.
+  - The tab appears if and only if you have any bookmarks.  It cannot be explicitly opened or closed.
+  - Each entry here shows time created, filename (basename only), timestamp of the log entry, and a few characters of the log's message.
+  - When in this tab, there is a selection, similar to the `x` mode we've built.
+  - With any bookmark selected, `enter`/`return navigates to that bookmark.  If the bookmark's log stream is already open in some tab, then this takes you to that tab and navigates to the bookmark.  If not, it opens a new tab with that logstream and navigates to that bookmark.
+  - With any bookmark selected, `x` deletes the bookmark.  This should prompt
+    for a "Cancel" / "Confirm" conformation.
+
+Bookmarks are stored in the session state.
+
+What do you think?
+
+### Summarizing fields in the view
+
+When we process each log, keep track of distinct top-level JSON field names.  Keep only the top 10.
+
+Let's add a summary view.  If the user hits `S` in the main view, a dialog pops up that lists the different available fields.  The user selects one.  Then the dialog shows the top N values for that field, whatever N fits in the box.  Alongside the values, print a little histogram.
+
+"Time" should be treated specially.  Summary by time should show the count of log entries for each distinct minute in the log file.  This should similarly show a histogram.
+
+### "Create filter" dialog
+
+I want to make the "create filter" dialog easier to use.  I want folks to be presented with:
+
+- choose sources:
+  - default: merged view of all sources
+  - or: select individual sources.  (note: there may be a lot of these.  Maybe
+    this should involve another popup with checkboxes for each one, where you
+    can scroll down with j/k and use spacebar to select/deselect)
+- choose time range ("from" (optional) and "to" (optional))
+- see available fields (known because we cache these with each file now) with the ability to create conditions for them
+
+As folks edit these, the filter string should be rendered below.
+
+It should still be possible to edit the filter string directly.  If it's parseable as something the dialog can understand, then you can go back and forth.  If not, then it should print a note about that and you won't be able to select the other fields.
+
+New tabs should still open with this dialog.
+
+### TODO
+
+- parse SMF entries
+- parse CockroachDB log
+- persistent session state
+  - look up based on canonicalized filename
+  - dialog:
+    - resume previous session
+    - create new saved session
+    - create new session and don't save it
