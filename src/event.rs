@@ -112,6 +112,15 @@ impl<'de> Deserialize<'de> for Level {
     }
 }
 
+impl serde::Serialize for Level {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.serialize_u8(self.as_bunyan_number())
+    }
+}
+
 /// Logger name (the `name` field in a bunyan record).
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Deserialize, Display, From, AsRef,

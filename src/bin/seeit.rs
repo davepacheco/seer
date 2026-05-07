@@ -11,7 +11,7 @@
 
 use camino::Utf8PathBuf;
 use clap::Parser;
-use seer::Engine;
+use seer::{Engine, Filter};
 
 #[derive(Parser)]
 #[command(
@@ -21,15 +21,22 @@ struct Args {
     /// One or more bunyan log files to read, in order.
     #[arg(required = true)]
     files: Vec<Utf8PathBuf>,
+
+    /// Filter expression, e.g. `level>=warn name=Nexus msg=~boom`.
+    /// See `seer::filter` docs for the full grammar.
+    #[arg(short, long, default_value = "")]
+    filter: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let filter: Filter = args.filter.parse()?;
+
     let mut engine = Engine::new();
     for path in &args.files {
         engine.add_file_source(path)?;
     }
-    for result in engine.query_events() {
+    for result in engine.query_events(&filter) {
         match result {
             Ok(event) => println!(
                 "{} [{}] {}/{}/{}: {}",

@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod event;
+pub mod filter;
 pub mod session;
 pub mod source;
 pub mod stream;
@@ -15,6 +16,7 @@ mod test_util;
 
 pub use engine::Engine;
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
+pub use filter::{Filter, FilterParseError, Predicate};
 pub use session::{Bookmark, BookmarkName, Session, Tab};
 pub use source::{FileSource, Source, SourceError, SourceId};
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};

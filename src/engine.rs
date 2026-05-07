@@ -10,6 +10,7 @@
 //! design develops.
 
 use crate::event::Event;
+use crate::filter::Filter;
 use crate::source::{FileSource, Source, SourceError, SourceId};
 use camino::Utf8Path;
 
@@ -37,16 +38,24 @@ impl Engine {
         Ok(id)
     }
 
-    /// Returns an iterator over every event in every source.
+    /// Returns an iterator over every event in every source that
+    /// matches `filter`.
     ///
     /// Sources are consumed in the order they were added; events from
     /// each source are yielded contiguously.  Per-line parse and I/O
     /// errors appear inline as `Err` items so the stream isn't aborted
-    /// by a single bad line.
-    pub fn query_events(
-        &self,
-    ) -> impl Iterator<Item = Result<Event, SourceError>> + '_ {
-        self.sources.iter().flat_map(|s| s.events())
+    /// by a single bad line; the filter only applies to `Ok` items, so
+    /// errors are always surfaced regardless of the filter.
+    pub fn query_events<'a>(
+        &'a self,
+        filter: &'a Filter,
+    ) -> impl Iterator<Item = Result<Event, SourceError>> + 'a {
+        self.sources.iter().flat_map(|s| s.events()).filter(
+            move |r| match r {
+                Ok(e) => filter.matches(e),
+                Err(_) => true,
+            },
+        )
     }
 }
 
@@ -75,8 +84,9 @@ mod tests {
         let id_b = engine.add_file_source(&b).unwrap();
         assert_ne!(id_a, id_b);
 
+        let filter = Filter::default();
         let msgs: Vec<_> = engine
-            .query_events()
+            .query_events(&filter)
             .map(|e| e.unwrap().msg)
             .collect();
         assert_eq!(msgs, vec!["a1", "a2", "b1"]);
@@ -94,11 +104,56 @@ mod tests {
         });
         let mut engine = Engine::new();
         engine.add_file_source(&p).unwrap();
+        let filter = Filter::default();
         let levels: Vec<_> = engine
-            .query_events()
+            .query_events(&filter)
             .map(|e| e.unwrap().level)
             .collect();
         assert_eq!(levels, vec![Level::Debug, Level::Error]);
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_filters_by_level() {
+        let dir = TestDir::new();
+        let p = dir.path().join("levels.log");
+        append_bunyan(&p, "x", |log| {
+            debug!(log, "d");
+            info!(log, "i");
+            error!(log, "e");
+        });
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+
+        let filter: Filter = "level>=warn".parse().unwrap();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().msg)
+            .collect();
+        assert_eq!(msgs, vec!["e"]);
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_filters_by_field_and_msg_regex() {
+        let dir = TestDir::new();
+        let p = dir.path().join("fields.log");
+        append_bunyan(&p, "Nexus", |log| {
+            info!(log, "blueprint executed");
+            info!(log, "boot complete");
+            info!(log, "blueprint failed");
+        });
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+
+        let filter: Filter = "name=Nexus msg=~blueprint".parse().unwrap();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().msg)
+            .collect();
+        assert_eq!(msgs, vec!["blueprint executed", "blueprint failed"]);
 
         dir.cleanup();
     }
