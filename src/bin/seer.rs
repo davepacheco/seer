@@ -123,7 +123,8 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        let half_page = (self.viewport_height as usize) / 2;
+        let page = self.viewport_height as usize;
+        let half_page = page / 2;
         match key {
             KeyEvent {
                 code: KeyCode::Char('q'),
@@ -162,6 +163,13 @@ impl App {
                 ..
             } => {
                 self.scroll_down(half_page);
+            }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.scroll_down(page);
             }
             KeyEvent {
                 code: KeyCode::Char('u'),
@@ -304,6 +312,13 @@ mod tests {
         let mut a = app(100, 10);
         a.handle_key(ctrl('d'));
         assert_eq!(a.viewport_top, 5);
+    }
+
+    #[test]
+    fn space_scrolls_full_page_down() {
+        let mut a = app(100, 10);
+        a.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(a.viewport_top, 10);
     }
 
     #[test]
