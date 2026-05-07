@@ -11,6 +11,7 @@
 
 use crate::event::Event;
 use camino::{Utf8Path, Utf8PathBuf};
+use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -26,13 +27,34 @@ use std::io::{BufRead, BufReader};
 #[as_ref(forward)]
 pub struct SourceId(String);
 
-/// Error produced while reading events from a source.
+/// A non-event item surfaced by a source — either a true error
+/// encountered while reading (`Io`, `Parse`) or a non-fatal warning
+/// about the source's content (`OutOfOrder`).  All variants ride the
+/// same `Err` channel of the iterator returned by [`Source::events`]
+/// and the engine's merge so callers can render them inline next to
+/// real events; the variant's `Display` is responsible for spelling
+/// out whether it is a warning or an error.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse log line as JSON: {0}")]
     Parse(#[from] serde_json::Error),
+    /// Reported once per source by the engine when an event with a
+    /// timestamp earlier than the previous event is observed.  Merging
+    /// across sources assumes each source is itself sorted by time;
+    /// when that assumption is violated the merge can no longer
+    /// guarantee its output is sorted, so we surface a warning rather
+    /// than failing.
+    #[error(
+        "warning: source {source_id} is not sorted by time: \
+         {seen} appeared after {last_seen}"
+    )]
+    OutOfOrder {
+        source_id: SourceId,
+        seen: DateTime<Utc>,
+        last_seen: DateTime<Utc>,
+    },
 }
 
 /// A source of log events.

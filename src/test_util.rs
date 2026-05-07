@@ -16,6 +16,7 @@
 
 use camino::Utf8Path;
 use camino_tempfile::Utf8TempDir;
+use chrono::{DateTime, Utc};
 use slog::{Drain, Logger, o};
 use std::fs::File;
 use std::io::Write;
@@ -92,6 +93,33 @@ pub(crate) fn append_bunyan<F>(
     let drain = Mutex::new(drain).fuse();
     let log = Logger::root(drain, o!());
     body(&log);
+}
+
+/// Appends a single bunyan-formatted line to `path` with a chosen
+/// timestamp and message.
+///
+/// `append_bunyan` uses slog, which derives the `time` field from the
+/// system clock; merge tests need controlled timestamps so they can
+/// verify cross-file ordering deterministically.  Other bunyan-core
+/// fields take fixed values (`level=info`, `hostname="test-host"`,
+/// `pid=42`, `v=0`); tests that care about those should construct
+/// records by other means.
+pub(crate) fn append_bunyan_at(
+    path: &Utf8Path,
+    name: &str,
+    time: DateTime<Utc>,
+    msg: &str,
+) {
+    let line = serde_json::json!({
+        "v": 0,
+        "level": 30,
+        "name": name,
+        "hostname": "test-host",
+        "pid": 42,
+        "time": time.to_rfc3339(),
+        "msg": msg,
+    });
+    append_raw(path, &line.to_string());
 }
 
 /// Appends an arbitrary raw line to `path`.

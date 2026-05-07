@@ -85,7 +85,10 @@ fn render_rows(
                 events.push(Some(e));
             }
             Err(err) => {
-                formatted.push(format!("error: {err}"));
+                // SourceError's Display already says "I/O error: ...",
+                // "failed to parse ...", or "warning: ..." as
+                // appropriate; don't add another prefix.
+                formatted.push(err.to_string());
                 events.push(None);
             }
         }

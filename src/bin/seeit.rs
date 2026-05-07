@@ -47,7 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 event.pid,
                 event.msg,
             ),
-            Err(err) => eprintln!("error: {err}"),
+            // SourceError's Display already says "I/O error: ...",
+            // "failed to parse ...", or "warning: ..." as appropriate;
+            // don't add another prefix here.
+            Err(err) => eprintln!("{err}"),
         }
     }
     Ok(())
