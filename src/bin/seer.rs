@@ -20,8 +20,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
+use regex::Regex;
 use seer::{Engine, Filter, SourceError};
 use std::time::Duration;
 
@@ -84,6 +85,61 @@ fn format_row(r: Result<seer::Event, SourceError>) -> String {
     }
 }
 
+/// Indices of every row in `rows` containing at least one match for
+/// `regex`.  Output is naturally sorted ascending.
+fn compute_matches(rows: &[String], regex: &Regex) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, r)| regex.is_match(r).then_some(i))
+        .collect()
+}
+
+/// Direction of a `less`-style search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+impl SearchDirection {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Forward => Self::Backward,
+            Self::Backward => Self::Forward,
+        }
+    }
+
+    /// Character drawn at the left of the search prompt — `/` for
+    /// forward, `?` for backward.  Matches the key that opened the
+    /// dialog.
+    fn prompt(self) -> char {
+        match self {
+            Self::Forward => '/',
+            Self::Backward => '?',
+        }
+    }
+}
+
+/// State of the active search on a tab.  `matches` is sorted ascending
+/// and is the list of row indices in [`Tab::rows`] where `regex` finds
+/// at least one match.  Cleared whenever `rows` changes (e.g. after a
+/// filter edit), since the indices would no longer line up.
+struct TabSearch {
+    pattern: String,
+    regex: Regex,
+    matches: Vec<usize>,
+}
+
+/// The most recent search the user issued, used to repeat with
+/// `n`/`N`, `/<enter>`, or `?<enter>`.  Lives on [`App`] so it survives
+/// switching tabs and filter edits — when the user repeats a search,
+/// any tab without [`TabSearch`] re-derives one from this pattern.
+#[derive(Clone)]
+struct LastSearch {
+    pattern: String,
+    direction: SearchDirection,
+}
+
 /// One independent view: name, filter, the rows produced by querying
 /// the engine with that filter, and the scroll offset within those
 /// rows.
@@ -93,18 +149,23 @@ struct Tab {
     rows: Vec<String>,
     /// Index of the row at the top of the viewport.
     viewport_top: usize,
+    /// Active highlighted search, if any.  Cleared when `rows` is
+    /// re-queried (filter change), because match indices would
+    /// otherwise dangle.
+    search: Option<TabSearch>,
 }
 
 impl Tab {
     fn new(name: String, engine: &Engine, filter: Filter) -> Self {
         let rows = render_rows(engine, &filter);
-        Self { name, filter, rows, viewport_top: 0 }
+        Self { name, filter, rows, viewport_top: 0, search: None }
     }
 
     fn apply_filter(&mut self, engine: &Engine, filter: Filter) {
         self.rows = render_rows(engine, &filter);
         self.filter = filter;
         self.viewport_top = 0;
+        self.search = None;
     }
 
     /// Largest valid `viewport_top`: the row index that places the last
@@ -141,6 +202,11 @@ struct App {
     quit: bool,
     /// When `Some`, this dialog is open and intercepts all keys.
     dialog: Option<Dialog>,
+    /// Most recent search pattern + direction.  Outlives any
+    /// individual tab's [`TabSearch`] so `n` / `N` / empty repeats
+    /// still work after switching tabs or editing the filter (which
+    /// clears `tab.search`).
+    last_search: Option<LastSearch>,
 }
 
 impl App {
@@ -153,6 +219,7 @@ impl App {
             viewport_height: 0,
             quit: false,
             dialog: None,
+            last_search: None,
         };
         a.push_tab(Filter::default());
         a
@@ -187,6 +254,117 @@ impl App {
 
     fn rename_active_tab(&mut self, name: String) {
         self.tabs[self.active].name = name;
+    }
+
+    /// Installs `regex` as the active search on the current tab,
+    /// records it as the most recent search at the app level, and
+    /// scrolls so the first match at or after the current viewport
+    /// top sits at the top of the viewport.  "At or after" applies
+    /// to fresh searches only — repeats and `n`/`N` advance strictly
+    /// past the current top via [`Self::step_search`].
+    fn apply_search(
+        &mut self,
+        pattern: String,
+        regex: Regex,
+        direction: SearchDirection,
+    ) {
+        let matches =
+            compute_matches(&self.tabs[self.active].rows, &regex);
+        let tab = &mut self.tabs[self.active];
+        tab.search = Some(TabSearch {
+            pattern: pattern.clone(),
+            regex,
+            matches,
+        });
+        self.last_search = Some(LastSearch { pattern, direction });
+        self.jump_to_match(direction, /* exclusive = */ false);
+    }
+
+    /// Repeats the most recent search (used by `/<enter>` and
+    /// `?<enter>` with an empty buffer).  Updates the stored direction
+    /// so a follow-up `n` continues the way the user just chose.  No-op
+    /// if there is no previous search.
+    fn repeat_last_search(&mut self, direction: SearchDirection) {
+        let pattern = match &self.last_search {
+            Some(l) => l.pattern.clone(),
+            None => return,
+        };
+        self.ensure_tab_search(&pattern);
+        self.last_search = Some(LastSearch { pattern, direction });
+        self.jump_to_match(direction, /* exclusive = */ true);
+    }
+
+    /// Steps to the next match in `direction` without changing which
+    /// direction was the user's last expressed preference.  Used by
+    /// `n` (direction = stored direction) and `N` (direction =
+    /// opposite).  No-op if there is no previous search.
+    fn step_search(&mut self, direction: SearchDirection) {
+        let pattern = match &self.last_search {
+            Some(l) => l.pattern.clone(),
+            None => return,
+        };
+        self.ensure_tab_search(&pattern);
+        self.jump_to_match(direction, /* exclusive = */ true);
+    }
+
+    /// Re-derives `tab.search` from `pattern` if it's missing or stale.
+    /// Called before any repeat to recover from filter edits (which
+    /// clear `tab.search`) and from tab switches.
+    fn ensure_tab_search(&mut self, pattern: &str) {
+        let tab = &mut self.tabs[self.active];
+        let needs_recompute = match &tab.search {
+            Some(s) => s.pattern != pattern,
+            None => true,
+        };
+        if !needs_recompute {
+            return;
+        }
+        // The regex came from `last_search`, which was only set after a
+        // successful compile, so this should not fail.  If it somehow
+        // does (e.g. a future code path puts an invalid pattern there),
+        // leave `tab.search` empty rather than panicking.
+        let Ok(regex) = Regex::new(pattern) else {
+            return;
+        };
+        let matches = compute_matches(&tab.rows, &regex);
+        tab.search = Some(TabSearch {
+            pattern: pattern.to_string(),
+            regex,
+            matches,
+        });
+    }
+
+    /// Move `viewport_top` to the next match in `direction`.  When
+    /// `exclusive`, a match exactly at `viewport_top` is skipped (used
+    /// for repeats — otherwise `/<enter>` would re-land on the current
+    /// match forever).  Stays put if no further match exists.
+    fn jump_to_match(
+        &mut self,
+        direction: SearchDirection,
+        exclusive: bool,
+    ) {
+        let tab = &self.tabs[self.active];
+        let Some(search) = &tab.search else {
+            return;
+        };
+        let cur = tab.viewport_top;
+        let target = match (direction, exclusive) {
+            (SearchDirection::Forward, true) => {
+                search.matches.iter().copied().find(|&m| m > cur)
+            }
+            (SearchDirection::Forward, false) => {
+                search.matches.iter().copied().find(|&m| m >= cur)
+            }
+            (SearchDirection::Backward, true) => {
+                search.matches.iter().rev().copied().find(|&m| m < cur)
+            }
+            (SearchDirection::Backward, false) => {
+                search.matches.iter().rev().copied().find(|&m| m <= cur)
+            }
+        };
+        if let Some(t) = target {
+            self.tabs[self.active].viewport_top = t;
+        }
     }
 
     fn next_tab(&mut self) {
@@ -225,6 +403,7 @@ impl App {
             viewport_height: 0,
             quit: false,
             dialog: None,
+            last_search: None,
         };
         // Manually push so we can override `rows` (the engine has no
         // sources, so a real push_tab would yield an empty Vec).
@@ -233,6 +412,7 @@ impl App {
             filter: Filter::default(),
             rows,
             viewport_top: 0,
+            search: None,
         });
         a.next_tab_number += 1;
         a
@@ -259,6 +439,14 @@ impl App {
                 DialogResult::ApplyRename(name) => {
                     self.dialog = None;
                     self.rename_active_tab(name);
+                }
+                DialogResult::ApplySearch { pattern, regex, direction } => {
+                    self.dialog = None;
+                    self.apply_search(pattern, regex, direction);
+                }
+                DialogResult::RepeatSearch(direction) => {
+                    self.dialog = None;
+                    self.repeat_last_search(direction);
                 }
             }
             return;
@@ -362,6 +550,45 @@ impl App {
             } => {
                 self.dialog =
                     Some(Dialog::rename(&self.active_tab().name));
+            }
+            // less-style search.  `/` opens a forward prompt, `?` a
+            // backward one.  `?` only reaches here as the post-shift
+            // character: terminals sometimes report it with SHIFT,
+            // sometimes with NONE — accept both.
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.dialog =
+                    Some(Dialog::search(SearchDirection::Forward));
+            }
+            KeyEvent { code: KeyCode::Char('?'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.dialog =
+                    Some(Dialog::search(SearchDirection::Backward));
+            }
+            // `n` repeats the last search in its stored direction; `N`
+            // reverses it for one move (and does NOT update the stored
+            // direction, matching less).
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if let Some(last) = self.last_search.as_ref() {
+                    self.step_search(last.direction);
+                }
+            }
+            KeyEvent { code: KeyCode::Char('N'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                if let Some(last) = self.last_search.as_ref() {
+                    self.step_search(last.direction.opposite());
+                }
             }
             // Ctrl-T: open a fresh tab cloning the current filter and
             // immediately drop into the filter dialog so the user can
@@ -601,6 +828,16 @@ enum Dialog {
     /// Editing the active tab's display name.  Any string (including
     /// empty) is acceptable, so there's no parse feedback.
     Rename { editor: LineEditor },
+    /// `less`-style regex search prompt.  `direction` is set by the
+    /// key that opened the dialog (`/` → forward, `?` → backward).
+    /// Re-compiles on every change so a regex parse error is visible
+    /// live; Enter on a non-empty buffer commits, Enter on an empty
+    /// buffer repeats the last search via [`App::repeat_last_search`].
+    Search {
+        editor: LineEditor,
+        direction: SearchDirection,
+        parse_error: Option<String>,
+    },
 }
 
 /// Outcome of one keystroke routed to the dialog.
@@ -613,6 +850,14 @@ enum DialogResult {
     ApplyFilter(Filter),
     /// Close the dialog and rename the active tab to this string.
     ApplyRename(String),
+    /// Close the dialog and install this regex as the active search.
+    /// The regex is pre-compiled in the dialog so [`App`] doesn't have
+    /// to handle a parse failure here.
+    ApplySearch { pattern: String, regex: Regex, direction: SearchDirection },
+    /// Close the dialog and repeat the most recent search in the given
+    /// direction (Enter pressed with an empty buffer).  No-op if no
+    /// previous search exists.
+    RepeatSearch(SearchDirection),
 }
 
 impl Dialog {
@@ -627,15 +872,26 @@ impl Dialog {
         Self::Rename { editor: LineEditor::new(current_name.to_string()) }
     }
 
+    fn search(direction: SearchDirection) -> Self {
+        Self::Search {
+            editor: LineEditor::new(String::new()),
+            direction,
+            parse_error: None,
+        }
+    }
+
     fn editor(&self) -> &LineEditor {
         match self {
-            Self::Filter { editor, .. } | Self::Rename { editor } => editor,
+            Self::Filter { editor, .. }
+            | Self::Rename { editor }
+            | Self::Search { editor, .. } => editor,
         }
     }
 
     fn parse_error(&self) -> Option<&str> {
         match self {
-            Self::Filter { parse_error, .. } => parse_error.as_deref(),
+            Self::Filter { parse_error, .. }
+            | Self::Search { parse_error, .. } => parse_error.as_deref(),
             Self::Rename { .. } => None,
         }
     }
@@ -646,6 +902,7 @@ impl Dialog {
             Self::Rename { .. } => {
                 "Rename tab (Esc cancel · Enter apply)"
             }
+            Self::Search { .. } => "Search (Esc cancel · Enter apply)",
         }
     }
 
@@ -654,6 +911,19 @@ impl Dialog {
             *parse_error = match editor.text.parse::<Filter>() {
                 Ok(_) => None,
                 Err(e) => Some(e.to_string()),
+            };
+        }
+    }
+
+    fn reparse_search(&mut self) {
+        if let Self::Search { editor, parse_error, .. } = self {
+            *parse_error = if editor.text.is_empty() {
+                None
+            } else {
+                match Regex::new(&editor.text) {
+                    Ok(_) => None,
+                    Err(e) => Some(regex_error_summary(&e)),
+                }
             };
         }
     }
@@ -675,12 +945,13 @@ impl Dialog {
             _ => {}
         }
         let editor_result = match self {
-            Self::Filter { editor, .. } | Self::Rename { editor } => {
-                editor.handle_edit(key)
-            }
+            Self::Filter { editor, .. }
+            | Self::Rename { editor }
+            | Self::Search { editor, .. } => editor.handle_edit(key),
         };
         if let EditAction::Handled = editor_result {
             self.reparse_filter();
+            self.reparse_search();
         }
         DialogResult::Stay
     }
@@ -699,8 +970,33 @@ impl Dialog {
             Self::Rename { editor } => {
                 DialogResult::ApplyRename(editor.text.clone())
             }
+            Self::Search { editor, direction, parse_error } => {
+                if editor.text.is_empty() {
+                    DialogResult::RepeatSearch(*direction)
+                } else {
+                    match Regex::new(&editor.text) {
+                        Ok(regex) => DialogResult::ApplySearch {
+                            pattern: editor.text.clone(),
+                            regex,
+                            direction: *direction,
+                        },
+                        Err(e) => {
+                            *parse_error = Some(regex_error_summary(&e));
+                            DialogResult::Stay
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+/// Compact a [`regex::Error`]'s display into a single line, since the
+/// search prompt has at most one line of room for it.  All whitespace
+/// runs (including the embedded newlines `regex` uses to point at the
+/// offending character) collapse to single spaces.
+fn regex_error_summary(e: &regex::Error) -> String {
+    e.to_string().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn prev_char_boundary(s: &str, byte_idx: usize) -> usize {
@@ -768,10 +1064,18 @@ fn backward_whitespace_word(s: &str, byte_idx: usize) -> usize {
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let [tabs_area, content_area, footer_area] = Layout::vertical([
+    // The bottom strip is normally one line (the footer).  When the
+    // search dialog is open it expands by one to fit a parse error
+    // beneath the prompt, mirroring the Filter dialog's two-line
+    // popup but laid out inline at the screen bottom — closer to less.
+    let bottom_height = match app.dialog.as_ref() {
+        Some(Dialog::Search { parse_error: Some(_), .. }) => 2,
+        _ => 1,
+    };
+    let [tabs_area, content_area, bottom_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(bottom_height),
     ])
     .areas(area);
 
@@ -791,26 +1095,114 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     let lines: Vec<Line<'_>> = tab.rows[top..bottom]
         .iter()
-        .map(|s| Line::raw(s.as_str()))
+        .map(|s| match &tab.search {
+            Some(search) => highlight_line(s, &search.regex),
+            None => Line::raw(s.as_str()),
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), content_area);
 
-    let footer = if total == 0 {
-        "q quit · f filter · ^T new · ^W close · r rename · 0/0"
-            .to_string()
-    } else {
-        format!(
-            "q quit · f filter · ^T new · ^W close · r rename · \
-             {}-{} of {}",
-            top + 1,
-            bottom,
-            total,
-        )
-    };
-    frame.render_widget(Paragraph::new(footer), footer_area);
+    // Bottom strip: search prompt or footer, never both.
+    match app.dialog.as_ref() {
+        Some(Dialog::Search { editor, direction, parse_error }) => {
+            render_search_prompt(
+                frame,
+                editor,
+                *direction,
+                parse_error.as_deref(),
+                bottom_area,
+            );
+        }
+        _ => {
+            let footer = if total == 0 {
+                "q quit · f filter · / search · n next · \
+                 ^T new · ^W close · r rename · 0/0"
+                    .to_string()
+            } else {
+                format!(
+                    "q quit · f filter · / search · n next · \
+                     ^T new · ^W close · r rename · {}-{} of {}",
+                    top + 1,
+                    bottom,
+                    total,
+                )
+            };
+            frame.render_widget(Paragraph::new(footer), bottom_area);
+        }
+    }
 
-    if let Some(dialog) = app.dialog.as_ref() {
+    // Centered popups (Filter, Rename) draw on top of the rest.  The
+    // Search prompt is laid out inline above and is skipped here.
+    if let Some(dialog @ (Dialog::Filter { .. } | Dialog::Rename { .. })) =
+        app.dialog.as_ref()
+    {
         render_dialog(frame, dialog, area);
+    }
+}
+
+/// Splits `text` into [`Span`]s, highlighting every (non-empty) match
+/// of `regex` with `Modifier::REVERSED`.  Zero-width matches (e.g.
+/// from `a*`) are skipped so they don't multiply into a sea of empty
+/// styled spans.
+fn highlight_line<'a>(text: &'a str, regex: &Regex) -> Line<'a> {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut last_end = 0;
+    for m in regex.find_iter(text) {
+        if m.start() == m.end() {
+            continue;
+        }
+        if m.start() > last_end {
+            spans.push(Span::raw(&text[last_end..m.start()]));
+        }
+        spans.push(Span::styled(
+            &text[m.start()..m.end()],
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+        last_end = m.end();
+    }
+    if last_end < text.len() {
+        spans.push(Span::raw(&text[last_end..]));
+    }
+    Line::from(spans)
+}
+
+/// Renders a `less`-style search prompt (`/foo` or `?foo`) on the top
+/// row of `area`, with the cursor positioned after the typed text.
+/// If `parse_error` is set and `area` is at least two rows tall, the
+/// error is drawn in red on the row below.
+fn render_search_prompt(
+    frame: &mut Frame,
+    editor: &LineEditor,
+    direction: SearchDirection,
+    parse_error: Option<&str>,
+    area: Rect,
+) {
+    let prompt_area = Rect::new(area.x, area.y, area.width, 1);
+    let prefix = direction.prompt();
+    let prompt_text = format!("{prefix}{}", editor.text);
+    frame.render_widget(
+        Paragraph::new(Line::raw(prompt_text)),
+        prompt_area,
+    );
+
+    // Cursor sits at: x + 1 (for the prefix char) + cursor offset.
+    // Search patterns are ASCII in practice, so byte offset == column.
+    let col = prompt_area
+        .x
+        .saturating_add(1)
+        .saturating_add(u16::try_from(editor.cursor).unwrap_or(u16::MAX));
+    let col = col.min(prompt_area.x.saturating_add(prompt_area.width));
+    frame.set_cursor_position(Position::new(col, prompt_area.y));
+
+    if let Some(err) = parse_error
+        && area.height > 1
+    {
+        let err_area = Rect::new(area.x, area.y + 1, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::raw(err))
+                .style(Style::new().fg(Color::Red)),
+            err_area,
+        );
     }
 }
 
@@ -1546,5 +1938,409 @@ mod tests {
         let dump = buffer_text(terminal.backend().buffer());
         assert!(dump.contains("Tab 1"), "dump:\n{dump}");
         assert!(dump.contains("Tab 2"), "dump:\n{dump}");
+    }
+
+    // ---------- search ----------
+
+    /// 10 rows whose every-other line matches "alpha" — useful for
+    /// exercising forward and backward navigation across multiple
+    /// matches.
+    fn search_app() -> App {
+        let rows = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("alpha row {i}")
+                } else {
+                    format!("beta row {i}")
+                }
+            })
+            .collect();
+        let mut a = App::with_rows(rows);
+        a.viewport_height = 3;
+        a
+    }
+
+    #[test]
+    fn slash_opens_forward_search_dialog() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        let d = a.dialog.as_ref().expect("search dialog should be open");
+        assert!(matches!(
+            d,
+            Dialog::Search { direction: SearchDirection::Forward, .. }
+        ));
+        assert_eq!(d.editor().text, "");
+    }
+
+    #[test]
+    fn question_opens_backward_search_dialog() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('?')));
+        let d = a.dialog.as_ref().expect("search dialog should be open");
+        assert!(matches!(
+            d,
+            Dialog::Search { direction: SearchDirection::Backward, .. }
+        ));
+    }
+
+    #[test]
+    fn search_dialog_typing_inserts() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "alpha");
+    }
+
+    #[test]
+    fn search_dialog_keys_do_not_quit_or_scroll() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        // 'q' goes into the buffer, not to the quit binding.
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(!a.quit);
+        assert!(a.dialog.is_some());
+        // 'j' goes into the buffer, not to scroll.
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.active_tab().viewport_top, 0);
+        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "qj");
+    }
+
+    #[test]
+    fn ctrl_w_inside_search_dialog_kills_word_not_close_tab() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha beta");
+        a.handle_key(ctrl('w'));
+        assert!(a.dialog.is_some());
+        assert_eq!(a.dialog.as_ref().unwrap().editor().text, "alpha ");
+        assert_eq!(a.tabs.len(), 1);
+    }
+
+    #[test]
+    fn search_dialog_shows_parse_error_live() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        // `[` opens an unclosed character class.
+        type_into(a.dialog.as_mut().unwrap(), "[");
+        assert!(a.dialog.as_ref().unwrap().parse_error().is_some());
+        a.handle_key(key(KeyCode::Backspace));
+        assert!(a.dialog.as_ref().unwrap().parse_error().is_none());
+    }
+
+    #[test]
+    fn search_enter_with_invalid_regex_keeps_dialog_open() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "[");
+        a.handle_key(key(KeyCode::Enter));
+        let d = a.dialog.as_ref().expect("dialog should still be open");
+        assert!(d.parse_error().is_some());
+        assert!(a.last_search.is_none());
+        assert!(a.active_tab().search.is_none());
+    }
+
+    #[test]
+    fn search_enter_with_valid_regex_jumps_to_first_match() {
+        let mut a = search_app();
+        // Start mid-file so "first match at or after viewport_top" is
+        // visible.
+        a.active_tab_mut().viewport_top = 3;
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(a.dialog.is_none());
+        // Rows 4, 6, 8 are alphas (and 0, 2 above); the first match
+        // at or after row 3 is row 4.
+        assert_eq!(a.active_tab().viewport_top, 4);
+        assert_eq!(
+            a.last_search.as_ref().unwrap().pattern,
+            "alpha".to_string(),
+        );
+        assert_eq!(
+            a.last_search.as_ref().unwrap().direction,
+            SearchDirection::Forward,
+        );
+        // tab.search holds all five even-row indices.
+        let s = a.active_tab().search.as_ref().unwrap();
+        assert_eq!(s.matches, vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn backward_search_jumps_to_previous_match() {
+        let mut a = search_app();
+        a.active_tab_mut().viewport_top = 5;
+        a.handle_key(key(KeyCode::Char('?')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+
+        // Closest alpha at or before row 5 is row 4.
+        assert_eq!(a.active_tab().viewport_top, 4);
+        assert_eq!(
+            a.last_search.as_ref().unwrap().direction,
+            SearchDirection::Backward,
+        );
+    }
+
+    #[test]
+    fn n_advances_to_next_match() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        // Lands on row 0 (first match at/after viewport_top=0).
+        assert_eq!(a.active_tab().viewport_top, 0);
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 2);
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 4);
+    }
+
+    #[test]
+    fn shift_n_reverses_direction_for_one_step_only() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        a.handle_key(key(KeyCode::Char('n')));
+        a.handle_key(key(KeyCode::Char('n')));
+        // viewport_top now at row 4.
+        assert_eq!(a.active_tab().viewport_top, 4);
+        a.handle_key(shift('N'));
+        assert_eq!(a.active_tab().viewport_top, 2);
+        // last_search direction is still Forward, so `n` resumes
+        // going forward (back to row 4).
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 4);
+    }
+
+    #[test]
+    fn slash_enter_repeats_last_search_forward() {
+        let mut a = search_app();
+        // Initial backward search.
+        a.active_tab_mut().viewport_top = 5;
+        a.handle_key(key(KeyCode::Char('?')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.active_tab().viewport_top, 4);
+        // Now /<enter>: same pattern, but Forward direction.
+        a.handle_key(key(KeyCode::Char('/')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        // Forward repeat from row 4 advances to row 6.
+        assert_eq!(a.active_tab().viewport_top, 6);
+        // direction is now Forward.
+        assert_eq!(
+            a.last_search.as_ref().unwrap().direction,
+            SearchDirection::Forward,
+        );
+    }
+
+    #[test]
+    fn question_enter_repeats_last_search_backward() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        // viewport_top = 0.
+        a.handle_key(key(KeyCode::Char('n')));
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 4);
+        a.handle_key(key(KeyCode::Char('?')));
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.active_tab().viewport_top, 2);
+        assert_eq!(
+            a.last_search.as_ref().unwrap().direction,
+            SearchDirection::Backward,
+        );
+    }
+
+    #[test]
+    fn empty_search_with_no_history_is_noop() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        assert_eq!(a.active_tab().viewport_top, 0);
+        assert!(a.last_search.is_none());
+        assert!(a.active_tab().search.is_none());
+    }
+
+    #[test]
+    fn n_with_no_history_is_noop() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('n')));
+        a.handle_key(shift('N'));
+        assert_eq!(a.active_tab().viewport_top, 0);
+        assert!(a.last_search.is_none());
+    }
+
+    #[test]
+    fn search_stays_put_when_no_match_in_direction() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "no_such_pattern");
+        a.handle_key(key(KeyCode::Enter));
+        // No matches; viewport doesn't move.
+        assert_eq!(a.active_tab().viewport_top, 0);
+        // tab.search still installed (with empty matches), so n is
+        // also a no-op.
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 0);
+    }
+
+    #[test]
+    fn search_cleared_on_filter_change() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.active_tab().search.is_some());
+        // Apply any filter (with_rows uses an empty engine, so the
+        // resulting rows will be empty — but that's fine for testing
+        // that search is cleared).
+        a.handle_key(key(KeyCode::Char('f')));
+        type_into(a.dialog.as_mut().unwrap(), "level>=warn");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.active_tab().search.is_none());
+        // last_search still remembered at the App level.
+        assert!(a.last_search.is_some());
+    }
+
+    #[test]
+    fn n_after_filter_change_re_derives_search() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        // Advance once so the next `n` after re-derivation has a match
+        // strictly past viewport_top.
+        a.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(a.active_tab().viewport_top, 2);
+
+        // Open the filter dialog with no edits and apply: rows
+        // re-query (still all the same rows since with_rows engine has
+        // no sources, so the re-queried rows are now empty), but the
+        // search clears either way.  To realistically test
+        // re-derivation, we sneak the rows back in directly.
+        a.active_tab_mut().rows = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!("alpha row {i}")
+                } else {
+                    format!("beta row {i}")
+                }
+            })
+            .collect();
+        a.active_tab_mut().search = None;
+        a.active_tab_mut().viewport_top = 3;
+
+        a.handle_key(key(KeyCode::Char('n')));
+        // Re-derives search; nearest match strictly past row 3 is 4.
+        assert_eq!(a.active_tab().viewport_top, 4);
+        assert!(a.active_tab().search.is_some());
+    }
+
+    #[test]
+    fn compute_matches_returns_sorted_indices() {
+        let rows: Vec<String> =
+            ["foo", "bar", "foo bar", "baz", "qux foo"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let regex = Regex::new("foo").unwrap();
+        assert_eq!(compute_matches(&rows, &regex), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn highlight_line_styles_only_matched_runs() {
+        let regex = Regex::new("alpha").unwrap();
+        let line = highlight_line("xx alpha yy alpha zz", &regex);
+        // Three plain spans, two reversed.
+        assert_eq!(line.spans.len(), 5);
+        let reversed = Style::default().add_modifier(Modifier::REVERSED);
+        let plain = Style::default();
+        assert_eq!(line.spans[0].style, plain);
+        assert_eq!(line.spans[0].content, "xx ");
+        assert_eq!(line.spans[1].style, reversed);
+        assert_eq!(line.spans[1].content, "alpha");
+        assert_eq!(line.spans[2].style, plain);
+        assert_eq!(line.spans[2].content, " yy ");
+        assert_eq!(line.spans[3].style, reversed);
+        assert_eq!(line.spans[3].content, "alpha");
+        assert_eq!(line.spans[4].style, plain);
+        assert_eq!(line.spans[4].content, " zz");
+    }
+
+    #[test]
+    fn highlight_line_skips_zero_width_matches() {
+        // `a*` matches the empty string between every char — without
+        // explicit handling this would emit a styled span of width 0
+        // at every byte boundary.
+        let regex = Regex::new("a*").unwrap();
+        let line = highlight_line("xyz", &regex);
+        // Only the unmatched-tail span survives.
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "xyz");
+    }
+
+    #[test]
+    fn render_draws_search_prompt_at_bottom() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // Bottom row should start with /alpha.  A 6-row screen lays
+        // out: tab bar (1) + content (1+) + footer (1).  The prompt
+        // replaces the footer.
+        assert!(dump.contains("/alpha"), "dump:\n{dump}");
+        // Footer text shouldn't be drawn while search is open.
+        assert!(!dump.contains("q quit"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn render_draws_search_parse_error_below_prompt() {
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "[");
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("/["), "dump:\n{dump}");
+        assert!(
+            dump.contains("regex parse error")
+                || dump.contains("character class"),
+            "expected a regex error:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn render_highlights_matches_in_visible_rows() {
+        let backend = TestBackend::new(40, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["alpha line".to_string()]);
+        a.viewport_height = 1;
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Layout: row 0 is the tab bar, row 1 is the first content row.
+        // Cells (0..5, 1) cover "alpha" and should be reversed; cell
+        // (5, 1) is the space after, plain.
+        for x in 0..5 {
+            assert!(
+                buf[(x, 1)].modifier.contains(Modifier::REVERSED),
+                "expected REVERSED at ({x}, 1)",
+            );
+        }
+        assert!(
+            !buf[(5, 1)].modifier.contains(Modifier::REVERSED),
+            "expected plain at (5, 1)",
+        );
     }
 }
