@@ -1,0 +1,357 @@
+{"msg":"Nexus starting up","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.142223551-07:00","hostname":"ivanova","pid":15797,"version":"0.1.0","build":"0.1.0"}
+{"msg":"loaded blueprint","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.142471972-07:00","hostname":"ivanova","pid":15797,"blueprint_id":"1f8d-3c57"}
+{"msg":"DNS records loaded","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.142617109-07:00","hostname":"ivanova","pid":15797,"zones":4}
+{"msg":"instance_watcher background task started","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.142761645-07:00","hostname":"ivanova","pid":15797}
+{"msg":"blueprint_executor background task started","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.142887423-07:00","hostname":"ivanova","pid":15797}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143021589-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0000","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143203939-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0000","elapsed_ms":20,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143376861-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0001","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143555214-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0001","elapsed_ms":33,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143726202-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0002","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.143903312-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0002","elapsed_ms":46,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.144074741-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0003","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.144254006-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0003","elapsed_ms":59,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.144421667-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0004","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.144599449-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0004","elapsed_ms":72,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.14476693-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0005","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.144945293-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0005","elapsed_ms":85,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.145114568-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0006","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.145289844-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0006","elapsed_ms":98,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.145457295-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0007","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.145633965-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0007","elapsed_ms":111}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.14578826-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0007","elapsed_ms":111,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.145957625-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0008","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.146135066-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0008","elapsed_ms":124}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.146290222-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0008","elapsed_ms":124,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.146459477-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0009","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.146635415-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0009","elapsed_ms":137}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.14678963-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0009","elapsed_ms":137,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.146963534-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0010","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.147147099-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0010","elapsed_ms":30,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.147321915-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0011","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.147505067-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0011","elapsed_ms":43,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.147678239-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0012","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.147862453-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0012","elapsed_ms":56,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148035606-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0013","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148217987-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0013","elapsed_ms":69,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148393313-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0014","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148574231-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0014","elapsed_ms":82,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148747914-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0015","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.148930305-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0015","elapsed_ms":95,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.149102696-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0016","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.149284506-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0016","elapsed_ms":108}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.149441316-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0016","elapsed_ms":108,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.149612544-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0017","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.149796638-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0017","elapsed_ms":121}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.14995432-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0017","elapsed_ms":121,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.15013131-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0018","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.150313821-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0018","elapsed_ms":134}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.150471864-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0018","elapsed_ms":134,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.150645687-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0019","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.150828499-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0019","elapsed_ms":27,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151000729-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0020","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151186206-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0020","elapsed_ms":40,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151357615-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0021","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151542531-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0021","elapsed_ms":53,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151715994-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0022","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.151897052-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0022","elapsed_ms":66,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.152074463-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0023","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.152256924-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0023","elapsed_ms":79,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.152430797-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0024","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.152613629-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0024","elapsed_ms":92,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.152785709-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0025","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.152969072-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0025","elapsed_ms":105}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.153127245-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0025","elapsed_ms":105,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.153298393-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0026","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.153483329-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0026","elapsed_ms":118}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.153641211-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0026","elapsed_ms":118,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.153814063-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0027","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.153996223-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0027","elapsed_ms":131}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.154156099-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0027","elapsed_ms":131,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.154327759-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0028","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.154509919-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0028","elapsed_ms":24,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.154681548-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0029","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.154861494-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0029","elapsed_ms":37,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155033955-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0030","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155215534-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0030","elapsed_ms":50,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155389348-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0031","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155569895-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0031","elapsed_ms":63,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155743749-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0032","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.155924376-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0032","elapsed_ms":76,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.156097438-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0033","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.156281472-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0033","elapsed_ms":89,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.156454564-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0034","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.156635292-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0034","elapsed_ms":102}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.156795378-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0034","elapsed_ms":102,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.156969152-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0035","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.157151895-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0035","elapsed_ms":115}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.157310759-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0035","elapsed_ms":115,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.157483932-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0036","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.157668878-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0036","elapsed_ms":128}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.157827151-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0036","elapsed_ms":128,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.157999642-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0037","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.158185229-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0037","elapsed_ms":21,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.158356948-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0038","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.158538257-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0038","elapsed_ms":34,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.158712271-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0039","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.158892387-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0039","elapsed_ms":47,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159074297-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0040","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159253982-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0040","elapsed_ms":60,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159423928-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0041","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159600758-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0041","elapsed_ms":73,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159768399-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0042","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.159944898-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0042","elapsed_ms":86,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.160118101-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0043","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.160296434-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0043","elapsed_ms":99,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.160467652-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0044","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.160644672-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0044","elapsed_ms":112}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.160798366-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0044","elapsed_ms":112,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.160969184-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0045","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.161148509-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0045","elapsed_ms":125}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.161303195-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0045","elapsed_ms":125,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.161473591-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0046","uri":"/v1/instances","method":"GET"}
+{"msg":"slow request","v":0,"name":"Nexus","level":40,"time":"2026-05-06T21:48:12.161652305-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0046","elapsed_ms":138}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.161807552-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0046","elapsed_ms":138,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.161977107-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0047","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.162154217-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0047","elapsed_ms":31,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.162323612-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0048","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.162501294-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0048","elapsed_ms":44,"status":200}
+{"msg":"received request","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.162673083-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0049","uri":"/v1/instances","method":"GET"}
+{"msg":"request complete","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.16285314-07:00","hostname":"ivanova","pid":15797,"request_id":"req-0049","elapsed_ms":57,"status":200}
+{"msg":"blueprint execution failed","v":0,"name":"Nexus","level":50,"time":"2026-05-06T21:48:12.163023907-07:00","hostname":"ivanova","pid":15797,"reason":"sled-04 unreachable","step":"datasets","blueprint_id":"1f8d-3c57"}
+{"msg":"blueprint execution failed","v":0,"name":"Nexus","level":50,"time":"2026-05-06T21:48:12.16320749-07:00","hostname":"ivanova","pid":15797,"reason":"sled-04 unreachable","step":"datasets","blueprint_id":"1f8d-3c57"}
+{"msg":"blueprint execution retry scheduled","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.163387226-07:00","hostname":"ivanova","pid":15797,"delay_s":30,"blueprint_id":"1f8d-3c57"}
+{"msg":"blueprint execution succeeded","v":0,"name":"Nexus","level":30,"time":"2026-05-06T21:48:12.163546451-07:00","hostname":"ivanova","pid":15797,"blueprint_id":"1f8d-3c57"}
+{"msg":"lookup expanded","v":0,"name":"Nexus","level":20,"time":"2026-05-06T21:48:12.163691307-07:00","hostname":"ivanova","pid":15797,"id":"abc-123","kind":"instance"}
+{"msg":"authz check","v":0,"name":"Nexus","level":20,"time":"2026-05-06T21:48:12.163852846-07:00","hostname":"ivanova","pid":15797,"resource":"instance:abc-123","action":"read","actor":"user-foo"}
+{"msg":"sled-agent starting up","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.164053814-07:00","hostname":"ivanova","pid":15797,"sled":"sled-01"}
+{"msg":"rack initialized","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.164196787-07:00","hostname":"ivanova","pid":15797,"sled":"sled-01"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.164345741-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.164529004-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.164707146-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.164896891-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.165079893-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.165257174-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.165446558-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.165626554-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.165804696-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.165995243-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.166175049-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.166354954-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.166543928-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.166722551-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.166902617-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.167091292-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.167271218-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.167451775-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.16764107-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.167821326-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.16800017-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.168194123-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.168371013-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.168553274-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.168742899-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.168919868-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.169102951-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.169292285-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.169474575-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.169653149-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.169840198-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.170018421-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.170196142-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.170384435-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.170562206-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.170740619-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"instance failed to start","v":0,"name":"SledAgent","level":50,"time":"2026-05-06T21:48:12.170930344-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-01","reason":"image not found"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.171109458-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.171290947-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.171470853-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.171664225-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.171842568-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.172022885-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.172215125-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.172392506-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.172573784-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.172760553-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.172940579-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.173120946-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.173306663-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.173484776-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.173663459-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.173851731-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.174031016-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.174208928-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.174399274-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.17457925-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.174756631-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.17494314-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-01","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.175119819-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-01","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.175298512-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-01","memory_mib":1024,"vcpus":2}
+{"msg":"disk near capacity","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.175486233-07:00","hostname":"ivanova","pid":15797,"sled":"sled-01","free_pct":14,"disk":"M.2_0"}
+{"msg":"ntp drift exceeded threshold","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.175660087-07:00","hostname":"ivanova","pid":15797,"sled":"sled-01","drift_ms":122}
+{"msg":"ntp sync complete","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.1758183-07:00","hostname":"ivanova","pid":15797,"sled":"sled-01","drift_ms":3}
+{"msg":"sled-agent starting up","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.175978788-07:00","hostname":"ivanova","pid":15797,"sled":"sled-02"}
+{"msg":"rack initialized","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.176121341-07:00","hostname":"ivanova","pid":15797,"sled":"sled-02"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.176263372-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.17644426-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.176625899-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.176811506-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.176987584-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.177166799-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.177353959-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.177531159-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.177707308-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.177894899-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.178076658-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.178253207-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.178442582-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.178620403-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.178801241-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.178987289-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.179168878-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.179349305-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.179536365-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.179715679-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.179894012-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.180082835-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18026216-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.180442767-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.180630218-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.180805574-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.180983015-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.181171117-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18134437-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.181522392-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.181706827-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.181882805-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.182062179-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.182248037-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.1824264-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.182604782-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"instance failed to start","v":0,"name":"SledAgent","level":50,"time":"2026-05-06T21:48:12.182791231-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-02","reason":"image not found"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.182971738-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.183151494-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.183331469-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.183518048-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.183697403-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.183874042-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.184060351-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.184240407-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.184417527-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.184605649-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.184782729-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.184958036-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.185146879-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.185324661-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.185504026-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.18569329-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.185868146-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.186048263-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.186234151-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.186415029-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18659237-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.186779941-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-02","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.1869566-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-02","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.187136927-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-02","memory_mib":1024,"vcpus":2}
+{"msg":"disk near capacity","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.187326271-07:00","hostname":"ivanova","pid":15797,"sled":"sled-02","free_pct":14,"disk":"M.2_0"}
+{"msg":"ntp drift exceeded threshold","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.187498482-07:00","hostname":"ivanova","pid":15797,"sled":"sled-02","drift_ms":122}
+{"msg":"ntp sync complete","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18765416-07:00","hostname":"ivanova","pid":15797,"sled":"sled-02","drift_ms":3}
+{"msg":"sled-agent starting up","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.187814897-07:00","hostname":"ivanova","pid":15797,"sled":"sled-03"}
+{"msg":"rack initialized","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.187954884-07:00","hostname":"ivanova","pid":15797,"sled":"sled-03"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.188096635-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.188275248-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18845362-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0000","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.188642424-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.188820456-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.188997726-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0001","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.189188484-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.189366596-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18954546-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0002","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.189731047-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.18990977-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.190090167-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0003","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.19027897-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.190457193-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.190634764-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0004","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.190824108-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.19100194-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.191183759-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0005","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.191372282-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.191549893-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.191729969-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0006","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.191916338-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.192096244-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.192275037-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0007","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.192459963-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.192638857-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.192816829-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0008","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.193004119-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.193188935-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.193366115-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0009","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.193554087-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.193729854-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.193903868-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0010","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.194092822-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.194269922-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.194448706-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"instance failed to start","v":0,"name":"SledAgent","level":50,"time":"2026-05-06T21:48:12.194634834-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0011","sled":"sled-03","reason":"image not found"}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.194813908-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.194990547-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.195169331-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0012","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.195356882-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.195533451-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.195712745-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0013","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.195901689-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.196080996-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.196261402-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0014","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.196448713-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.196626685-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.196804506-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0015","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.196993099-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.197172264-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.197347841-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0016","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.197535301-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.197713033-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.197891947-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0017","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.198081722-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.198259353-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.19843961-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0018","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"received instance ensure","v":0,"name":"SledAgent","level":20,"time":"2026-05-06T21:48:12.198627211-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-03","kind":"running"}
+{"msg":"instance starting","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.198806776-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-03","image":"alpine-3.19"}
+{"msg":"instance running","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.198984908-07:00","hostname":"ivanova","pid":15797,"instance_id":"inst-0019","sled":"sled-03","memory_mib":1024,"vcpus":2}
+{"msg":"disk near capacity","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.199172649-07:00","hostname":"ivanova","pid":15797,"sled":"sled-03","free_pct":14,"disk":"M.2_0"}
+{"msg":"ntp drift exceeded threshold","v":0,"name":"SledAgent","level":40,"time":"2026-05-06T21:48:12.199346493-07:00","hostname":"ivanova","pid":15797,"sled":"sled-03","drift_ms":122}
+{"msg":"ntp sync complete","v":0,"name":"SledAgent","level":30,"time":"2026-05-06T21:48:12.19950169-07:00","hostname":"ivanova","pid":15797,"sled":"sled-03","drift_ms":3}
+{"msg":"MGS starting up","v":0,"name":"MGS","level":30,"time":"2026-05-06T21:48:12.199661516-07:00","hostname":"ivanova","pid":15797}
+{"msg":"switch detected","v":0,"name":"MGS","level":30,"time":"2026-05-06T21:48:12.199787415-07:00","hostname":"ivanova","pid":15797,"switch":"switch0"}
+{"msg":"ignition state read","v":0,"name":"MGS","level":30,"time":"2026-05-06T21:48:12.19992671-07:00","hostname":"ivanova","pid":15797,"switch":"switch0","powered":true}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.200082298-07:00","hostname":"ivanova","pid":15797,"switch":"switch0","celsius":42}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.200242415-07:00","hostname":"ivanova","pid":15797,"switch":"switch0","celsius":43}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.200397301-07:00","hostname":"ivanova","pid":15797,"switch":"switch0","celsius":44}
+{"msg":"transceiver missing","v":0,"name":"MGS","level":40,"time":"2026-05-06T21:48:12.200552658-07:00","hostname":"ivanova","pid":15797,"switch":"switch0","port":7}
+{"msg":"switch detected","v":0,"name":"MGS","level":30,"time":"2026-05-06T21:48:12.200711382-07:00","hostname":"ivanova","pid":15797,"switch":"switch1"}
+{"msg":"ignition state read","v":0,"name":"MGS","level":30,"time":"2026-05-06T21:48:12.200850978-07:00","hostname":"ivanova","pid":15797,"switch":"switch1","powered":true}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.201005834-07:00","hostname":"ivanova","pid":15797,"switch":"switch1","celsius":42}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.2011604-07:00","hostname":"ivanova","pid":15797,"switch":"switch1","celsius":43}
+{"msg":"thermal sensor read","v":0,"name":"MGS","level":20,"time":"2026-05-06T21:48:12.201316158-07:00","hostname":"ivanova","pid":15797,"switch":"switch1","celsius":44}
+{"msg":"transceiver missing","v":0,"name":"MGS","level":40,"time":"2026-05-06T21:48:12.201471435-07:00","hostname":"ivanova","pid":15797,"switch":"switch1","port":7}
+{"msg":"switch port flapping","v":0,"name":"MGS","level":50,"time":"2026-05-06T21:48:12.201628576-07:00","hostname":"ivanova","pid":15797,"port":12,"switch":"switch0"}
+{"msg":"node startup","v":0,"name":"CockroachDB","level":30,"time":"2026-05-06T21:48:12.201788853-07:00","hostname":"ivanova","pid":15797}
+{"msg":"joined cluster","v":0,"name":"CockroachDB","level":30,"time":"2026-05-06T21:48:12.201909792-07:00","hostname":"ivanova","pid":15797,"node_id":3}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.202044298-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":5,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.202199675-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":8,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.202354121-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":11,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.20251058-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":14,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.20266222-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":17,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.202817046-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":20,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.202971471-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":23,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.20312755-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":26,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.203283168-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":29,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.20343606-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":7,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.203591017-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":10,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.203744931-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":13,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.203896411-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":16,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.204054132-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":19,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"executed sql","v":0,"name":"CockroachDB","level":20,"time":"2026-05-06T21:48:12.204207816-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":22,"stmt":"SELECT * FROM omicron.public.instance LIMIT 100"}
+{"msg":"slow query","v":0,"name":"CockroachDB","level":40,"time":"2026-05-06T21:48:12.204363745-07:00","hostname":"ivanova","pid":15797,"elapsed_ms":1850,"stmt":"SELECT count(*) FROM omicron.public.network_interface"}
+{"msg":"transaction aborted","v":0,"name":"CockroachDB","level":50,"time":"2026-05-06T21:48:12.204517749-07:00","hostname":"ivanova","pid":15797,"reason":"retry exhausted"}
