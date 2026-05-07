@@ -50,6 +50,13 @@ impl Filter {
     pub fn predicates(&self) -> &[Predicate] {
         &self.predicates
     }
+
+    /// Appends `predicate` to the conjunction.  Used by callers that
+    /// build a filter incrementally (e.g. the TUI's exclude mode adds a
+    /// `msg != <selected message>` predicate to the active filter).
+    pub fn add_predicate(&mut self, predicate: Predicate) {
+        self.predicates.push(predicate);
+    }
 }
 
 /// A single predicate over an [`Event`].

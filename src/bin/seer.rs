@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use regex::Regex;
-use seer::{Engine, Filter, SourceError};
+use seer::{Engine, Event as LogEvent, Filter, Predicate};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -66,23 +66,43 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn render_rows(engine: &Engine, filter: &Filter) -> Vec<String> {
-    engine.query_events(filter).map(format_row).collect()
+/// Materializes the active filter against the engine, returning the
+/// underlying events alongside their pre-formatted display strings.  The
+/// two vecs are the same length and indexed identically; an `events`
+/// entry is `None` exactly where the corresponding row was a parse/I/O
+/// error.  Keeping the events lets callers (e.g. exclude mode) build
+/// new filter predicates from the row under the cursor.
+fn render_rows(
+    engine: &Engine,
+    filter: &Filter,
+) -> (Vec<Option<LogEvent>>, Vec<String>) {
+    let mut events = Vec::new();
+    let mut formatted = Vec::new();
+    for r in engine.query_events(filter) {
+        match r {
+            Ok(e) => {
+                formatted.push(format_event(&e));
+                events.push(Some(e));
+            }
+            Err(err) => {
+                formatted.push(format!("error: {err}"));
+                events.push(None);
+            }
+        }
+    }
+    (events, formatted)
 }
 
-fn format_row(r: Result<seer::Event, SourceError>) -> String {
-    match r {
-        Ok(e) => format!(
-            "{} [{}] {}/{}/{}: {}",
-            e.time.to_rfc3339(),
-            e.level,
-            e.name,
-            e.hostname,
-            e.pid,
-            e.msg,
-        ),
-        Err(err) => format!("error: {err}"),
-    }
+fn format_event(e: &LogEvent) -> String {
+    format!(
+        "{} [{}] {}/{}/{}: {}",
+        e.time.to_rfc3339(),
+        e.level,
+        e.name,
+        e.hostname,
+        e.pid,
+        e.msg,
+    )
 }
 
 /// Indices of every row in `rows` containing at least one match for
@@ -143,35 +163,72 @@ struct LastSearch {
 /// One independent view: name, filter, the rows produced by querying
 /// the engine with that filter, and the scroll offset within those
 /// rows.
+///
+/// `events` and `formatted` have identical length and are indexed the
+/// same way.  `events[i]` is `None` exactly when that row came from a
+/// parse or I/O error rather than a real log record; the stringified
+/// error sits in `formatted[i]`.  Keeping the parsed events around lets
+/// in-place actions (e.g. exclude mode's "filter out entries like this")
+/// inspect the record under the cursor without re-parsing.
 struct Tab {
     name: String,
     filter: Filter,
-    rows: Vec<String>,
+    events: Vec<Option<LogEvent>>,
+    formatted: Vec<String>,
     /// Index of the row at the top of the viewport.
     viewport_top: usize,
-    /// Active highlighted search, if any.  Cleared when `rows` is
+    /// Active highlighted search, if any.  Cleared when `formatted` is
     /// re-queried (filter change), because match indices would
     /// otherwise dangle.
     search: Option<TabSearch>,
+    /// When `Some`, select mode is active.  The contained value carries
+    /// the row index currently highlighted and the polarity (`x` →
+    /// exclude, `X` → include) used to build the predicate on commit.
+    /// Cleared whenever `formatted` is re-queried so the index can't
+    /// dangle.
+    select: Option<Selection>,
+}
+
+/// State of an in-progress `x`/`X` selection.
+///
+/// `row` is an absolute index into [`Tab::formatted`].  `negated` is
+/// the polarity that will be baked into the predicate when the user
+/// hits Enter — `true` for `x` (exclude: `msg!=value`), `false` for
+/// `X` (include: `msg=value`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    row: usize,
+    negated: bool,
 }
 
 impl Tab {
     fn new(name: String, engine: &Engine, filter: Filter) -> Self {
-        let rows = render_rows(engine, &filter);
-        Self { name, filter, rows, viewport_top: 0, search: None }
+        let (events, formatted) = render_rows(engine, &filter);
+        Self {
+            name,
+            filter,
+            events,
+            formatted,
+            viewport_top: 0,
+            search: None,
+            select: None,
+        }
     }
 
     fn apply_filter(&mut self, engine: &Engine, filter: Filter) {
-        self.rows = render_rows(engine, &filter);
+        let (events, formatted) = render_rows(engine, &filter);
+        self.events = events;
+        self.formatted = formatted;
         self.filter = filter;
         self.viewport_top = 0;
         self.search = None;
+        self.select = None;
     }
 
     /// Largest valid `viewport_top`: the row index that places the last
-    /// row of `rows` flush with the bottom of the viewport.
+    /// row of `formatted` flush with the bottom of the viewport.
     fn max_top(&self, viewport_height: u16) -> usize {
-        self.rows.len().saturating_sub(viewport_height as usize)
+        self.formatted.len().saturating_sub(viewport_height as usize)
     }
 
     fn scroll_down(&mut self, n: usize, viewport_height: u16) {
@@ -181,6 +238,32 @@ impl Tab {
 
     fn scroll_up(&mut self, n: usize) {
         self.viewport_top = self.viewport_top.saturating_sub(n);
+    }
+
+    /// Moves the select-mode highlight by `delta` rows (positive ==
+    /// down) and scrolls the viewport just enough to keep the new
+    /// selection visible.  No-op if select mode is not active or if
+    /// there are no rows.
+    fn move_selection(&mut self, delta: isize, viewport_height: u16) {
+        let Some(sel) = self.select else {
+            return;
+        };
+        if self.formatted.is_empty() {
+            return;
+        }
+        let last = self.formatted.len() - 1;
+        let new_row =
+            (sel.row as isize + delta).clamp(0, last as isize) as usize;
+        self.select = Some(Selection { row: new_row, ..sel });
+        // Re-anchor the viewport.  `viewport_height` is sometimes 0 in
+        // tests that don't render — saturating math keeps that case
+        // sensible (selection visible at viewport_top).
+        let h = viewport_height as usize;
+        if new_row < self.viewport_top {
+            self.viewport_top = new_row;
+        } else if h > 0 && new_row >= self.viewport_top + h {
+            self.viewport_top = new_row + 1 - h;
+        }
     }
 }
 
@@ -269,7 +352,7 @@ impl App {
         direction: SearchDirection,
     ) {
         let matches =
-            compute_matches(&self.tabs[self.active].rows, &regex);
+            compute_matches(&self.tabs[self.active].formatted, &regex);
         let tab = &mut self.tabs[self.active];
         tab.search = Some(TabSearch {
             pattern: pattern.clone(),
@@ -326,7 +409,7 @@ impl App {
         let Ok(regex) = Regex::new(pattern) else {
             return;
         };
-        let matches = compute_matches(&tab.rows, &regex);
+        let matches = compute_matches(&tab.formatted, &regex);
         tab.search = Some(TabSearch {
             pattern: pattern.to_string(),
             regex,
@@ -388,12 +471,104 @@ impl App {
         }
     }
 
+    /// Enters select mode on the active tab with the given polarity.
+    /// `negated` is `true` for `x` (exclude on commit) and `false` for
+    /// `X` (include on commit).  No-op when the tab has no rows.
+    fn start_selection(&mut self, negated: bool) {
+        let tab = self.active_tab_mut();
+        if tab.formatted.is_empty() {
+            return;
+        }
+        tab.select = Some(Selection { row: tab.viewport_top, negated });
+    }
+
+    /// Routes a keystroke while select mode is active on the current
+    /// tab.  Only the keys that make sense in this transient mode are
+    /// honored; everything else is dropped on the floor so a stray `f`
+    /// or `^T` can't move the user into a context where the row index
+    /// no longer means what they thought.
+    fn handle_selection_key(&mut self, key: KeyEvent) {
+        let h = self.viewport_height;
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.active_tab_mut().select = None;
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.commit_selection();
+            }
+            KeyEvent {
+                code: KeyCode::Char('j') | KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.active_tab_mut().move_selection(1, h);
+            }
+            KeyEvent {
+                code: KeyCode::Char('k') | KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.active_tab_mut().move_selection(-1, h);
+            }
+            _ => {}
+        }
+    }
+
+    /// Build a `msg=<selected msg>` (or `msg!=<selected msg>`,
+    /// depending on the selection's polarity) predicate from the row
+    /// under the highlight, append it to the active filter, and
+    /// re-query.  When the selected row is an error (no parsed event)
+    /// this is a no-op: there's no `msg` to extract, and silently
+    /// exiting the mode would be more confusing than just doing nothing
+    /// and letting the user pick a different row or Esc out.
+    fn commit_selection(&mut self) {
+        let tab = &self.tabs[self.active];
+        let Some(sel) = tab.select else {
+            return;
+        };
+        let Some(Some(event)) = tab.events.get(sel.row) else {
+            return;
+        };
+        let new_pred = Predicate::FieldEquals {
+            name: "msg".to_string(),
+            value: event.msg.clone(),
+            negated: sel.negated,
+        };
+        let mut new_filter = tab.filter.clone();
+        new_filter.add_predicate(new_pred);
+        // apply_filter resets viewport_top, search, and select.
+        self.apply_filter(new_filter);
+    }
+
     /// Test constructor that skips the engine entirely.  The scroll
-    /// tests don't care where rows come from, and unit-testing those
-    /// against pre-formatted strings is much simpler than wiring up
-    /// real log files.
+    /// and search tests don't care where rows come from, and
+    /// unit-testing those against pre-formatted strings is much simpler
+    /// than wiring up real log files.  The events vec is parallel-empty
+    /// (`None` everywhere); tests that exercise exclude mode go through
+    /// [`App::with_events`] instead.
     #[cfg(test)]
-    fn with_rows(rows: Vec<String>) -> Self {
+    fn with_rows(formatted: Vec<String>) -> Self {
+        let events = vec![None; formatted.len()];
+        Self::with_events(events, formatted)
+    }
+
+    /// Test constructor that lets the caller supply both events and
+    /// pre-formatted display strings.  Required for exclude-mode tests,
+    /// which read `Event::msg` to build the new predicate.
+    #[cfg(test)]
+    fn with_events(
+        events: Vec<Option<LogEvent>>,
+        formatted: Vec<String>,
+    ) -> Self {
+        assert_eq!(events.len(), formatted.len());
         let mut a = Self {
             engine: Engine::new(),
             tabs: Vec::new(),
@@ -405,14 +580,16 @@ impl App {
             dialog: None,
             last_search: None,
         };
-        // Manually push so we can override `rows` (the engine has no
-        // sources, so a real push_tab would yield an empty Vec).
+        // Manually push so we can override the row data (the engine
+        // has no sources, so a real push_tab would yield empty vecs).
         a.tabs.push(Tab {
             name: format!("Tab {}", a.next_tab_number),
             filter: Filter::default(),
-            rows,
+            events,
+            formatted,
             viewport_top: 0,
             search: None,
+            select: None,
         });
         a.next_tab_number += 1;
         a
@@ -449,6 +626,17 @@ impl App {
                     self.repeat_last_search(direction);
                 }
             }
+            return;
+        }
+        // Exclude mode similarly intercepts every keystroke: in this
+        // mode j/k move the selection rather than the viewport, and
+        // Enter commits the new exclusion predicate.  Other actions
+        // (filter edits, tab switches, search) are intentionally
+        // suppressed so the in-progress selection can't be carried into
+        // a context where the row index would no longer mean what the
+        // user thought.
+        if self.active_tab().select.is_some() {
+            self.handle_selection_key(key);
             return;
         }
         let page = self.viewport_height as usize;
@@ -542,6 +730,26 @@ impl App {
             } => {
                 self.dialog =
                     Some(Dialog::filter(&self.active_tab().filter));
+            }
+            // `x`: enter select mode for *exclusion*; `X`: same mode
+            // but for *inclusion*.  Different terminals report `X` with
+            // either NONE or SHIFT modifiers (matching `G`/`?`), so we
+            // accept both.  The selection starts at `viewport_top` so
+            // the user can immediately move it through the visible
+            // rows; if the tab is empty there's nothing to select
+            // against, so this is a no-op.
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.start_selection(/* negated = */ true);
+            }
+            KeyEvent { code: KeyCode::Char('X'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.start_selection(/* negated = */ false);
             }
             KeyEvent {
                 code: KeyCode::Char('r'),
@@ -1089,15 +1297,31 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let tab = app.active_tab();
-    let total = tab.rows.len();
+    let total = tab.formatted.len();
     let top = tab.viewport_top;
     let bottom = (top + content_area.height as usize).min(total);
 
-    let lines: Vec<Line<'_>> = tab.rows[top..bottom]
+    let lines: Vec<Line<'_>> = tab.formatted[top..bottom]
         .iter()
-        .map(|s| match &tab.search {
-            Some(search) => highlight_line(s, &search.regex),
-            None => Line::raw(s.as_str()),
+        .enumerate()
+        .map(|(i, s)| {
+            let row_index = top + i;
+            let mut line = match &tab.search {
+                Some(search) => highlight_line(s, &search.regex),
+                None => Line::raw(s.as_str()),
+            };
+            if tab.select.map(|s| s.row) == Some(row_index) {
+                // Distinct from the search highlight (REVERSED on
+                // matched runs); a row-wide background reads as "this
+                // is the line you're about to act on" without fighting
+                // search styling on the same row.
+                line = line.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            line
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), content_area);
@@ -1114,14 +1338,27 @@ fn render(frame: &mut Frame, app: &mut App) {
             );
         }
         _ => {
-            let footer = if total == 0 {
-                "q quit · f filter · / search · n next · \
+            // Footer hints prioritize the actions a fresh user needs to
+            // discover.  `n`/`N` repeat searches and are taught by the
+            // `/` workflow, so they're omitted here to keep the live
+            // footer readable on 80-column terminals.
+            let footer = if let Some(sel) = tab.select {
+                let verb = if sel.negated { "exclude" } else { "include" };
+                format!(
+                    "{verb}: j/k select · Enter {verb} msg · \
+                     Esc cancel · row {}/{}",
+                    sel.row + 1,
+                    total,
+                )
+            } else if total == 0 {
+                "q quit · f filter · / search · x/X exclude/include · \
                  ^T new · ^W close · r rename · 0/0"
                     .to_string()
             } else {
                 format!(
-                    "q quit · f filter · / search · n next · \
-                     ^T new · ^W close · r rename · {}-{} of {}",
+                    "q quit · f filter · / search · \
+                     x/X exclude/include · ^T new · ^W close · \
+                     r rename · {}-{} of {}",
                     top + 1,
                     bottom,
                     total,
@@ -1455,7 +1692,10 @@ mod tests {
 
     #[test]
     fn render_paints_rows_and_footer() {
-        let backend = TestBackend::new(80, 6);
+        // Wider than the typical 80 cols so the footer's "1-3 of 3"
+        // counter isn't truncated; the live footer is sized to be
+        // legible at 80 cols even with truncation.
+        let backend = TestBackend::new(100, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
             "alpha line".to_string(),
@@ -1717,14 +1957,14 @@ mod tests {
         let mut a = App::new(engine);
         a.viewport_height = 2;
         a.active_tab_mut().viewport_top = 3;
-        assert_eq!(a.active_tab().rows.len(), 6);
+        assert_eq!(a.active_tab().formatted.len(), 6);
 
         a.handle_key(key(KeyCode::Char('f')));
         type_into(a.dialog.as_mut().unwrap(), "level>=warn");
         a.handle_key(key(KeyCode::Enter));
 
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_tab().rows.len(), 1);
+        assert_eq!(a.active_tab().formatted.len(), 1);
         assert_eq!(a.active_tab().viewport_top, 0);
     }
 
@@ -2223,7 +2463,7 @@ mod tests {
         // no sources, so the re-queried rows are now empty), but the
         // search clears either way.  To realistically test
         // re-derivation, we sneak the rows back in directly.
-        a.active_tab_mut().rows = (0..10)
+        a.active_tab_mut().formatted = (0..10)
             .map(|i| {
                 if i % 2 == 0 {
                     format!("alpha row {i}")
@@ -2341,6 +2581,285 @@ mod tests {
         assert!(
             !buf[(5, 1)].modifier.contains(Modifier::REVERSED),
             "expected plain at (5, 1)",
+        );
+    }
+
+    // ---------- exclude mode ----------
+
+    /// Builds a fixture event with a custom `msg`.  Other bunyan-core
+    /// fields take fixed values that the exclude tests don't inspect.
+    fn ev(msg: &str) -> LogEvent {
+        let json = format!(
+            r#"{{
+                "v": 0,
+                "level": 30,
+                "name": "Nexus",
+                "hostname": "sled-01",
+                "pid": 1234,
+                "time": "2025-04-01T00:00:00Z",
+                "msg": {}
+            }}"#,
+            serde_json::Value::String(msg.to_string()),
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Constructs an App with `n` event rows whose msgs are "msg 0",
+    /// "msg 1", ... and a viewport_height of `h`.
+    fn select_app(n: usize, h: u16) -> App {
+        let events: Vec<Option<LogEvent>> =
+            (0..n).map(|i| Some(ev(&format!("msg {i}")))).collect();
+        let formatted: Vec<String> =
+            (0..n).map(|i| format!("row {i}")).collect();
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = h;
+        a
+    }
+
+    fn excl_sel(row: usize) -> Selection {
+        Selection { row, negated: true }
+    }
+
+    fn incl_sel(row: usize) -> Selection {
+        Selection { row, negated: false }
+    }
+
+    #[test]
+    fn x_enters_exclude_mode_at_viewport_top() {
+        let mut a = select_app(10, 5);
+        a.active_tab_mut().viewport_top = 3;
+        a.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(a.active_tab().select, Some(excl_sel(3)));
+    }
+
+    #[test]
+    fn x_is_noop_when_no_rows() {
+        let mut a = App::with_rows(Vec::new());
+        a.viewport_height = 5;
+        a.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(a.active_tab().select, None);
+    }
+
+    #[test]
+    fn shift_x_enters_include_mode_at_viewport_top() {
+        let mut a = select_app(10, 5);
+        a.active_tab_mut().viewport_top = 3;
+        a.handle_key(shift('X'));
+        assert_eq!(a.active_tab().select, Some(incl_sel(3)));
+    }
+
+    #[test]
+    fn shift_x_accepts_no_modifier_form() {
+        // Some terminals drop the SHIFT modifier on capital letters.
+        let mut a = select_app(10, 5);
+        a.handle_key(key(KeyCode::Char('X')));
+        assert_eq!(a.active_tab().select, Some(incl_sel(0)));
+    }
+
+    #[test]
+    fn select_j_moves_selection_within_viewport() {
+        let mut a = select_app(10, 5);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.active_tab().select, Some(excl_sel(1)));
+        assert_eq!(a.active_tab().viewport_top, 0);
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(a.active_tab().select, Some(excl_sel(2)));
+    }
+
+    #[test]
+    fn select_k_moves_selection_up() {
+        let mut a = select_app(10, 5);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.active_tab_mut().select = Some(excl_sel(3));
+        a.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(a.active_tab().select, Some(excl_sel(2)));
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(a.active_tab().select, Some(excl_sel(1)));
+    }
+
+    #[test]
+    fn select_motion_preserves_polarity() {
+        // Entering with `X` and then moving must not silently flip the
+        // selection back to "exclude".
+        let mut a = select_app(10, 5);
+        a.handle_key(shift('X'));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(a.active_tab().select, Some(incl_sel(1)));
+    }
+
+    #[test]
+    fn select_j_past_viewport_bottom_scrolls() {
+        let mut a = select_app(10, 3);
+        a.handle_key(key(KeyCode::Char('x')));
+        // Selection starts at 0, viewport [0..3).  Three j's land
+        // selection at 3, which is below the viewport — viewport
+        // should scroll to keep it just inside.
+        for _ in 0..3 {
+            a.handle_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(a.active_tab().select, Some(excl_sel(3)));
+        assert_eq!(a.active_tab().viewport_top, 1);
+    }
+
+    #[test]
+    fn select_k_above_viewport_top_scrolls() {
+        let mut a = select_app(10, 3);
+        a.active_tab_mut().viewport_top = 5;
+        a.handle_key(key(KeyCode::Char('x')));
+        // Selection starts at viewport_top (5), one `k` puts it at 4
+        // which is above the current viewport — viewport_top should
+        // follow.
+        a.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(a.active_tab().select, Some(excl_sel(4)));
+        assert_eq!(a.active_tab().viewport_top, 4);
+    }
+
+    #[test]
+    fn select_clamps_at_ends() {
+        let mut a = select_app(3, 5);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(a.active_tab().select, Some(excl_sel(0)));
+        for _ in 0..10 {
+            a.handle_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(a.active_tab().select, Some(excl_sel(2)));
+    }
+
+    #[test]
+    fn select_esc_cancels_without_changing_filter() {
+        let mut a = select_app(5, 5);
+        let before = a.active_tab().filter.to_string();
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Esc));
+        assert_eq!(a.active_tab().select, None);
+        assert_eq!(a.active_tab().filter.to_string(), before);
+    }
+
+    #[test]
+    fn exclude_enter_appends_negated_predicate_and_exits_mode() {
+        let mut a = select_app(5, 5);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        // Selection is at row 2 → "msg 2".
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.active_tab().select, None);
+        // The new predicate displays as `msg!="msg 2"` (quoted because
+        // it contains whitespace).
+        let displayed = a.active_tab().filter.to_string();
+        assert!(
+            displayed.contains("msg!=") && displayed.contains("msg 2"),
+            "expected exclusion predicate in {displayed:?}",
+        );
+    }
+
+    #[test]
+    fn include_enter_appends_positive_predicate_and_exits_mode() {
+        let mut a = select_app(5, 5);
+        a.handle_key(shift('X'));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        // Selection is at row 2 → "msg 2".
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.active_tab().select, None);
+        let displayed = a.active_tab().filter.to_string();
+        assert!(
+            displayed.contains("msg=") && displayed.contains("msg 2"),
+            "expected inclusion predicate in {displayed:?}",
+        );
+        // Sanity: not the negated form.
+        assert!(
+            !displayed.contains("msg!="),
+            "include must not produce a negated predicate: {displayed:?}",
+        );
+    }
+
+    #[test]
+    fn select_enter_on_error_row_is_noop() {
+        // Two real events sandwich one error row at index 1.
+        let events = vec![Some(ev("first")), None, Some(ev("third"))];
+        let formatted = vec![
+            "row 0".to_string(),
+            "error: parse failure".to_string(),
+            "row 2".to_string(),
+        ];
+        let mut a = App::with_events(events, formatted);
+        a.viewport_height = 5;
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j'))); // selection -> row 1 (error)
+        let before = a.active_tab().filter.to_string();
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.active_tab().select, Some(excl_sel(1)));
+        assert_eq!(a.active_tab().filter.to_string(), before);
+    }
+
+    #[test]
+    fn select_other_keys_are_ignored() {
+        let mut a = select_app(10, 5);
+        a.handle_key(key(KeyCode::Char('x')));
+        // `q` would normally quit; in select mode it's swallowed.
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(!a.quit);
+        assert_eq!(a.active_tab().select, Some(excl_sel(0)));
+        // `f` would normally open the filter dialog; not in this mode.
+        a.handle_key(key(KeyCode::Char('f')));
+        assert!(a.dialog.is_none());
+        // Tab switching also disabled.
+        a.handle_key(key(KeyCode::Tab));
+        assert_eq!(a.active, 0);
+    }
+
+    #[test]
+    fn render_paints_select_highlight() {
+        // Tall enough to fit the tab bar, two content rows, and a
+        // footer.  Selection is on row 1 (the second event).
+        let backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = select_app(3, 2);
+        a.handle_key(key(KeyCode::Char('x')));
+        a.handle_key(key(KeyCode::Char('j')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Layout: row 0 = tab bar, row 1 = first content row, row 2 =
+        // second content row (the selected one), row 3 = footer.
+        assert!(
+            buf[(0, 2)].style().bg == Some(Color::DarkGray),
+            "expected DarkGray bg on selected content row",
+        );
+        assert!(
+            buf[(0, 1)].style().bg != Some(Color::DarkGray),
+            "non-selected content row should not be highlighted",
+        );
+    }
+
+    #[test]
+    fn render_shows_exclude_footer_hint() {
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = select_app(3, 2);
+        a.handle_key(key(KeyCode::Char('x')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("Enter exclude msg"),
+            "expected exclude-mode footer hint, got:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn render_shows_include_footer_hint() {
+        let backend = TestBackend::new(80, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = select_app(3, 2);
+        a.handle_key(shift('X'));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("Enter include msg"),
+            "expected include-mode footer hint, got:\n{dump}",
         );
     }
 }
