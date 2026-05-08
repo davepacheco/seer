@@ -23,7 +23,7 @@ pub use render::format_event;
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
 };
-pub use source::{FileSource, Source, SourceError, SourceId};
+pub use source::{FileSource, Source, SourceError, SourceId, SourceMetadata};
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
 pub use summary::{
     FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,
