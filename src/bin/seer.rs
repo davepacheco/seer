@@ -24,14 +24,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use regex::Regex;
 #[cfg(test)]
+use seer::Event as LogEvent;
+#[cfg(test)]
 use seer::SourceId;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
     LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
     format_event,
 };
-#[cfg(test)]
-use seer::Event as LogEvent;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -159,7 +159,11 @@ struct RenderedRows {
     first_line_for_event: Vec<usize>,
 }
 
-fn render_rows(engine: &Engine, filter: &Filter) -> RenderedRows {
+fn render_rows(
+    engine: &Engine,
+    filter: &Filter,
+    show_extras: bool,
+) -> RenderedRows {
     let mut events = Vec::new();
     let mut formatted = Vec::new();
     let mut event_for_line = Vec::new();
@@ -169,7 +173,7 @@ fn render_rows(engine: &Engine, filter: &Filter) -> RenderedRows {
         first_line_for_event.push(formatted.len());
         match r {
             Ok(ee) => {
-                let lines = format_event(&ee.event);
+                let lines = format_event(&ee.event, show_extras);
                 for line in lines {
                     formatted.push(line);
                     event_for_line.push(event_idx);
@@ -327,8 +331,9 @@ impl Tab {
         engine: &Engine,
         stream: LogStreamId,
         filter: &Filter,
+        show_extras: bool,
     ) -> Self {
-        let rendered = render_rows(engine, filter);
+        let rendered = render_rows(engine, filter, show_extras);
         Self {
             name,
             stream,
@@ -346,8 +351,8 @@ impl Tab {
     /// the cached rows, viewport, and transient selection/search state.
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
-    fn refresh(&mut self, engine: &Engine, filter: &Filter) {
-        let rendered = render_rows(engine, filter);
+    fn refresh(&mut self, engine: &Engine, filter: &Filter, show_extras: bool) {
+        let rendered = render_rows(engine, filter, show_extras);
         self.events = rendered.events;
         self.formatted = rendered.formatted;
         self.event_for_line = rendered.event_for_line;
@@ -355,6 +360,31 @@ impl Tab {
         self.viewport_top = 0;
         self.search = None;
         self.select = None;
+    }
+
+    /// Re-renders the host stream like [`Self::refresh`], but keeps the
+    /// viewport pinned to the *record* that was at the top before — used
+    /// when only the rendering changed (e.g. toggling `show_extras`),
+    /// where the underlying events are the same and resetting to the top
+    /// would lose the user's place.  Search is cleared because match
+    /// indices are line-indexed and lines moved; selection is preserved
+    /// because it sits on a record index, which is still valid.
+    fn rerender(
+        &mut self,
+        engine: &Engine,
+        filter: &Filter,
+        show_extras: bool,
+    ) {
+        let anchor_event = self.event_for_line.get(self.viewport_top).copied();
+        let rendered = render_rows(engine, filter, show_extras);
+        self.events = rendered.events;
+        self.formatted = rendered.formatted;
+        self.event_for_line = rendered.event_for_line;
+        self.first_line_for_event = rendered.first_line_for_event;
+        self.viewport_top = anchor_event
+            .and_then(|i| self.first_line_for_event.get(i).copied())
+            .unwrap_or(0);
+        self.search = None;
     }
 
     /// Last *display line* index belonging to record `event_idx`,
@@ -489,14 +519,11 @@ impl Tab {
                 },
             )
         } else {
-            self.events
-                .iter()
-                .enumerate()
-                .take(anchor_idx + 1)
-                .rev()
-                .find_map(|(i, e)| {
+            self.events.iter().enumerate().take(anchor_idx + 1).rev().find_map(
+                |(i, e)| {
                     e.as_ref().filter(|ee| ee.event.time <= target).map(|_| i)
-                })
+                },
+            )
         };
         let new_top = match new_event {
             Some(idx) => self.first_line_for_event[idx],
@@ -635,11 +662,13 @@ impl App {
             .streams
             .insert_unique(stream)
             .expect("freshly-minted LogStreamId is unique");
+        let stream = self.session.streams.get(&stream_id).unwrap();
         let tab = Tab::new(
             name,
             &self.engine,
             stream_id,
-            &self.session.streams.get(&stream_id).unwrap().filter,
+            &stream.filter,
+            stream.show_extras,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -648,7 +677,8 @@ impl App {
     /// Pushes a new tab targeting an existing [`LogStream`] (looked up
     /// in `session.streams`).  Used when navigating to a bookmark
     /// whose stream isn't currently shown in any tab — the new tab
-    /// inherits the stream's persisted filter.
+    /// inherits the stream's persisted filter and field-visibility
+    /// setting.
     fn push_tab_for_existing_stream(&mut self, stream_id: LogStreamId) {
         let name = format!("Tab {}", self.next_tab_number);
         self.next_tab_number += 1;
@@ -657,7 +687,13 @@ impl App {
             .streams
             .get(&stream_id)
             .expect("caller verified the stream exists");
-        let tab = Tab::new(name, &self.engine, stream_id, &stream.filter);
+        let tab = Tab::new(
+            name,
+            &self.engine,
+            stream_id,
+            &stream.filter,
+            stream.show_extras,
+        );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
     }
@@ -704,13 +740,39 @@ impl App {
         };
         stream.filter = filter;
         let new_filter = stream.filter.clone();
+        let show_extras = stream.show_extras;
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.refresh(&self.engine, &new_filter);
+                tab.refresh(&self.engine, &new_filter, show_extras);
+            }
+        }
+    }
+
+    /// Toggles whether the active stream renders structured fields
+    /// beyond the bunyan header.  Persisted on the [`LogStream`] so the
+    /// preference outlives the session, and applied to every tab
+    /// targeting that stream so two tabs sharing a stream stay
+    /// consistent.  Preserves each tab's anchor record (only the
+    /// rendering changed; the events themselves did not).
+    fn toggle_show_extras(&mut self) {
+        let stream_id = self.tabs[self.active].stream;
+        let Some(mut stream) = self.session.streams.remove(&stream_id) else {
+            return;
+        };
+        stream.show_extras = !stream.show_extras;
+        let new_filter = stream.filter.clone();
+        let show_extras = stream.show_extras;
+        self.session
+            .streams
+            .insert_unique(stream)
+            .expect("removed-then-reinserted id is unique");
+        for tab in self.tabs.iter_mut() {
+            if tab.stream == stream_id {
+                tab.rerender(&self.engine, &new_filter, show_extras);
             }
         }
     }
@@ -721,6 +783,14 @@ impl App {
     fn active_filter(&self) -> &Filter {
         let stream_id = self.tabs[self.active].stream;
         &self.session.streams.get(&stream_id).expect("stream exists").filter
+    }
+
+    /// Returns whether the active stream is currently rendering
+    /// structured-field extras.  Used by the footer to show the F-key
+    /// state.
+    fn active_show_extras(&self) -> bool {
+        let stream_id = self.tabs[self.active].stream;
+        self.session.streams.get(&stream_id).expect("stream exists").show_extras
     }
 
     fn rename_active_tab(&mut self, name: String) {
@@ -846,8 +916,7 @@ impl App {
                 // when at least one event matches the filter; if the
                 // filter strips everything the convention is `0`,
                 // which is a valid line index for the empty viewport.
-                let line = self
-                    .tabs[tab_idx]
+                let line = self.tabs[tab_idx]
                     .first_line_for_event
                     .get(event_idx)
                     .copied()
@@ -1464,6 +1533,16 @@ impl App {
                 ..
             } => {
                 self.dialog = Some(Dialog::filter(self.active_filter()));
+            }
+            // `F`: toggle whether the active stream's structured-field
+            // extras render below the bunyan header.  Some terminals
+            // report `F` with NONE, others with SHIFT (matching `G` /
+            // `?` / `X`); accept both.
+            KeyEvent { code: KeyCode::Char('F'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.toggle_show_extras();
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -2271,16 +2350,18 @@ fn render(frame: &mut Frame, app: &mut App) {
                 }
             } else if total == 0 {
                 format!(
-                    "q quit · f filter · / search · </> step={} · \
-                     x/X exclude/include · b bookmark · ^T new · \
-                     ^W close · r rename · 0/0",
+                    "q quit · f filter · F fields={} · / search · \
+                     </> step={} · x/X exclude/include · b bookmark · \
+                     ^T new · ^W close · r rename · 0/0",
+                    if app.active_show_extras() { "on" } else { "off" },
                     app.current_step_label(),
                 )
             } else {
                 format!(
-                    "q quit · f filter · / search · </> step={} · \
-                     x/X exclude/include · b bookmark · ^T new · \
-                     ^W close · r rename · {}-{} of {}",
+                    "q quit · f filter · F fields={} · / search · \
+                     </> step={} · x/X exclude/include · b bookmark · \
+                     ^T new · ^W close · r rename · {}-{} of {}",
+                    if app.active_show_extras() { "on" } else { "off" },
                     app.current_step_label(),
                     top + 1,
                     bottom,
@@ -2683,11 +2764,11 @@ mod tests {
 
     #[test]
     fn render_paints_rows_and_footer() {
-        // Wider than 80 cols so the footer's trailing dynamic info
-        // (step indicator, "1-3 of 3" counter) isn't truncated; the
-        // live footer is sized to be legible at 80 cols even with
-        // truncation.
-        let backend = TestBackend::new(120, 6);
+        // Wide enough to hold the entire footer including the trailing
+        // dynamic info (step indicator, fields toggle, "1-3 of 3"
+        // counter) without truncation; the live footer is sized to be
+        // legible at 80 cols even when terminals truncate it.
+        let backend = TestBackend::new(160, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
             "alpha line".to_string(),
@@ -4343,11 +4424,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.log");
         for (secs, msg, extras) in records {
-            let time = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                *secs, 0,
-            )
-            .unwrap()
-            .to_rfc3339();
+            let time =
+                chrono::DateTime::<chrono::Utc>::from_timestamp(*secs, 0)
+                    .unwrap()
+                    .to_rfc3339();
             let mut line = format!(
                 r#"{{"v":0,"level":30,"name":"Nexus","hostname":"h","pid":1,"time":"{time}","msg":{}"#,
                 serde_json::Value::String(msg.to_string()),
@@ -4368,6 +4448,10 @@ mod tests {
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
         let mut a = App::new(engine);
+        // The multi-line tests are about exactly the line/event split
+        // that extras introduce.  Streams hide extras by default, so
+        // flip the toggle on before handing the app back.
+        a.toggle_show_extras();
         a.viewport_height = 10;
         (a, dir)
     }
@@ -4482,5 +4566,102 @@ mod tests {
             dump.contains("entry 1/3"),
             "expected entry count in footer, got:\n{dump}",
         );
+    }
+
+    // ---------- show_extras toggle (F) ----------
+
+    #[test]
+    fn streams_default_to_hiding_extras() {
+        // A fresh stream produced by `push_tab` must hide structured
+        // extras: the multi-line file below has two events, each with
+        // its own extras, but the rendered tab should be just the two
+        // header lines.
+        use camino_tempfile::tempdir;
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"v":0,"level":30,"name":"N","hostname":"h","pid":1,"time":"2026-05-07T00:00:00Z","msg":"first","build":"0.1.0"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"v":0,"level":30,"name":"N","hostname":"h","pid":1,"time":"2026-05-07T00:00:01Z","msg":"second","zones":4}}"#
+        )
+        .unwrap();
+        drop(f);
+        let mut engine = Engine::new();
+        engine.add_file_source(&path).unwrap();
+        let a = App::new(engine);
+        let tab = a.active_tab();
+        assert_eq!(tab.events.len(), 2);
+        assert_eq!(tab.formatted.len(), 2, "extras should be hidden");
+        assert!(tab.formatted[0].ends_with(": first"));
+        assert!(tab.formatted[1].ends_with(": second"));
+        assert!(!a.active_show_extras());
+    }
+
+    #[test]
+    fn shift_f_toggles_show_extras_and_repaints() {
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[("build", r#""0.1.0""#)]),
+            (20, "tick", &[]),
+        ]);
+        // multi_line_app already enabled extras for its own tests; flip
+        // it off, then back on, asserting the line count tracks the
+        // setting and that `F` is the user-visible binding.
+        assert!(a.active_show_extras());
+        assert_eq!(a.active_tab().formatted.len(), 3);
+        a.handle_key(shift('F'));
+        assert!(!a.active_show_extras());
+        assert_eq!(a.active_tab().formatted.len(), 2);
+        // Bare `F` (some terminals don't set the SHIFT modifier) toggles
+        // back on.
+        a.handle_key(key(KeyCode::Char('F')));
+        assert!(a.active_show_extras());
+        assert_eq!(a.active_tab().formatted.len(), 3);
+    }
+
+    #[test]
+    fn show_extras_toggle_preserves_anchor_record() {
+        // Three records, the second has two extras.  Park the viewport
+        // on the second event's header (line 2 with extras showing) and
+        // toggle off — viewport should snap to the same record at its
+        // new (post-rerender) line.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[("a", "1"), ("b", "2")]),
+            (30, "third", &[]),
+        ]);
+        // With extras: lines = [first, second, a-row, b-row, third].
+        a.active_tab_mut().viewport_top = 1; // second event's header
+        a.handle_key(shift('F')); // hide
+        // Without extras: lines = [first, second, third].  The same
+        // record's first line is now index 1.
+        assert_eq!(a.active_tab().viewport_top, 1);
+        assert_eq!(a.active_tab().formatted.len(), 3);
+        a.handle_key(shift('F')); // show again
+        // First line for record 1 is still index 1 (event 0 is single
+        // line).  Anchor preserved across the second toggle too.
+        assert_eq!(a.active_tab().viewport_top, 1);
+    }
+
+    #[test]
+    fn show_extras_persists_into_session_round_trip() {
+        // Toggling extras on must survive a session save/load cycle:
+        // the user shouldn't have to flip F again every time they
+        // re-open the project.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[("k", "1")])]);
+        // multi_line_app starts with extras enabled; flip off so we
+        // exercise a non-default value through the round-trip.
+        a.handle_key(shift('F'));
+        assert!(!a.active_show_extras());
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        let stream_id = a.tabs[a.active].stream;
+        let stream = restored.streams.get(&stream_id).unwrap();
+        assert!(!stream.show_extras);
     }
 }

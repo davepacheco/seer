@@ -27,11 +27,13 @@ use crate::event::Event;
 /// Formats `event` into one or more display lines.
 ///
 /// The first line is the bunyan header
-/// (`<time> <LEVEL> <name>/<pid> on <hostname>: <msg>`); subsequent
-/// lines, if any, are `    <key> = <json-value>`, one per entry in
-/// `event.extra`, ordered by key.  The returned vec is non-empty.
-pub fn format_event(event: &Event) -> Vec<String> {
-    let mut lines = Vec::with_capacity(1 + event.extra.len());
+/// (`<time> <LEVEL> <name>/<pid> on <hostname>: <msg>`); when
+/// `show_extras` is true, subsequent lines are `    <key> = <json-value>`,
+/// one per entry in `event.extra`, ordered by key.  The returned vec is
+/// non-empty.
+pub fn format_event(event: &Event, show_extras: bool) -> Vec<String> {
+    let cap = if show_extras { 1 + event.extra.len() } else { 1 };
+    let mut lines = Vec::with_capacity(cap);
     lines.push(format!(
         "{} {} {}/{} on {}: {}",
         event.time.to_rfc3339(),
@@ -41,8 +43,10 @@ pub fn format_event(event: &Event) -> Vec<String> {
         event.hostname,
         event.msg,
     ));
-    for (k, v) in &event.extra {
-        lines.push(format!("    {k} = {v}"));
+    if show_extras {
+        for (k, v) in &event.extra {
+            lines.push(format!("    {k} = {v}"));
+        }
     }
     lines
 }
@@ -68,7 +72,7 @@ mod tests {
                 "msg": "Nexus starting up"
             }"#,
         );
-        let lines = format_event(&e);
+        let lines = format_event(&e, /* show_extras = */ true);
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0],
@@ -94,11 +98,33 @@ mod tests {
                 "build": "0.1.0"
             }"#,
         );
-        let lines = format_event(&e);
+        let lines = format_event(&e, /* show_extras = */ true);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with(": Nexus starting up"));
         assert_eq!(lines[1], r#"    build = "0.1.0""#);
         assert_eq!(lines[2], r#"    version = "0.1.0""#);
+    }
+
+    #[test]
+    fn extras_hidden_when_show_extras_false() {
+        // When `show_extras` is false the function returns only the
+        // header, regardless of how many extras the event carries.
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "Nexus",
+                "hostname": "ivanova",
+                "pid": 15797,
+                "time": "2026-05-07T04:48:12.142Z",
+                "msg": "Nexus starting up",
+                "version": "0.1.0",
+                "build": "0.1.0"
+            }"#,
+        );
+        let lines = format_event(&e, /* show_extras = */ false);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with(": Nexus starting up"));
     }
 
     #[test]
@@ -117,7 +143,7 @@ mod tests {
                 "msg": "kaboom"
             }"#,
         );
-        let header = &format_event(&e)[0];
+        let header = &format_event(&e, /* show_extras = */ true)[0];
         assert_eq!(
             header,
             "2026-05-07T00:00:00+00:00 ERROR Nexus/100 on host-a: kaboom",
@@ -143,7 +169,7 @@ mod tests {
                 "absent": null
             }"#,
         );
-        let lines = format_event(&e);
+        let lines = format_event(&e, /* show_extras = */ true);
         // Header + 6 extras, sorted: absent, count, enabled, meta, ratio, tags.
         assert_eq!(lines.len(), 7);
         assert_eq!(lines[1], "    absent = null");

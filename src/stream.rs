@@ -112,16 +112,27 @@ pub struct LogStream {
     pub name: String,
     #[serde(default)]
     pub filter: Filter,
+    /// when true, render the structured fields beyond the bunyan header
+    /// below each event; defaults to false because most triage starts
+    /// from the header line and the user opts in (`F` in the TUI) when
+    /// they need the details
+    #[serde(default)]
+    pub show_extras: bool,
 }
 
 impl LogStream {
     /// Returns a new log stream with a freshly-generated id, the given
-    /// display name, and an empty filter.
+    /// display name, an empty filter, and extras hidden.
     // No `Default` impl: each call mints a distinct id, so a default
     // value would silently produce non-equal objects.
     #[allow(clippy::new_without_default)]
     pub fn new(name: String) -> Self {
-        Self { id: LogStreamId::new_v4(), name, filter: Filter::default() }
+        Self {
+            id: LogStreamId::new_v4(),
+            name,
+            filter: Filter::default(),
+            show_extras: false,
+        }
     }
 }
 
