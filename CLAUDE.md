@@ -218,10 +218,6 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## TODO list
 
-### Option to hide fields, maybe hide fields by default
-
-Let's actually hide the extra fields by default.  A user can toggle whether they're shown by hitting the `F` key.
-
 ### Make `source_id` something you can filter on.
 
 The `source_id` for each file should already be the canonical path to the file.  Users should be able to filter on this as a regex.
@@ -303,3 +299,4 @@ New tabs should still open with this dialog.
     - resume previous session
     - create new saved session
     - create new session and don't save it
+- make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks

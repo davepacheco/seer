@@ -34,8 +34,11 @@ use crate::event::Event;
 pub fn format_event(event: &Event, show_extras: bool) -> Vec<String> {
     let cap = if show_extras { 1 + event.extra.len() } else { 1 };
     let mut lines = Vec::with_capacity(cap);
+    // Level is padded to 5 columns (the width of the longest variant,
+    // `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the column following it lines
+    // up across rows of mixed severity.
     lines.push(format!(
-        "{} {} {}/{} on {}: {}",
+        "{} {:<5} {}/{} on {}: {}",
         event.time.to_rfc3339(),
         event.level,
         event.name,
@@ -76,7 +79,7 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             lines[0],
-            "2026-05-07T04:48:12.142223551+00:00 INFO \
+            "2026-05-07T04:48:12.142223551+00:00 INFO  \
              Nexus/15797 on ivanova: Nexus starting up",
         );
     }
@@ -148,6 +151,33 @@ mod tests {
             header,
             "2026-05-07T00:00:00+00:00 ERROR Nexus/100 on host-a: kaboom",
         );
+    }
+
+    #[test]
+    fn level_column_is_left_aligned_to_five_columns() {
+        // INFO/WARN are 4 chars and must pad to 5; ERROR/FATAL/TRACE/
+        // DEBUG are already 5.  Pin the layout so callers downstream
+        // (highlighting, search) can rely on consistent column offsets.
+        let info = parse(
+            r#"{"v":0,"level":30,"name":"n","hostname":"h","pid":1,
+                "time":"2026-05-07T00:00:00Z","msg":"m"}"#,
+        );
+        let warn = parse(
+            r#"{"v":0,"level":40,"name":"n","hostname":"h","pid":1,
+                "time":"2026-05-07T00:00:00Z","msg":"m"}"#,
+        );
+        let error = parse(
+            r#"{"v":0,"level":50,"name":"n","hostname":"h","pid":1,
+                "time":"2026-05-07T00:00:00Z","msg":"m"}"#,
+        );
+        // The two characters following the level are always "  " for
+        // 4-char levels and " <name>" for 5-char ones.
+        let info_line = &format_event(&info, false)[0];
+        let warn_line = &format_event(&warn, false)[0];
+        let error_line = &format_event(&error, false)[0];
+        assert!(info_line.contains(" INFO  n/"));
+        assert!(warn_line.contains(" WARN  n/"));
+        assert!(error_line.contains(" ERROR n/"));
     }
 
     #[test]

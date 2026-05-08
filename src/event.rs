@@ -75,7 +75,11 @@ impl Level {
 
 impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        // Use `pad` (rather than `write_str`) so callers can rely on
+        // width and alignment specifiers to align the names — `INFO`
+        // and `WARN` are 4 chars while the others are 5, and the
+        // log-line renderer wants a fixed-width column.
+        f.pad(self.as_str())
     }
 }
 
