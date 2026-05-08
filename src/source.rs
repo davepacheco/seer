@@ -17,6 +17,7 @@
 //! ever opening them for reading.
 
 use crate::event::{Event, Hostname, LoggerName};
+use crate::filter::{Filter, Predicate};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
@@ -49,6 +50,80 @@ use std::iter;
 #[as_ref(forward)]
 #[serde(transparent)]
 pub struct SourceId(String);
+
+/// Byte offset into a source's underlying bytes.
+///
+/// A newtype around `u64` so an offset can't be silently confused
+/// with a length, count, or any other unsigned quantity that turns up
+/// in adjacent code.  `Copy + Ord` so it can be used as a `BTreeMap`
+/// key (the engine's eventual merged-stream cursor is a
+/// `BTreeMap<SourceId, ByteOffset>`).
+///
+/// Convention: an offset always names the byte at which the *next*
+/// record would start when scanning forward — equivalently, the byte
+/// just past the end of the previous record.  Backward scans honor
+/// the same convention: an offset of `N` reads the record whose end
+/// is at `N`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    From,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ByteOffset(u64);
+
+impl ByteOffset {
+    /// Byte offset zero — the start of any source.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the offset as a raw `u64`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Direction of a [`Source::query`] scan.
+///
+/// `Forward` reads records starting at the requested offset and
+/// advancing toward EOF.  `Backward` reads the record whose end is at
+/// the requested offset and walks toward BOF.  Using an enum (rather
+/// than a `bool reverse` parameter) keeps call sites self-documenting
+/// and makes the code unambiguous to read at a distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Forward,
+    Backward,
+}
+
+/// A single record returned by [`Source::query`].
+///
+/// The `offset` is where this record starts in the source's bytes;
+/// `length` is its length in bytes including any trailing `\n`.  In
+/// particular, `offset + length` is the offset at which the next
+/// forward record begins (or, equivalently, the offset to pass back
+/// to [`Source::query`] to read further forward).  A backward query
+/// uses `offset` itself as the next call's offset.
+///
+/// `event` carries either the parsed [`Event`] or the
+/// [`SourceError`] from a line that failed to parse — parse errors
+/// are surfaced inline rather than aborting the query, since a single
+/// bad line is rarely interesting enough to lose the rest of the
+/// file's events to.
+#[derive(Debug)]
+pub struct QueryRecord {
+    pub offset: ByteOffset,
+    pub length: u64,
+    pub event: Result<Event, SourceError>,
+}
 
 /// A non-event item surfaced by a source — either a true error
 /// encountered while reading (`Io`, `Parse`) or a non-fatal warning
@@ -106,6 +181,35 @@ pub trait Source {
     fn events<'a>(
         &'a self,
     ) -> Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a>;
+
+    /// Reads up to `count` records from `offset` in `direction` whose
+    /// events are accepted by `filter`.
+    ///
+    /// `offset` follows the [`ByteOffset`] convention: forward,
+    /// records are read starting at the byte; backward, the record
+    /// whose end is at the byte is read first.  Records whose events
+    /// fail the filter are silently skipped — the scan continues
+    /// until `count` matching records have been collected or the end
+    /// of the source (in the chosen direction) is reached.  Lines
+    /// that fail to parse as JSON are surfaced as inline `Err` items
+    /// in the returned vector and *do* count toward `count`, since a
+    /// run of malformed lines would otherwise scan the entire file
+    /// looking for matches.
+    ///
+    /// Implementations are expected to consult [`Self::metadata`] for
+    /// whole-source pruning before doing any I/O — see
+    /// [`SourceMetadata::excludes_all`].
+    ///
+    /// I/O errors that prevent the source from being read at all
+    /// (file gone, permission denied) are returned as `Err`; per-line
+    /// parse errors do not.
+    fn query(
+        &self,
+        offset: ByteOffset,
+        direction: Direction,
+        count: usize,
+        filter: &Filter,
+    ) -> std::io::Result<Vec<QueryRecord>>;
 }
 
 /// Coarse-grained facts about a source's content, derived from its
@@ -131,6 +235,52 @@ pub struct SourceMetadata {
     pub name: Option<LoggerName>,
     /// `hostname` field of the first record, if present
     pub hostname: Option<Hostname>,
+}
+
+impl SourceMetadata {
+    /// Returns `true` iff this source provably contains no events
+    /// matching `filter`, given only the metadata.
+    ///
+    /// Today this checks `name` and `hostname` equality predicates
+    /// (`name=Nexus`, `hostname!=foo`, etc.) against the recorded
+    /// first-record values.  When the metadata's value disagrees with
+    /// what such a predicate would accept, the predicate is taken to
+    /// reject every event in the source and the source is excluded
+    /// without ever being read.
+    ///
+    /// This is heuristic.  It assumes that `name` and `hostname` are
+    /// uniform within a source, which is true of every Oxide bunyan
+    /// log file in practice — each file is one component on one
+    /// host — but a hand-mixed file would defeat the heuristic.  The
+    /// cost of being wrong is missed records, not incorrect output
+    /// from records that *are* returned.  Predicates we can't
+    /// evaluate at this layer (`level`, `msg=~`, extra-field
+    /// matchers, etc.) are simply ignored here and applied during
+    /// the per-record scan.
+    pub fn excludes_all(&self, filter: &Filter) -> bool {
+        for predicate in filter.predicates() {
+            let Predicate::FieldEquals { name, value, negated } = predicate
+            else {
+                continue;
+            };
+            let known_value: &str = match name.as_str() {
+                "name" => match &self.name {
+                    Some(n) => n.as_ref(),
+                    None => continue,
+                },
+                "hostname" => match &self.hostname {
+                    Some(h) => h.as_ref(),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let predicate_passes = (known_value == value) ^ *negated;
+            if !predicate_passes {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Source backed by a single file on disk.
@@ -202,6 +352,200 @@ impl Source for FileSource {
             }
         }))
     }
+
+    fn query(
+        &self,
+        offset: ByteOffset,
+        direction: Direction,
+        count: usize,
+        filter: &Filter,
+    ) -> std::io::Result<Vec<QueryRecord>> {
+        if count == 0 || self.metadata.excludes_all(filter) {
+            return Ok(Vec::new());
+        }
+        let mut file = File::open(&self.path)?;
+        let len = file.seek(SeekFrom::End(0))?;
+        let mut results = Vec::with_capacity(count);
+        match direction {
+            Direction::Forward => {
+                if offset.get() < len {
+                    scan_forward(
+                        &mut file,
+                        offset.get(),
+                        count,
+                        filter,
+                        &mut results,
+                    )?;
+                }
+            }
+            Direction::Backward => {
+                // A stale cursor past EOF clamps to EOF; the caller
+                // gets the last `count` records as if they had asked
+                // from EOF in the first place.
+                let bounded = std::cmp::min(offset.get(), len);
+                scan_backward(
+                    &mut file,
+                    bounded,
+                    count,
+                    filter,
+                    &mut results,
+                )?;
+            }
+        }
+        Ok(results)
+    }
+}
+
+/// Walks `file` forward from `start_offset`, parsing one line at a
+/// time and pushing accepted records (plus inline parse errors) into
+/// `results` until `count` records have been collected or EOF is
+/// reached.
+fn scan_forward(
+    file: &mut File,
+    start_offset: u64,
+    count: usize,
+    filter: &Filter,
+    results: &mut Vec<QueryRecord>,
+) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = String::new();
+    let mut current_offset = start_offset;
+    while results.len() < count {
+        buf.clear();
+        let n = reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let length = n as u64;
+        let line = buf.trim_end_matches(['\r', '\n']);
+        let parsed = serde_json::from_str::<Event>(line)
+            .map_err(SourceError::from);
+        push_if_accepted(
+            results,
+            ByteOffset(current_offset),
+            length,
+            parsed,
+            filter,
+        );
+        current_offset += length;
+    }
+    Ok(())
+}
+
+/// Walks `file` backward from `start_offset`, reading one record at
+/// a time (from its trailing `\n` back to the previous `\n` or BOF)
+/// and pushing accepted records (plus inline parse errors) into
+/// `results` until `count` records have been collected or BOF is
+/// reached.
+fn scan_backward(
+    file: &mut File,
+    start_offset: u64,
+    count: usize,
+    filter: &Filter,
+    results: &mut Vec<QueryRecord>,
+) -> std::io::Result<()> {
+    let mut cursor = start_offset;
+    while results.len() < count && cursor > 0 {
+        let (record_start, bytes) = read_record_before(file, cursor)?;
+        let length = cursor - record_start;
+        // Trim a single trailing `\r\n` or `\n` for parsing without
+        // copying the bytes — `serde_json::from_slice` handles UTF-8
+        // validation for us, so this stays bytes-only until parse.
+        let mut content_end = bytes.len();
+        while content_end > 0
+            && matches!(bytes[content_end - 1], b'\n' | b'\r')
+        {
+            content_end -= 1;
+        }
+        let parsed = serde_json::from_slice::<Event>(&bytes[..content_end])
+            .map_err(SourceError::from);
+        push_if_accepted(
+            results,
+            ByteOffset(record_start),
+            length,
+            parsed,
+            filter,
+        );
+        cursor = record_start;
+    }
+    Ok(())
+}
+
+/// Pushes a [`QueryRecord`] for a parsed line into `results`,
+/// skipping it only when the parse succeeded *and* the filter
+/// rejects the resulting event.  Parse errors are always surfaced.
+fn push_if_accepted(
+    results: &mut Vec<QueryRecord>,
+    offset: ByteOffset,
+    length: u64,
+    parsed: Result<Event, SourceError>,
+    filter: &Filter,
+) {
+    match parsed {
+        Ok(event) => {
+            if filter.matches(&event) {
+                results.push(QueryRecord {
+                    offset,
+                    length,
+                    event: Ok(event),
+                });
+            }
+        }
+        Err(e) => {
+            results.push(QueryRecord {
+                offset,
+                length,
+                event: Err(e),
+            });
+        }
+    }
+}
+
+/// Reads the record whose end is exactly at `offset` (exclusive).
+///
+/// Returns the record's start byte offset and its raw bytes,
+/// including any trailing `\n`.  The caller is responsible for
+/// stripping the line terminator before parsing.  Caller must ensure
+/// `offset > 0`.
+///
+/// Walks backwards in 4 KiB chunks looking for the previous `\n`;
+/// when none is found, the record extends to byte 0.  The byte at
+/// position `offset - 1`, if it is a `\n`, is taken as the
+/// terminator of *this* record and is excluded from the search for
+/// the previous newline.
+fn read_record_before(
+    file: &mut File,
+    offset: u64,
+) -> std::io::Result<(u64, Vec<u8>)> {
+    debug_assert!(offset > 0);
+
+    const CHUNK: u64 = 4096;
+    let mut search_end = offset.saturating_sub(1);
+    let record_start: u64 = loop {
+        if search_end == 0 {
+            break 0;
+        }
+        let chunk_size = std::cmp::min(CHUNK, search_end);
+        let chunk_start = search_end - chunk_size;
+        file.seek(SeekFrom::Start(chunk_start))?;
+        // `chunk_size` is bounded above by `CHUNK`, so this `as
+        // usize` cannot truncate on any supported target.
+        let mut buf = vec![0u8; chunk_size as usize];
+        file.read_exact(&mut buf)?;
+        if let Some(idx) = buf.iter().rposition(|&b| b == b'\n') {
+            break chunk_start + (idx as u64) + 1;
+        }
+        search_end = chunk_start;
+    };
+
+    let length = usize::try_from(offset - record_start).map_err(|_| {
+        std::io::Error::other("record too large to read into memory")
+    })?;
+    file.seek(SeekFrom::Start(record_start))?;
+    let mut buf = vec![0u8; length];
+    file.read_exact(&mut buf)?;
+    Ok((record_start, buf))
 }
 
 /// Reads the first and last records of `path` and uses them to fill in
@@ -587,6 +931,544 @@ mod tests {
             m.hostname.as_ref().map(|h| h.to_string()),
             Some("h-first".to_string()),
         );
+        dir.cleanup();
+    }
+
+    // ----- excludes_all: metadata-based whole-file pruning -----
+
+    fn metadata_with_name(name: &str) -> SourceMetadata {
+        SourceMetadata {
+            earliest: None,
+            latest: None,
+            name: Some(LoggerName::from(name.to_string())),
+            hostname: None,
+        }
+    }
+
+    #[test]
+    fn excludes_all_name_match_does_not_prune() {
+        let m = metadata_with_name("Nexus");
+        let f: Filter = "name=Nexus".parse().unwrap();
+        assert!(!m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_name_mismatch_prunes() {
+        let m = metadata_with_name("Nexus");
+        let f: Filter = "name=SledAgent".parse().unwrap();
+        assert!(m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_negated_name_match_prunes() {
+        let m = metadata_with_name("Nexus");
+        let f: Filter = "name!=Nexus".parse().unwrap();
+        assert!(m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_negated_name_mismatch_does_not_prune() {
+        let m = metadata_with_name("Nexus");
+        let f: Filter = "name!=SledAgent".parse().unwrap();
+        assert!(!m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_hostname_mismatch_prunes() {
+        let m = SourceMetadata {
+            earliest: None,
+            latest: None,
+            name: None,
+            hostname: Some(Hostname::from("h-1".to_string())),
+        };
+        let f: Filter = "hostname=h-2".parse().unwrap();
+        assert!(m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_unknown_predicates_are_ignored() {
+        // Level, msg, extra-field predicates can't be evaluated against
+        // metadata; they must never cause exclusion at this layer (the
+        // per-record scan applies them).
+        let m = metadata_with_name("Nexus");
+        let f: Filter =
+            "level>=warn msg=~boom component=nexus".parse().unwrap();
+        assert!(!m.excludes_all(&f));
+    }
+
+    #[test]
+    fn excludes_all_default_metadata_never_prunes() {
+        // No first-record info means we know nothing about the source's
+        // contents — be conservative and let the scan decide.
+        let m = SourceMetadata::default();
+        let f: Filter = "name=Nexus hostname=h".parse().unwrap();
+        assert!(!m.excludes_all(&f));
+    }
+
+    // ----- query: forward direction -----
+
+    /// Builds a multi-record fixture file at `path` with the supplied
+    /// epoch-seconds.  Returns the file's total length so tests can
+    /// query backward from EOF without an extra `metadata` call.
+    fn write_fixture(path: &Utf8Path, name: &str, secs: &[i64]) -> u64 {
+        for s in secs {
+            append_bunyan_at(path, name, t(*s), &format!("m{s}"));
+        }
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn query_forward_returns_records_in_order() {
+        let dir = TestDir::new();
+        let p = dir.path().join("fwd.log");
+        write_fixture(&p, "Nexus", &[10, 20, 30]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m10", "m20", "m30"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_forward_respects_count() {
+        let dir = TestDir::new();
+        let p = dir.path().join("fwd_count.log");
+        write_fixture(&p, "Nexus", &[10, 20, 30, 40]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(ByteOffset::ZERO, Direction::Forward, 2, &Filter::default())
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m10", "m20"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_forward_from_eof_is_empty() {
+        let dir = TestDir::new();
+        let p = dir.path().join("fwd_eof.log");
+        let len = write_fixture(&p, "Nexus", &[10, 20]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Forward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert!(out.is_empty());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_forward_from_middle_resumes_at_offset() {
+        // Pull the first record, take its end offset, and ask for the
+        // rest from there — the second batch must start at the second
+        // record, not repeat the first.
+        let dir = TestDir::new();
+        let p = dir.path().join("fwd_mid.log");
+        write_fixture(&p, "Nexus", &[10, 20, 30]);
+        let src = FileSource::open(&p).unwrap();
+        let first = src
+            .query(ByteOffset::ZERO, Direction::Forward, 1, &Filter::default())
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let next_offset =
+            ByteOffset::from(first[0].offset.get() + first[0].length);
+        let rest = src
+            .query(next_offset, Direction::Forward, 10, &Filter::default())
+            .unwrap();
+        let msgs: Vec<_> = rest
+            .iter()
+            .map(|r| r.event.as_ref().unwrap().msg.clone())
+            .collect();
+        assert_eq!(msgs, vec!["m20", "m30"]);
+        dir.cleanup();
+    }
+
+    // ----- query: backward direction -----
+
+    #[test]
+    fn query_backward_from_eof_yields_records_in_reverse() {
+        let dir = TestDir::new();
+        let p = dir.path().join("bwd.log");
+        let len = write_fixture(&p, "Nexus", &[10, 20, 30]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m30", "m20", "m10"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_backward_respects_count() {
+        let dir = TestDir::new();
+        let p = dir.path().join("bwd_count.log");
+        let len = write_fixture(&p, "Nexus", &[10, 20, 30, 40]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Backward,
+                2,
+                &Filter::default(),
+            )
+            .unwrap();
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m40", "m30"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_backward_from_bof_is_empty() {
+        let dir = TestDir::new();
+        let p = dir.path().join("bwd_bof.log");
+        write_fixture(&p, "Nexus", &[10, 20]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert!(out.is_empty());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_backward_from_stale_offset_clamps_to_eof() {
+        // A cursor past EOF (e.g. from a previous run, after the file
+        // was rotated) should clamp to EOF rather than fail or
+        // overrun.  Backward from `len + 100` returns the same records
+        // as backward from `len`.
+        let dir = TestDir::new();
+        let p = dir.path().join("bwd_stale.log");
+        let len = write_fixture(&p, "Nexus", &[10, 20]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len + 100),
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m20", "m10"]);
+        dir.cleanup();
+    }
+
+    // ----- query: file-shape edge cases -----
+
+    #[test]
+    fn query_empty_file_both_directions() {
+        let dir = TestDir::new();
+        let p = dir.path().join("empty.log");
+        std::fs::File::create(&p).unwrap();
+        let src = FileSource::open(&p).unwrap();
+        let fwd = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let bwd = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert!(fwd.is_empty());
+        assert!(bwd.is_empty());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_no_trailing_newline_round_trip() {
+        // Last record has no terminating `\n`.  Forward and backward
+        // must each see both records with consistent offsets/lengths.
+        let dir = TestDir::new();
+        let p = dir.path().join("no_nl.log");
+        let first = serde_json::json!({
+            "v": 0, "level": 30, "name": "Nexus", "hostname": "h",
+            "pid": 1, "time": t(10).to_rfc3339(), "msg": "first",
+        })
+        .to_string();
+        let last = serde_json::json!({
+            "v": 0, "level": 30, "name": "Nexus", "hostname": "h",
+            "pid": 1, "time": t(20).to_rfc3339(), "msg": "last",
+        })
+        .to_string();
+        std::fs::write(&p, format!("{first}\n{last}")).unwrap();
+        let len = std::fs::metadata(&p).unwrap().len();
+        let src = FileSource::open(&p).unwrap();
+
+        let fwd = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let fwd_msgs: Vec<_> = fwd
+            .iter()
+            .map(|r| r.event.as_ref().unwrap().msg.clone())
+            .collect();
+        assert_eq!(fwd_msgs, vec!["first", "last"]);
+        // The two record lengths sum to file length, matching the
+        // "offset + length is the next record's start" contract.
+        let total: u64 = fwd.iter().map(|r| r.length).sum();
+        assert_eq!(total, len);
+
+        let bwd = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        let bwd_msgs: Vec<_> = bwd
+            .iter()
+            .map(|r| r.event.as_ref().unwrap().msg.clone())
+            .collect();
+        assert_eq!(bwd_msgs, vec!["last", "first"]);
+        dir.cleanup();
+    }
+
+    // ----- query: filter integration -----
+
+    #[test]
+    fn query_skips_records_rejected_by_filter() {
+        // Filter accepts only `msg=m20`; the scan must walk past the
+        // other two records without including them but still yield the
+        // matching one.
+        let dir = TestDir::new();
+        let p = dir.path().join("filtered.log");
+        write_fixture(&p, "Nexus", &[10, 20, 30]);
+        let src = FileSource::open(&p).unwrap();
+        let f: Filter = "msg=m20".parse().unwrap();
+        let out = src
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &f)
+            .unwrap();
+        let msgs: Vec<_> =
+            out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
+        assert_eq!(msgs, vec!["m20"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_excludes_all_short_circuits_before_io() {
+        // Whole-source pruning by `name`: the filter cannot match this
+        // file's recorded `name`.  Removing the file after open
+        // confirms that `query` did not re-open it — any I/O attempt
+        // would surface as `Err`.
+        let dir = TestDir::new();
+        let p = dir.path().join("short_circuit.log");
+        append_bunyan_at(&p, "Nexus", t(10), "a");
+        let src = FileSource::open(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        let f: Filter = "name=SledAgent".parse().unwrap();
+        let out = src
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &f)
+            .unwrap();
+        assert!(out.is_empty());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_count_zero_returns_empty() {
+        // A `count = 0` request short-circuits without touching disk.
+        let dir = TestDir::new();
+        let p = dir.path().join("count_zero.log");
+        write_fixture(&p, "Nexus", &[10, 20]);
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                0,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert!(out.is_empty());
+        dir.cleanup();
+    }
+
+    // ----- query: parse-error handling -----
+
+    #[test]
+    fn query_surfaces_parse_errors_inline() {
+        // A non-JSON line in the middle of the file appears as an
+        // inline `Err` record; the scan continues past it.
+        let dir = TestDir::new();
+        let p = dir.path().join("with_garbage.log");
+        append_bunyan_at(&p, "Nexus", t(10), "a");
+        append_raw(&p, "not json at all");
+        append_bunyan_at(&p, "Nexus", t(20), "b");
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].event.as_ref().unwrap().msg, "a");
+        assert!(matches!(
+            out[1].event.as_ref().unwrap_err(),
+            SourceError::Parse(_),
+        ));
+        assert_eq!(out[2].event.as_ref().unwrap().msg, "b");
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_backward_surfaces_parse_errors_inline() {
+        let dir = TestDir::new();
+        let p = dir.path().join("with_garbage_bwd.log");
+        append_bunyan_at(&p, "Nexus", t(10), "a");
+        append_raw(&p, "not json");
+        append_bunyan_at(&p, "Nexus", t(20), "b");
+        let len = std::fs::metadata(&p).unwrap().len();
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].event.as_ref().unwrap().msg, "b");
+        assert!(matches!(
+            out[1].event.as_ref().unwrap_err(),
+            SourceError::Parse(_),
+        ));
+        assert_eq!(out[2].event.as_ref().unwrap().msg, "a");
+        dir.cleanup();
+    }
+
+    // ----- query: chunk-boundary backward read -----
+
+    #[test]
+    fn query_backward_handles_record_larger_than_chunk() {
+        // The backward-read helper walks the file in 4 KiB chunks.
+        // Make the second record's content larger than that to force
+        // the search for the previous newline to span multiple chunks.
+        let dir = TestDir::new();
+        let p = dir.path().join("big_record_bwd.log");
+        append_bunyan_at(&p, "Nexus", t(10), "small");
+        let big = "x".repeat(10_000);
+        append_bunyan_at(&p, "Nexus", t(20), &big);
+        let len = std::fs::metadata(&p).unwrap().len();
+        let src = FileSource::open(&p).unwrap();
+        let out = src
+            .query(
+                ByteOffset::from(len),
+                Direction::Backward,
+                10,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].event.as_ref().unwrap().msg, big);
+        assert_eq!(out[1].event.as_ref().unwrap().msg, "small");
+        dir.cleanup();
+    }
+
+    // ----- query: forward/backward symmetry -----
+
+    #[test]
+    fn query_forward_then_backward_round_trips() {
+        // Read N records forward, then read N records backward starting
+        // at where the forward scan stopped.  The two sequences should
+        // be exact reverses of each other (offsets included).
+        let dir = TestDir::new();
+        let p = dir.path().join("round_trip.log");
+        write_fixture(&p, "Nexus", &[10, 20, 30, 40, 50]);
+        let src = FileSource::open(&p).unwrap();
+        let fwd = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                100,
+                &Filter::default(),
+            )
+            .unwrap();
+        let last_end =
+            fwd.last().map(|r| r.offset.get() + r.length).unwrap_or(0);
+        let bwd = src
+            .query(
+                ByteOffset::from(last_end),
+                Direction::Backward,
+                100,
+                &Filter::default(),
+            )
+            .unwrap();
+        assert_eq!(fwd.len(), bwd.len());
+        let fwd_offsets: Vec<_> = fwd.iter().map(|r| r.offset).collect();
+        let bwd_offsets: Vec<_> = bwd.iter().map(|r| r.offset).collect();
+        let mut fwd_rev = fwd_offsets.clone();
+        fwd_rev.reverse();
+        assert_eq!(bwd_offsets, fwd_rev);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_offsets_partition_the_file() {
+        // Record offsets and lengths from a forward scan should
+        // partition the file exactly: no gaps, no overlaps, summing to
+        // file length.
+        let dir = TestDir::new();
+        let p = dir.path().join("partition.log");
+        let len = write_fixture(&p, "Nexus", &[10, 20, 30, 40, 50, 60]);
+        let src = FileSource::open(&p).unwrap();
+        let fwd = src
+            .query(
+                ByteOffset::ZERO,
+                Direction::Forward,
+                100,
+                &Filter::default(),
+            )
+            .unwrap();
+        let mut expected_offset = 0u64;
+        for r in &fwd {
+            assert_eq!(r.offset.get(), expected_offset);
+            expected_offset += r.length;
+        }
+        assert_eq!(expected_offset, len);
         dir.cleanup();
     }
 }
