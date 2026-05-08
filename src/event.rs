@@ -10,7 +10,9 @@
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
 use serde::Deserialize;
+use serde::de::{IgnoredAny, MapAccess, Visitor};
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fmt;
 
 /// A single log record.
@@ -18,7 +20,14 @@ use std::fmt;
 /// Field set tracks the bunyan format: a fixed core (time, level, name,
 /// hostname, pid, msg, v) plus arbitrary additional structured fields
 /// captured in `extra`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Deserialization tolerates duplicate keys: the first occurrence of
+/// each key wins and subsequent duplicates are silently dropped.
+/// Real-world Oxide bunyan logs occasionally repeat keys when nested
+/// slog scopes both attach a context value (e.g. two layers each
+/// setting `component`); failing the whole record over that loses more
+/// information than it preserves.
+#[derive(Debug, Clone)]
 pub struct Event {
     pub time: DateTime<Utc>,
     pub level: Level,
@@ -29,8 +38,99 @@ pub struct Event {
     /// bunyan record-format version
     pub v: u32,
     /// any additional structured fields beyond the bunyan core
-    #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for Event {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        struct EventVisitor;
+
+        impl<'de> Visitor<'de> for EventVisitor {
+            type Value = Event;
+
+            fn expecting(
+                &self,
+                f: &mut fmt::Formatter<'_>,
+            ) -> fmt::Result {
+                f.write_str("a bunyan log record")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Event, A::Error> {
+                let mut time: Option<DateTime<Utc>> = None;
+                let mut level: Option<Level> = None;
+                let mut name: Option<LoggerName> = None;
+                let mut hostname: Option<Hostname> = None;
+                let mut pid: Option<Pid> = None;
+                let mut msg: Option<String> = None;
+                let mut v: Option<u32> = None;
+                let mut extra: BTreeMap<String, serde_json::Value> =
+                    BTreeMap::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    // First-wins for every key, core or extra.  Each
+                    // arm must consume `next_value` exactly once so the
+                    // map iterator advances; duplicates use
+                    // `IgnoredAny` to drain the value without parsing.
+                    macro_rules! take_first {
+                        ($slot:ident) => {{
+                            if $slot.is_some() {
+                                let _: IgnoredAny = map.next_value()?;
+                            } else {
+                                $slot = Some(map.next_value()?);
+                            }
+                        }};
+                    }
+                    match key.as_str() {
+                        "time" => take_first!(time),
+                        "level" => take_first!(level),
+                        "name" => take_first!(name),
+                        "hostname" => take_first!(hostname),
+                        "pid" => take_first!(pid),
+                        "msg" => take_first!(msg),
+                        "v" => take_first!(v),
+                        _ => match extra.entry(key) {
+                            Entry::Vacant(e) => {
+                                e.insert(map.next_value()?);
+                            }
+                            Entry::Occupied(_) => {
+                                let _: IgnoredAny = map.next_value()?;
+                            }
+                        },
+                    }
+                }
+                Ok(Event {
+                    time: time.ok_or_else(|| {
+                        serde::de::Error::missing_field("time")
+                    })?,
+                    level: level.ok_or_else(|| {
+                        serde::de::Error::missing_field("level")
+                    })?,
+                    name: name.ok_or_else(|| {
+                        serde::de::Error::missing_field("name")
+                    })?,
+                    hostname: hostname.ok_or_else(|| {
+                        serde::de::Error::missing_field("hostname")
+                    })?,
+                    pid: pid.ok_or_else(|| {
+                        serde::de::Error::missing_field("pid")
+                    })?,
+                    msg: msg.ok_or_else(|| {
+                        serde::de::Error::missing_field("msg")
+                    })?,
+                    v: v.ok_or_else(|| {
+                        serde::de::Error::missing_field("v")
+                    })?,
+                    extra,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(EventVisitor)
+    }
 }
 
 /// Bunyan log level.
@@ -208,5 +308,22 @@ mod tests {
         let _: Pid = event.pid;
 
         dir.cleanup();
+    }
+
+    #[test]
+    fn duplicate_keys_keep_first_occurrence() {
+        // Real Oxide bunyan logs sometimes repeat keys when nested slog
+        // scopes each attach a value (e.g. two layers setting
+        // `component`); we keep the first and drop the rest rather
+        // than failing the line.
+        let line = r#"{"msg":"hello","v":0,"name":"first","level":30,"time":"2026-04-30T19:49:19Z","hostname":"h","pid":42,"component":"datastore","component":"nexus","name":"second"}"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        // First `name` wins over the late-appearing duplicate.
+        assert_eq!(event.name.to_string(), "first");
+        // First extra-field occurrence wins too.
+        assert_eq!(
+            event.extra.get("component").and_then(|v| v.as_str()),
+            Some("datastore"),
+        );
     }
 }
