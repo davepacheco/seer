@@ -16,11 +16,20 @@
 
 use camino::Utf8Path;
 use camino_tempfile::Utf8TempDir;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use slog::{Drain, Logger, o};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
+
+/// Builds a [`DateTime<Utc>`] from epoch seconds.
+///
+/// Used across the merge / source / engine test modules to anchor
+/// fixture records on predictable timestamps so that ordering can be
+/// asserted exactly.
+pub(crate) fn t(secs: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(secs, 0).single().expect("valid timestamp")
+}
 
 /// Test temporary directory that is preserved on drop unless
 /// [`TestDir::cleanup`] is called.

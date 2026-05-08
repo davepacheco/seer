@@ -16,7 +16,10 @@ pub mod summary;
 #[cfg(test)]
 mod test_util;
 
-pub use engine::{Engine, EngineEvent, EventStream, ResolvePosition};
+pub use engine::{
+    Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord,
+    ResolvePosition, Stepper,
+};
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
 pub use render::format_event;

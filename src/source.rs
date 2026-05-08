@@ -665,17 +665,9 @@ fn read_last_line(
 mod tests {
     use super::*;
     use crate::test_util::{
-        TestDir, append_bunyan, append_bunyan_at, append_raw,
+        TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
-    use chrono::TimeZone;
     use slog::{error, info};
-
-    /// Builds a [`DateTime<Utc>`] from epoch seconds.  Mirrors the
-    /// helper in the engine tests; metadata tests anchor on specific
-    /// timestamps to assert exact `earliest` / `latest` values.
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid timestamp")
-    }
 
     #[test]
     fn file_source_id_is_canonical_path() {

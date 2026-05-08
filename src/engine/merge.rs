@@ -1,0 +1,999 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! Merge stepper: forward/backward k-way merge over the engine's sources
+//! with per-source lookahead and lookbehind buffers.
+//!
+//! [`Stepper`] is the navigation engine that powers the TUI's scrolling.
+//! Unlike [`super::EventStream`], which materializes every event in one
+//! full pass, the stepper fetches lazily via [`Source::query`] and caches
+//! a bounded window of records in each direction so small navigation
+//! moves don't trigger fresh I/O.
+//!
+//! Use [`super::Engine::stepper`] to construct one.  The stepper is
+//! restored to a previous [`Cursor`] on construction; calling
+//! [`Stepper::cursor`] at any point produces a serializable snapshot of
+//! the current position.
+
+use crate::event::Event;
+use crate::filter::Filter;
+use crate::source::{
+    ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+
+/// Returns the opposite direction.
+fn opposite(d: Direction) -> Direction {
+    match d {
+        Direction::Forward => Direction::Backward,
+        Direction::Backward => Direction::Forward,
+    }
+}
+
+/// Per-fetch batch size.  Each refill of a [`SourceWindow`] asks the
+/// storage layer for up to this many matching records.  Larger batches
+/// amortize seek cost; smaller batches keep the maximum work per step
+/// bounded when the active filter rejects most records.
+const BATCH_SIZE: usize = 64;
+
+/// Maximum records held in either direction's buffer for a single
+/// source.  When a step would push beyond this, the oldest entry on
+/// the *opposite* end is dropped and that direction's EOF flag is
+/// cleared so a subsequent fetch can re-acquire the dropped data.
+const BUFFER_LIMIT: usize = 256;
+
+/// Merged-stream byte-offset position — one [`ByteOffset`] per source.
+///
+/// Wraps a `BTreeMap<SourceId, ByteOffset>` so callers can't accidentally
+/// use it as a plain map.  Used as a serializable bookmark of where a
+/// [`Stepper`] is in the merged stream and as the input shape for
+/// restoring a [`Stepper`] later.  Sources missing from the map resolve
+/// to [`ByteOffset::ZERO`] when used as input to
+/// [`super::Engine::stepper`], so a default `Cursor` walks each source
+/// from its beginning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Cursor {
+    offsets: BTreeMap<SourceId, ByteOffset>,
+}
+
+impl Cursor {
+    /// Returns an empty cursor.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a cursor from an iterator of (source id, byte offset)
+    /// pairs.
+    pub fn with(
+        offsets: impl IntoIterator<Item = (SourceId, ByteOffset)>,
+    ) -> Self {
+        Self { offsets: offsets.into_iter().collect() }
+    }
+
+    /// Returns the byte offset stored for `source_id`, if any.
+    pub fn get(&self, source_id: &SourceId) -> Option<ByteOffset> {
+        self.offsets.get(source_id).copied()
+    }
+
+    /// Iterates over (source id, byte offset) pairs in ascending source
+    /// id order.
+    pub fn iter(&self) -> impl Iterator<Item = (&SourceId, ByteOffset)> {
+        self.offsets.iter().map(|(k, v)| (k, *v))
+    }
+
+    /// Returns the number of source-id entries.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Returns true iff this cursor has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+}
+
+/// A single record produced by [`Stepper::step_forward`] /
+/// [`Stepper::step_backward`].
+///
+/// Holds either a parsed [`Event`] or a [`MergeError`] for a per-line
+/// error encountered while reading.  A synthetic [`MergeRecord`] with
+/// `length == 0` is emitted when the storage layer's `query` itself
+/// fails (e.g. the file was deleted out from under us); a real
+/// on-disk record always has positive length.
+#[derive(Debug, Clone)]
+pub struct MergeRecord {
+    /// source the record came from
+    pub source_id: SourceId,
+    /// byte offset in `source_id` where the record begins
+    pub offset: ByteOffset,
+    /// length of the record in bytes (including the trailing newline,
+    /// if present); `0` for synthetic error placeholders
+    pub length: u64,
+    /// parsed event when the line was valid; otherwise the per-line
+    /// parse or I/O error
+    pub event: Result<Event, MergeError>,
+}
+
+/// Per-line error surfaced by [`Stepper`].
+///
+/// Wraps a shared [`SourceError`] so the merge cursor's buffers can
+/// hand out `Clone` copies cheaply (the underlying `std::io::Error` /
+/// `serde_json::Error` are not `Clone`).  The original variant is
+/// preserved so consumers can match on parse vs. I/O if useful;
+/// most callers just render via [`Display`].
+#[derive(Debug, Clone)]
+pub struct MergeError(Arc<SourceError>);
+
+impl MergeError {
+    /// Returns the underlying [`SourceError`].
+    pub fn source_error(&self) -> &SourceError {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MergeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl From<SourceError> for MergeError {
+    fn from(err: SourceError) -> Self {
+        Self(Arc::new(err))
+    }
+}
+
+/// Internal cloneable buffer entry — same fields as [`MergeRecord`] but
+/// without the per-record `source_id` (it's a property of the owning
+/// [`SourceWindow`]).
+#[derive(Debug, Clone)]
+struct BufferedRecord {
+    offset: ByteOffset,
+    length: u64,
+    event: Result<Event, MergeError>,
+}
+
+impl From<QueryRecord> for BufferedRecord {
+    fn from(record: QueryRecord) -> Self {
+        let QueryRecord { offset, length, event } = record;
+        Self { offset, length, event: event.map_err(MergeError::from) }
+    }
+}
+
+/// Per-source state for the merge stepper: a byte-offset cursor, paired
+/// lookahead/lookbehind buffers, and per-direction EOF flags.
+struct SourceWindow<'a> {
+    source: &'a dyn Source,
+    source_id: SourceId,
+    /// Byte-offset cursor.  Forward step would read the record starting
+    /// at `position`; backward step would read the record ending at
+    /// `position`.
+    position: ByteOffset,
+    /// Records starting at or after `position`, earliest-first.  When
+    /// non-empty, `forward_buf.front().offset == position`.
+    forward_buf: VecDeque<BufferedRecord>,
+    /// Records ending at or before `position`, most-recent-first.  When
+    /// non-empty,
+    /// `backward_buf.front().offset + backward_buf.front().length ==
+    /// position`.
+    backward_buf: VecDeque<BufferedRecord>,
+    /// Source has no more records past the cached forward window.
+    /// Cleared whenever cached forward records are dropped.
+    forward_eof: bool,
+    /// Symmetric.
+    backward_eof: bool,
+}
+
+impl<'a> SourceWindow<'a> {
+    fn new(source: &'a dyn Source, position: ByteOffset) -> Self {
+        Self {
+            source,
+            source_id: source.id().clone(),
+            position,
+            forward_buf: VecDeque::new(),
+            backward_buf: VecDeque::new(),
+            forward_eof: false,
+            backward_eof: false,
+        }
+    }
+
+    fn buf(&self, dir: Direction) -> &VecDeque<BufferedRecord> {
+        match dir {
+            Direction::Forward => &self.forward_buf,
+            Direction::Backward => &self.backward_buf,
+        }
+    }
+
+    fn buf_mut(&mut self, dir: Direction) -> &mut VecDeque<BufferedRecord> {
+        match dir {
+            Direction::Forward => &mut self.forward_buf,
+            Direction::Backward => &mut self.backward_buf,
+        }
+    }
+
+    fn eof(&self, dir: Direction) -> bool {
+        match dir {
+            Direction::Forward => self.forward_eof,
+            Direction::Backward => self.backward_eof,
+        }
+    }
+
+    fn set_eof(&mut self, dir: Direction, value: bool) {
+        match dir {
+            Direction::Forward => self.forward_eof = value,
+            Direction::Backward => self.backward_eof = value,
+        }
+    }
+
+    /// Ensures the head of `dir`'s buffer is populated, fetching from
+    /// the storage layer when needed.  No-op when the buffer is
+    /// non-empty or the direction is already known to be exhausted.
+    fn fill(&mut self, dir: Direction, filter: &Filter) {
+        if !self.buf(dir).is_empty() || self.eof(dir) {
+            return;
+        }
+        // A backward query at offset 0 has no records to return — short
+        // circuit so we don't even open the file.
+        if matches!(dir, Direction::Backward) && self.position.get() == 0 {
+            self.set_eof(dir, true);
+            return;
+        }
+        match self.source.query(self.position, dir, BATCH_SIZE, filter) {
+            Ok(records) => {
+                if records.len() < BATCH_SIZE {
+                    self.set_eof(dir, true);
+                }
+                let buf = self.buf_mut(dir);
+                for r in records {
+                    buf.push_back(BufferedRecord::from(r));
+                }
+            }
+            Err(e) => {
+                // Surface the I/O failure inline as a synthetic
+                // zero-length record at the current frontier so it
+                // shows up in the merged stream the same as a per-line
+                // parse error, then mark the direction exhausted to
+                // avoid hammering the failed fetch.
+                let synth = BufferedRecord {
+                    offset: self.position,
+                    length: 0,
+                    event: Err(MergeError::from(SourceError::from(e))),
+                };
+                self.buf_mut(dir).push_back(synth);
+                self.set_eof(dir, true);
+            }
+        }
+    }
+
+    /// Pops `dir`'s head and emits it, mirroring the record into the
+    /// opposite buffer so a subsequent step in the opposite direction
+    /// replays it without I/O.  Caller must ensure the head exists.
+    fn pop(&mut self, dir: Direction) -> MergeRecord {
+        let r =
+            self.buf_mut(dir).pop_front().expect("buf has a head");
+        self.position = match dir {
+            Direction::Forward => {
+                ByteOffset::from(r.offset.get() + r.length)
+            }
+            Direction::Backward => r.offset,
+        };
+        let opp = opposite(dir);
+        self.buf_mut(opp).push_front(r.clone());
+        // Stepping in `dir` exposes new ground in the opposite
+        // direction, so any prior "exhausted" determination there is
+        // stale.  Trimming below would clear it again; we set it once
+        // up front and let the trim be a pure size operation.
+        self.set_eof(opp, false);
+        while self.buf(opp).len() > BUFFER_LIMIT {
+            self.buf_mut(opp).pop_back();
+        }
+        MergeRecord {
+            source_id: self.source_id.clone(),
+            offset: r.offset,
+            length: r.length,
+            event: r.event,
+        }
+    }
+
+    /// Drops both buffers and clears EOF flags.  Used on filter changes
+    /// — the buffered records were filtered against the previous
+    /// filter so they can no longer be trusted.
+    fn clear_buffers(&mut self) {
+        self.forward_buf.clear();
+        self.backward_buf.clear();
+        self.forward_eof = false;
+        self.backward_eof = false;
+    }
+}
+
+/// Forward/backward k-way merge over the engine's sources with per-source
+/// lookahead and lookbehind buffers.
+///
+/// Acquired from [`super::Engine::stepper`].  Each call to
+/// [`Self::step_forward`] / [`Self::step_backward`] returns the next
+/// record in time order across the sources, fetching from the
+/// underlying [`Source`] only as needed.  The set of sources is fixed at
+/// construction; filter changes are applied via [`Self::set_filter`]
+/// (which drops buffered records but retains per-source byte offsets).
+pub struct Stepper<'a> {
+    sources: Vec<SourceWindow<'a>>,
+    filter: Filter,
+}
+
+impl<'a> Stepper<'a> {
+    /// Internal constructor.  Public callers go through
+    /// [`super::Engine::stepper`].
+    pub(super) fn new(
+        sources: Vec<&'a dyn Source>,
+        filter: Filter,
+        cursor: &Cursor,
+    ) -> Self {
+        let windows = sources
+            .into_iter()
+            .map(|s| {
+                let pos = cursor.get(s.id()).unwrap_or(ByteOffset::ZERO);
+                SourceWindow::new(s, pos)
+            })
+            .collect();
+        Self { sources: windows, filter }
+    }
+
+    /// Returns the active filter.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// Replaces the active filter.  Drops every buffered record (since
+    /// they were filtered against the previous filter) and clears the
+    /// per-source EOF flags so a fresh fetch sees what the new filter
+    /// accepts.  Per-source byte offsets are retained — the cursor's
+    /// position does not move.
+    pub fn set_filter(&mut self, filter: Filter) {
+        self.filter = filter;
+        for s in &mut self.sources {
+            s.clear_buffers();
+        }
+    }
+
+    /// Returns a snapshot of every source's current byte offset,
+    /// suitable for serialization.
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            offsets: self
+                .sources
+                .iter()
+                .map(|s| (s.source_id.clone(), s.position))
+                .collect(),
+        }
+    }
+
+    /// Returns the next record in time order, or `None` when every
+    /// source is forward-exhausted.
+    pub fn step_forward(&mut self) -> Option<MergeRecord> {
+        self.step(Direction::Forward)
+    }
+
+    /// Returns the previous record in reverse time order, or `None`
+    /// when every source is backward-exhausted.
+    pub fn step_backward(&mut self) -> Option<MergeRecord> {
+        self.step(Direction::Backward)
+    }
+
+    fn step(&mut self, dir: Direction) -> Option<MergeRecord> {
+        for s in &mut self.sources {
+            s.fill(dir, &self.filter);
+        }
+        let idx = pick(&self.sources, dir)?;
+        Some(self.sources[idx].pop(dir))
+    }
+}
+
+/// Picks the source whose head should be emitted next.
+///
+/// For [`Direction::Forward`]: the head is `forward_buf.front()`;
+/// among non-error heads the smallest timestamp wins; ties break by
+/// lowest source-add index.  An error head wins over any event head,
+/// regardless of time.
+///
+/// For [`Direction::Backward`]: the head is `backward_buf.front()`;
+/// among non-error heads the largest timestamp wins; ties break by
+/// *highest* source-add index — the reverse of the forward tiebreaker
+/// — so backward stepping over a run of equal-timestamped events from
+/// multiple sources retraces the forward emit order in reverse.  Among
+/// multiple error heads the same direction-aware tiebreak applies.
+fn pick(
+    sources: &[SourceWindow<'_>],
+    direction: Direction,
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    let mut best_is_err = false;
+    let mut best_time: Option<DateTime<Utc>> = None;
+    for (i, s) in sources.iter().enumerate() {
+        let Some(head) = s.buf(direction).front() else { continue };
+        let is_err = head.event.is_err();
+        if is_err {
+            // Errors emit eagerly: an error head always wins over an
+            // event head.  Forward keeps the first error encountered
+            // (lowest index); backward overwrites so the highest index
+            // wins.
+            match (best_is_err, direction) {
+                (false, _) => {
+                    best = Some(i);
+                    best_is_err = true;
+                }
+                (true, Direction::Backward) => {
+                    best = Some(i);
+                }
+                (true, Direction::Forward) => {}
+            }
+            continue;
+        }
+        if best_is_err {
+            continue;
+        }
+        let t = head.event.as_ref().expect("not err").time;
+        // Strict inequality on time, then ties go to higher index for
+        // backward (lowest-index wins forward by being set first and
+        // never replaced).
+        let take = match direction {
+            Direction::Forward => best_time.is_none_or(|bt| t < bt),
+            Direction::Backward => match best_time {
+                None => true,
+                Some(bt) => t >= bt,
+            },
+        };
+        if take {
+            best = Some(i);
+            best_time = Some(t);
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::FileSource;
+    use crate::test_util::{TestDir, append_bunyan_at, append_raw, t};
+    use camino::Utf8Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Writes `secs.len()` bunyan records to `path` with consecutive
+    /// timestamps and messages `m{sec}`.
+    fn write_fixture(path: &Utf8Path, name: &str, secs: &[i64]) {
+        for s in secs {
+            append_bunyan_at(path, name, t(*s), &format!("m{s}"));
+        }
+    }
+
+    /// Builds a [`Stepper`] over the given sources, all starting at
+    /// byte zero with the default filter.  Returned alongside the
+    /// boxed sources so the borrow checker is happy: the stepper
+    /// borrows from the slice we keep alive in the caller.
+    fn make_stepper<'a>(
+        sources: &'a [Box<dyn Source>],
+    ) -> Stepper<'a> {
+        let refs: Vec<&dyn Source> =
+            sources.iter().map(|s| s.as_ref()).collect();
+        Stepper::new(refs, Filter::default(), &Cursor::new())
+    }
+
+    /// Drains a stepper forward and returns just the parsed event
+    /// messages, panicking on any error item.  Used by tests that
+    /// build error-free fixtures.
+    fn forward_msgs(stepper: &mut Stepper<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(r) = stepper.step_forward() {
+            match r.event {
+                Ok(e) => out.push(e.msg),
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Symmetric: drains a stepper backward.
+    fn backward_msgs(stepper: &mut Stepper<'_>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(r) = stepper.step_backward() {
+            match r.event {
+                Ok(e) => out.push(e.msg),
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn empty_engine_yields_no_steps() {
+        // No sources at all: both directions return None immediately.
+        let sources: Vec<Box<dyn Source>> = Vec::new();
+        let mut stepper = make_stepper(&sources);
+        assert!(stepper.step_forward().is_none());
+        assert!(stepper.step_backward().is_none());
+        assert!(stepper.cursor().is_empty());
+    }
+
+    #[test]
+    fn empty_source_yields_no_steps() {
+        let dir = TestDir::new();
+        let p = dir.path().join("empty.log");
+        std::fs::File::create(&p).unwrap();
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        assert!(stepper.step_forward().is_none());
+        assert!(stepper.step_backward().is_none());
+        // Cursor still records the source — at byte zero.
+        assert_eq!(stepper.cursor().len(), 1);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn single_source_forward_yields_records_in_order() {
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20, 30]);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m20", "m30"]);
+        // After draining forward, another forward step is None.
+        assert!(stepper.step_forward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn single_source_backward_from_default_cursor_is_empty() {
+        // A fresh stepper sits at byte 0 of every source; backward
+        // from byte 0 has nothing to return.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20]);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        assert!(stepper.step_backward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn forward_then_backward_round_trips() {
+        // Stepping forward N times then backward N times yields the
+        // forward sequence reversed.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20, 30, 40]);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        let mut fwd = Vec::new();
+        for _ in 0..4 {
+            let r = stepper.step_forward().unwrap();
+            fwd.push(r.event.unwrap().msg);
+        }
+        let mut bwd = Vec::new();
+        for _ in 0..4 {
+            let r = stepper.step_backward().unwrap();
+            bwd.push(r.event.unwrap().msg);
+        }
+        let mut fwd_rev = fwd.clone();
+        fwd_rev.reverse();
+        assert_eq!(bwd, fwd_rev);
+        // Now stepping backward more is None (we're at byte 0).
+        assert!(stepper.step_backward().is_none());
+        // And stepping forward replays the original sequence.
+        let replay = forward_msgs(&mut stepper);
+        assert_eq!(replay, fwd);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn multi_source_forward_merges_by_time() {
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        write_fixture(&a, "x", &[10, 30]);
+        write_fixture(&b, "x", &[20, 40]);
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sources = vec![sa, sb];
+        let mut stepper = make_stepper(&sources);
+        assert_eq!(
+            forward_msgs(&mut stepper),
+            vec!["m10", "m20", "m30", "m40"],
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn multi_source_backward_is_reverse_of_forward() {
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        write_fixture(&a, "x", &[10, 30]);
+        write_fixture(&b, "x", &[20, 40]);
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sources = vec![sa, sb];
+        let mut stepper = make_stepper(&sources);
+        // Drive forward to the end first.
+        let fwd = forward_msgs(&mut stepper);
+        let bwd = backward_msgs(&mut stepper);
+        let mut expected = fwd.clone();
+        expected.reverse();
+        assert_eq!(bwd, expected);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn forward_breaks_ties_by_source_add_order() {
+        // Both events at the same instant; source A added first, so its
+        // event emits first.
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        append_bunyan_at(&a, "x", t(50), "a-tie");
+        append_bunyan_at(&b, "x", t(50), "b-tie");
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sources = vec![sa, sb];
+        let mut stepper = make_stepper(&sources);
+        assert_eq!(forward_msgs(&mut stepper), vec!["a-tie", "b-tie"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn backward_ties_emit_in_reverse_of_forward_ties() {
+        // Three sources, all with one event at the same instant.
+        // Forward order is 0,1,2 (lowest index first); backward order
+        // must be 2,1,0 so that forward-then-backward symmetry holds
+        // even at exact-tie groups.
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        let c = dir.path().join("c.log");
+        append_bunyan_at(&a, "x", t(50), "tie-a");
+        append_bunyan_at(&b, "x", t(50), "tie-b");
+        append_bunyan_at(&c, "x", t(50), "tie-c");
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sc: Box<dyn Source> = Box::new(FileSource::open(&c).unwrap());
+        let sources = vec![sa, sb, sc];
+        let mut stepper = make_stepper(&sources);
+        let fwd = forward_msgs(&mut stepper);
+        assert_eq!(fwd, vec!["tie-a", "tie-b", "tie-c"]);
+        let bwd = backward_msgs(&mut stepper);
+        assert_eq!(bwd, vec!["tie-c", "tie-b", "tie-a"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_round_trips_across_steppers() {
+        // Step a few times, snapshot the cursor, build a fresh stepper
+        // from that cursor, and verify the remaining records match.
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        write_fixture(&a, "x", &[10, 30, 50]);
+        write_fixture(&b, "x", &[20, 40, 60]);
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sources = vec![sa, sb];
+        let mut stepper = make_stepper(&sources);
+        // Consume the first three events: m10, m20, m30.
+        for _ in 0..3 {
+            stepper.step_forward().unwrap();
+        }
+        let snapshot = stepper.cursor();
+        // Build a brand-new stepper at that cursor.
+        let refs: Vec<&dyn Source> =
+            sources.iter().map(|s| s.as_ref()).collect();
+        let mut resumed =
+            Stepper::new(refs, Filter::default(), &snapshot);
+        assert_eq!(
+            forward_msgs(&mut resumed),
+            vec!["m40", "m50", "m60"],
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_default_starts_at_byte_zero() {
+        // A `Cursor::default()` carries no entries, so every source
+        // resolves to byte zero — the stepper walks from the start.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20]);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = [src];
+        let refs: Vec<&dyn Source> =
+            sources.iter().map(|s| s.as_ref()).collect();
+        let mut stepper =
+            Stepper::new(refs, Filter::default(), &Cursor::default());
+        assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m20"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_at_eof_walks_backward_only() {
+        // Build a cursor pointing at end-of-file; forward step yields
+        // nothing, backward yields the records in reverse.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20, 30]);
+        let len = std::fs::metadata(&p).unwrap().len();
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = [src];
+        let id = sources[0].id().clone();
+        let cursor = Cursor::with([(id, ByteOffset::from(len))]);
+        let refs: Vec<&dyn Source> =
+            sources.iter().map(|s| s.as_ref()).collect();
+        let mut stepper = Stepper::new(refs, Filter::default(), &cursor);
+        assert!(stepper.step_forward().is_none());
+        assert_eq!(
+            backward_msgs(&mut stepper),
+            vec!["m30", "m20", "m10"],
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_serializes_as_bare_map() {
+        // The `#[serde(transparent)]` annotation means a Cursor
+        // round-trips through serde as the inner BTreeMap directly,
+        // so persisted bookmarks don't acquire a wrapping struct
+        // tag that would later need migration.
+        let id = SourceId::from("s1".to_string());
+        let cursor = Cursor::with([(id, ByteOffset::from(100))]);
+        let json = serde_json::to_string(&cursor).unwrap();
+        assert_eq!(json, r#"{"s1":100}"#);
+        let back: Cursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cursor);
+    }
+
+    #[test]
+    fn set_filter_drops_buffers_but_keeps_position() {
+        // Walk forward a few records, change the filter to one that
+        // drops the next record, and confirm that the next forward
+        // step honors the new filter without re-emitting earlier ones.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        for s in &[10i64, 20, 30, 40] {
+            append_bunyan_at(&p, "x", t(*s), &format!("m{s}"));
+        }
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        // Consume m10 and m20.
+        let r1 = stepper.step_forward().unwrap();
+        assert_eq!(r1.event.as_ref().unwrap().msg, "m10");
+        let r2 = stepper.step_forward().unwrap();
+        assert_eq!(r2.event.as_ref().unwrap().msg, "m20");
+        // Switch to a filter that excludes m30; m40 should be next.
+        let filter: Filter = "msg!=m30".parse().unwrap();
+        stepper.set_filter(filter);
+        let r3 = stepper.step_forward().unwrap();
+        assert_eq!(r3.event.as_ref().unwrap().msg, "m40");
+        // No more forward records.
+        assert!(stepper.step_forward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn source_id_filter_excludes_whole_source() {
+        // A `source_id!~b` filter at construction must keep source A's
+        // events and skip source B entirely — even if B would
+        // otherwise produce events that interleave by time.
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        write_fixture(&a, "x", &[10, 30]);
+        write_fixture(&b, "x", &[20, 40]);
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let id_b = sb.id().clone();
+        let sources = [sa, sb];
+        // Build an Engine-style filter directly; the stepper applies
+        // the source-id selection itself when constructed via
+        // `Engine::stepper`, so we mimic that here.
+        let filter: Filter =
+            format!("source_id!~{}", regex::escape(id_b.as_ref()))
+                .parse()
+                .unwrap();
+        let refs: Vec<&dyn Source> = sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| s.as_ref())
+            .collect();
+        let mut stepper = Stepper::new(refs, filter, &Cursor::new());
+        assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m30"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn parse_errors_emit_inline() {
+        // A non-JSON line in the middle of the file appears as an
+        // inline error; the surrounding events still come through.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        append_bunyan_at(&p, "x", t(10), "m10");
+        append_raw(&p, "not json");
+        append_bunyan_at(&p, "x", t(20), "m20");
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        let r1 = stepper.step_forward().unwrap();
+        assert_eq!(r1.event.as_ref().unwrap().msg, "m10");
+        let r2 = stepper.step_forward().unwrap();
+        assert!(r2.event.is_err());
+        let r3 = stepper.step_forward().unwrap();
+        assert_eq!(r3.event.as_ref().unwrap().msg, "m20");
+        assert!(stepper.step_forward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn parse_errors_replay_on_backward_step() {
+        // Forward over an error; backward must produce the error in
+        // its original position rather than skipping over it.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        append_bunyan_at(&p, "x", t(10), "m10");
+        append_raw(&p, "not json");
+        append_bunyan_at(&p, "x", t(20), "m20");
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        // Drain forward.
+        for _ in 0..3 {
+            stepper.step_forward().unwrap();
+        }
+        // Step backward: m20, then error, then m10.
+        let r1 = stepper.step_backward().unwrap();
+        assert_eq!(r1.event.as_ref().unwrap().msg, "m20");
+        let r2 = stepper.step_backward().unwrap();
+        assert!(r2.event.is_err());
+        let r3 = stepper.step_backward().unwrap();
+        assert_eq!(r3.event.as_ref().unwrap().msg, "m10");
+        assert!(stepper.step_backward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn many_records_force_multiple_batch_fetches() {
+        // Write more records than `BATCH_SIZE` so the stepper must
+        // refill at least twice.  A counting source wraps the
+        // underlying file source and asserts the stepper isn't
+        // single-fetching everything.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        let n = (BATCH_SIZE * 3 + 5) as i64;
+        let secs: Vec<i64> = (0..n).collect();
+        write_fixture(&p, "x", &secs);
+        let inner = FileSource::open(&p).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let src: Box<dyn Source> = Box::new(CountingSource {
+            inner,
+            count: counter.clone(),
+        });
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        let msgs = forward_msgs(&mut stepper);
+        assert_eq!(msgs.len(), n as usize);
+        let calls = counter.load(Ordering::SeqCst);
+        // We should see at least `ceil(n / BATCH_SIZE)` query calls;
+        // a single huge fetch would be only 1.
+        let expected_min = (n as usize).div_ceil(BATCH_SIZE);
+        assert!(
+            calls >= expected_min,
+            "expected at least {expected_min} fetches, got {calls}",
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn buffer_trim_preserves_navigation_correctness() {
+        // Walk far enough forward that the lookbehind buffer trims its
+        // oldest entries, then walk all the way back to byte zero.
+        // Trimming must not corrupt the cursor — the backward walk
+        // should hit every record, refetching from disk for the
+        // trimmed range.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        let n = (BUFFER_LIMIT + 10) as i64;
+        let secs: Vec<i64> = (0..n).collect();
+        write_fixture(&p, "x", &secs);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        // Forward all the way.
+        let fwd = forward_msgs(&mut stepper);
+        assert_eq!(fwd.len(), n as usize);
+        // Backward all the way — even though the trim has occurred.
+        let bwd = backward_msgs(&mut stepper);
+        let mut fwd_rev = fwd.clone();
+        fwd_rev.reverse();
+        assert_eq!(bwd, fwd_rev);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn step_backward_after_eof_works() {
+        // After step_forward returns None (forward exhausted), the
+        // backward direction is still available.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20]);
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        forward_msgs(&mut stepper);
+        // We're at EOF.
+        assert!(stepper.step_forward().is_none());
+        // Backward still works.
+        let r = stepper.step_backward().unwrap();
+        assert_eq!(r.event.as_ref().unwrap().msg, "m20");
+        dir.cleanup();
+    }
+
+    #[test]
+    fn merge_record_carries_offset_and_length() {
+        // The (offset, length) pair on each emitted record must be
+        // consistent: stepping forward through the file, the offsets
+        // partition the file with no gaps.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20, 30]);
+        let len = std::fs::metadata(&p).unwrap().len();
+        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
+        let mut stepper = make_stepper(&sources);
+        let mut expected_offset = 0u64;
+        while let Some(r) = stepper.step_forward() {
+            assert_eq!(r.offset.get(), expected_offset);
+            expected_offset += r.length;
+        }
+        assert_eq!(expected_offset, len);
+        dir.cleanup();
+    }
+
+    /// Wraps a `FileSource` and counts every call to `query`.  Used by
+    /// the batch-fetch test to confirm the stepper actually issues
+    /// multiple smaller fetches rather than reading the whole file at
+    /// once.
+    struct CountingSource {
+        inner: FileSource,
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Source for CountingSource {
+        fn id(&self) -> &SourceId {
+            self.inner.id()
+        }
+        fn metadata(&self) -> &crate::source::SourceMetadata {
+            self.inner.metadata()
+        }
+        fn events<'a>(
+            &'a self,
+        ) -> Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a>
+        {
+            self.inner.events()
+        }
+        fn query(
+            &self,
+            offset: ByteOffset,
+            direction: Direction,
+            count: usize,
+            filter: &Filter,
+        ) -> std::io::Result<Vec<QueryRecord>> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            self.inner.query(offset, direction, count, filter)
+        }
+    }
+}

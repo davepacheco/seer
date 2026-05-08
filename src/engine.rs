@@ -19,6 +19,10 @@ use camino::Utf8Path;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 
+mod merge;
+
+pub use merge::{Cursor, MergeError, MergeRecord, Stepper};
+
 /// An [`Event`] paired with the [`LogStreamPosition`] identifying which
 /// source it came from and its position within that source.
 ///
@@ -53,6 +57,29 @@ impl Engine {
         let id = source.id().clone();
         self.sources.push(Box::new(source));
         Ok(id)
+    }
+
+    /// Constructs a [`Stepper`] over every attached source whose id is
+    /// accepted by `filter`'s source-id predicates, with each source's
+    /// initial byte offset taken from `cursor` (defaulting to
+    /// [`crate::source::ByteOffset::ZERO`] for sources missing from the
+    /// cursor).
+    ///
+    /// Unlike [`Self::query_events`], a stepper fetches lazily and keeps
+    /// per-source lookahead/lookbehind buffers so the TUI can scroll
+    /// forward and backward without re-reading the whole file each
+    /// time.  Filter changes are applied via [`Stepper::set_filter`]
+    /// (which retains positions); changing the *source-id* filter
+    /// requires building a fresh stepper, since the source set is
+    /// fixed at construction.
+    pub fn stepper(&self, filter: Filter, cursor: &Cursor) -> Stepper<'_> {
+        let sources: Vec<&dyn Source> = self
+            .sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| s.as_ref())
+            .collect();
+        Stepper::new(sources, filter, cursor)
     }
 
     /// Returns an iterator over every event in every source that
@@ -473,17 +500,9 @@ mod tests {
     use super::*;
     use crate::event::Level;
     use crate::test_util::{
-        TestDir, append_bunyan, append_bunyan_at, append_raw,
+        TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
-    use chrono::TimeZone;
     use slog::{debug, error, info};
-
-    /// Builds a [`DateTime<Utc>`] from epoch seconds.  Tests use this to
-    /// pin event timestamps to predictable values so the merge order
-    /// can be asserted exactly.
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid timestamp")
-    }
 
     #[test]
     fn query_merges_sources_in_time_order() {
