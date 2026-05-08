@@ -58,16 +58,21 @@ impl Engine {
     /// Returns an iterator over every event in every source that
     /// matches `filter`.
     ///
-    /// Events from different sources are interleaved by time so the
-    /// caller sees the full timeline, not one source at a time.  Each
-    /// source is assumed to be locally sorted; if a source has an
-    /// out-of-order entry, a one-shot [`SourceError::OutOfOrder`]
-    /// warning for that source is emitted *before* the offending event
-    /// (and the merge continues with the timestamps as given).  Per-line
-    /// parse and I/O errors appear inline as `Err` items, kept close to
-    /// their position in the source file rather than being slotted by
-    /// time.  The filter only applies to `Ok` items, so errors and
-    /// warnings are always surfaced regardless of the filter.
+    /// Sources whose ids fail the filter's source-id predicates are
+    /// skipped entirely — the engine never opens them or iterates
+    /// their events, which is the whole point of having a source-id
+    /// predicate (a regex over an absolute path can prune a multi-GB
+    /// log file before any reads).  The remaining sources' events are
+    /// interleaved by time so the caller sees the full timeline, not
+    /// one source at a time.  Each source is assumed to be locally
+    /// sorted; if a source has an out-of-order entry, a one-shot
+    /// [`SourceError::OutOfOrder`] warning for that source is emitted
+    /// *before* the offending event (and the merge continues with the
+    /// timestamps as given).  Per-line parse and I/O errors appear
+    /// inline as `Err` items, kept close to their position in the
+    /// source file rather than being slotted by time.  The filter only
+    /// applies to `Ok` items, so errors and warnings are always
+    /// surfaced regardless of the filter.
     pub fn query_events<'a>(
         &'a self,
         filter: &'a Filter,
@@ -75,6 +80,7 @@ impl Engine {
         let cursors = self
             .sources
             .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
             .map(|s| SourceCursor::new(s.as_ref()))
             .collect();
         MergeIter { cursors }.filter(move |r| match r {
@@ -100,6 +106,14 @@ impl Engine {
         if !self.sources.iter().any(|s| s.id() == position.source()) {
             return ResolvePosition::Gone;
         }
+        // The anchor's source might still be attached but excluded by
+        // the source-id filter — in that case the merge never sees the
+        // anchor at all.  Handle this up front by finding the closest
+        // visible neighbor by *time*, matching the FilteredOut
+        // contract (prefer next-after, fall back to previous-before).
+        if !filter.matches_source_id(position.source()) {
+            return self.filtered_out_neighbor_by_time(filter, position.time());
+        }
         let mut row_in_filtered: usize = 0;
         let mut last_visible_before: Option<usize> = None;
         // Walk the unfiltered merge.  For each Ok event, decide three
@@ -109,9 +123,15 @@ impl Engine {
         // either when filter rejects no errors — but our Ok-only counter
         // is what matters here, since callers index into events, and
         // their events vec parallels query_events output.
+        //
+        // Sources whose ids fail the source-id filter are excluded from
+        // the merge, mirroring `query_events`.  The anchor's source has
+        // already been confirmed visible above, so the anchor (if it
+        // still exists in the file) will be reached.
         let cursors = self
             .sources
             .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
             .map(|s| SourceCursor::new(s.as_ref()))
             .collect();
         let merge = MergeIter { cursors };
@@ -150,6 +170,10 @@ impl Engine {
             }
         }
         if !found_anchor {
+            // Source is visible to the filter (the !visible branch
+            // returned earlier) but the anchor isn't in the merge —
+            // the underlying file has been rewritten or rotated since
+            // the bookmark was made.
             return ResolvePosition::Gone;
         }
         // Anchor is present but filtered out; pick the closest visible
@@ -161,6 +185,46 @@ impl Engine {
             (None, Some(idx)) => ResolvePosition::FilteredOut(idx),
             (None, None) => ResolvePosition::FilteredOut(0),
         }
+    }
+
+    /// Closest visible neighbor of an anchor whose source was excluded
+    /// by the source-id filter, indexed by time alone.
+    ///
+    /// Walks the source-id-filtered merge once and returns:
+    /// - the row of the first visible event whose `time > anchor_time`,
+    /// - or, when no later event is visible, the row of the latest
+    ///   visible event whose `time <= anchor_time`,
+    /// - or `0` when nothing is visible at all.
+    ///
+    /// Mirrors the next-then-previous preference of the in-merge
+    /// FilteredOut path so a bookmark whose source is regex-excluded
+    /// behaves the same as one whose anchored event was excluded by an
+    /// event-level predicate.
+    fn filtered_out_neighbor_by_time(
+        &self,
+        filter: &Filter,
+        anchor_time: DateTime<Utc>,
+    ) -> ResolvePosition {
+        let cursors = self
+            .sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| SourceCursor::new(s.as_ref()))
+            .collect();
+        let mut row = 0usize;
+        let mut last_before: Option<usize> = None;
+        for item in (MergeIter { cursors }) {
+            let Ok(ee) = item else { continue };
+            if !filter.matches(&ee.event) {
+                continue;
+            }
+            if ee.event.time > anchor_time {
+                return ResolvePosition::FilteredOut(row);
+            }
+            last_before = Some(row);
+            row += 1;
+        }
+        ResolvePosition::FilteredOut(last_before.unwrap_or(0))
     }
 }
 
@@ -719,6 +783,168 @@ mod tests {
             engine_b.resolve_position(&Filter::default(), &anchor),
             ResolvePosition::Gone,
         );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn query_filters_by_source_id_regex() {
+        // Two sources whose canonical paths contain different basename
+        // tokens.  A `source_id=~nexus` predicate must keep nexus's
+        // events and drop sled-agent's, regardless of event-level
+        // fields.
+        let dir = TestDir::new();
+        let nexus = dir.path().join("nexus.log");
+        let sled = dir.path().join("sled-agent.log");
+        append_bunyan_at(&nexus, "x", t(10), "n1");
+        append_bunyan_at(&nexus, "x", t(20), "n2");
+        append_bunyan_at(&sled, "x", t(15), "s1");
+        let mut engine = Engine::new();
+        engine.add_file_source(&nexus).unwrap();
+        engine.add_file_source(&sled).unwrap();
+
+        let filter: Filter = "source_id=~nexus".parse().unwrap();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().event.msg)
+            .collect();
+        assert_eq!(msgs, vec!["n1", "n2"]);
+
+        let filter: Filter = "source_id!~nexus".parse().unwrap();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().event.msg)
+            .collect();
+        assert_eq!(msgs, vec!["s1"]);
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn source_id_filter_skips_sources_without_iterating() {
+        // A source whose path can't be opened (e.g. it was deleted
+        // between `add_file_source` and the query) would normally
+        // surface an `Io` error from its iterator.  When the source-id
+        // filter rejects that source, the engine must not even
+        // construct its cursor — proven here by deleting the file
+        // after registering it: an `Io` error would only appear if the
+        // engine still tried to read it.
+        let dir = TestDir::new();
+        let nexus = dir.path().join("nexus.log");
+        let agent = dir.path().join("agent.log");
+        append_bunyan_at(&nexus, "x", t(10), "n1");
+        append_bunyan_at(&agent, "x", t(20), "a1");
+        let mut engine = Engine::new();
+        engine.add_file_source(&nexus).unwrap();
+        engine.add_file_source(&agent).unwrap();
+        // Delete the agent file *after* it has been registered.  A
+        // naive query would now surface an Io error from the agent
+        // cursor; the regex must keep the engine from ever opening it.
+        std::fs::remove_file(&agent).unwrap();
+
+        let filter: Filter = "source_id=~nexus".parse().unwrap();
+        let results: Vec<_> = engine.query_events(&filter).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap().event.msg, "n1");
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn source_id_filter_combines_with_event_filter() {
+        // Conjunction: event must clear both the source-id regex and
+        // the event-level filter.  Two sources, each with mixed
+        // levels; ask for `source_id=~nexus level>=warn`.
+        let dir = TestDir::new();
+        let nexus = dir.path().join("nexus.log");
+        let sled = dir.path().join("sled.log");
+        append_bunyan(&nexus, "x", |log| {
+            info!(log, "n-info");
+            error!(log, "n-error");
+        });
+        append_bunyan(&sled, "x", |log| {
+            error!(log, "s-error");
+        });
+        let mut engine = Engine::new();
+        engine.add_file_source(&nexus).unwrap();
+        engine.add_file_source(&sled).unwrap();
+
+        let filter: Filter = "source_id=~nexus level>=warn".parse().unwrap();
+        let msgs: Vec<_> = engine
+            .query_events(&filter)
+            .map(|r| r.unwrap().event.msg)
+            .collect();
+        assert_eq!(msgs, vec!["n-error"]);
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_treats_source_id_filter_as_filtered_out() {
+        // Anchor on a source's event, then apply a filter that
+        // excludes the anchor's source.  The bookmark's source is
+        // still attached, so the result is FilteredOut against the
+        // closest visible neighbor — not Gone.
+        let dir = TestDir::new();
+        let nexus = dir.path().join("nexus.log");
+        let sled = dir.path().join("sled.log");
+        append_bunyan_at(&nexus, "x", t(10), "n1");
+        append_bunyan_at(&sled, "x", t(5), "s-before");
+        append_bunyan_at(&sled, "x", t(20), "s-after");
+        let mut engine = Engine::new();
+        engine.add_file_source(&nexus).unwrap();
+        engine.add_file_source(&sled).unwrap();
+        // Anchor on the nexus event.  The merge order is
+        // s-before(5), n1(10), s-after(20); n1 is index 1.
+        let anchor = engine
+            .query_events(&Filter::default())
+            .filter_map(|r| r.ok())
+            .find(|ee| ee.event.msg == "n1")
+            .unwrap()
+            .position;
+
+        // Exclude nexus by source-id.  Visible-only sequence is
+        // s-before(5), s-after(20); the anchor (t=10) is between them,
+        // so the nearest visible-later event wins per the FilteredOut
+        // contract: s-after at filtered row 1.
+        let filter: Filter = "source_id!~nexus".parse().unwrap();
+        assert_eq!(
+            engine.resolve_position(&filter, &anchor),
+            ResolvePosition::FilteredOut(1),
+        );
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn resolve_position_falls_back_to_before_when_no_later_under_source_id_filter()
+     {
+        // Same shape as the previous test, but the anchor sits *after*
+        // every other source's events.  No later visible neighbor →
+        // fall back to the latest earlier visible event.
+        let dir = TestDir::new();
+        let nexus = dir.path().join("nexus.log");
+        let sled = dir.path().join("sled.log");
+        append_bunyan_at(&sled, "x", t(5), "s-1");
+        append_bunyan_at(&sled, "x", t(7), "s-2");
+        append_bunyan_at(&nexus, "x", t(20), "n-tail");
+        let mut engine = Engine::new();
+        engine.add_file_source(&nexus).unwrap();
+        engine.add_file_source(&sled).unwrap();
+        let anchor = engine
+            .query_events(&Filter::default())
+            .filter_map(|r| r.ok())
+            .find(|ee| ee.event.msg == "n-tail")
+            .unwrap()
+            .position;
+
+        let filter: Filter = "source_id!~nexus".parse().unwrap();
+        // Visible events: s-1(0), s-2(1).  Anchor t=20 is later than
+        // both, so we fall back to the latest before: row 1 (s-2).
+        assert_eq!(
+            engine.resolve_position(&filter, &anchor),
+            ResolvePosition::FilteredOut(1),
+        );
+
         dir.cleanup();
     }
 

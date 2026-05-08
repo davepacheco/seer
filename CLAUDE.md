@@ -218,10 +218,6 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## TODO list
 
-### Make `source_id` something you can filter on.
-
-The `source_id` for each file should already be the canonical path to the file.  Users should be able to filter on this as a regex.
-
 ### Summarizing fields in the view
 
 When we process each log, keep track of distinct top-level JSON field names.  Keep only the top 10.

@@ -18,14 +18,21 @@
 //! Tokens are split with [`shlex`], so values containing spaces can be
 //! double-quoted.  Each token is one predicate; the supported operators
 //! are `>=` (level only), `==` and `=` (equality), `!=` (negated
-//! equality), `=~` (regex, today only on `msg`), and `!~` (negated
-//! regex, msg only).  Level names are case-insensitive.
+//! equality), `=~` (regex, on `msg` and `source_id`), and `!~` (negated
+//! regex, on the same).  Level names are case-insensitive.
+//!
+//! `source_id=~regex` (and `!~`) is special: it filters whole sources
+//! at query time, before any of their lines are read, rather than
+//! per event.  Equality forms (`source_id=foo`) are not supported —
+//! the parser rejects them rather than silently routing to a
+//! never-matching field equality.
 //!
 //! Both [`Filter`] and [`Predicate`] are also `serde`-serializable so
 //! they can ride along in a persisted session; the regex's source string
 //! is what's stored.
 
 use crate::event::{Event, Level};
+use crate::source::SourceId;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -41,9 +48,28 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Returns true iff every predicate matches `event`.
+    /// Returns true iff every predicate accepts `event`.
+    ///
+    /// Source-id predicates are evaluated separately at source-selection
+    /// time (see [`Self::matches_source_id`]); at the per-event level
+    /// they trivially pass, so this method does *not* by itself reject
+    /// events from sources whose ids don't match the filter.  The engine
+    /// is responsible for filtering whole sources up front so this
+    /// method is only ever called for events that already cleared the
+    /// source-id check.
     pub fn matches(&self, event: &Event) -> bool {
         self.predicates.iter().all(|p| p.matches(event))
+    }
+
+    /// Returns true iff every source-id predicate accepts `source_id`.
+    ///
+    /// Predicates that don't constrain source ids contribute `true` to
+    /// the conjunction, so a filter with no source-id predicates accepts
+    /// every source.  The engine uses this to skip whole sources before
+    /// constructing cursors over them — a filtered-out source is never
+    /// queried for events.
+    pub fn matches_source_id(&self, source_id: &SourceId) -> bool {
+        self.predicates.iter().all(|p| p.matches_source_id(source_id))
     }
 
     /// Returns the predicates this filter is built from.
@@ -94,6 +120,17 @@ pub enum Predicate {
         #[serde(default)]
         negated: bool,
     },
+    /// The source the event came from has an id that matches (or, when
+    /// `negated`, does not match) the regex.  Evaluated against
+    /// [`crate::source::SourceId`] at source-selection time, not against
+    /// the event itself; the engine skips entire sources whose ids fail
+    /// rather than iterating their contents.
+    SourceIdMatches {
+        #[serde(with = "regex_serde")]
+        regex: Regex,
+        #[serde(default)]
+        negated: bool,
+    },
 }
 
 impl Predicate {
@@ -109,6 +146,29 @@ impl Predicate {
             Self::MsgMatches { regex, negated } => {
                 regex.is_match(&event.msg) ^ *negated
             }
+            // Source-id is not carried on the bare event; the engine
+            // filters whole sources before iterating them, so a source
+            // that reaches per-event matching has already passed.  Pass
+            // unconditionally here so a `Filter::matches` call doesn't
+            // double-reject (or reject events whose source it can't
+            // see).
+            Self::SourceIdMatches { .. } => true,
+        }
+    }
+
+    /// Whether this predicate accepts `source_id` for source-selection.
+    /// Predicates that don't constrain source ids contribute `true`
+    /// (i.e. they don't reject the source); only [`Self::SourceIdMatches`]
+    /// can return `false`.
+    pub fn matches_source_id(&self, source_id: &SourceId) -> bool {
+        match self {
+            Self::SourceIdMatches { regex, negated } => {
+                regex.is_match(source_id.as_ref()) ^ *negated
+            }
+            Self::LevelAtLeast(_)
+            | Self::LevelEquals { .. }
+            | Self::FieldEquals { .. }
+            | Self::MsgMatches { .. } => true,
         }
     }
 }
@@ -173,10 +233,12 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
     // must be probed first.  `!=` and `!~` come before `=`; `=~` and
     // `==` and `>=` likewise.
     if let Some((lhs, rhs)) = tok.split_once("=~") {
-        return parse_msg_regex(tok, lhs, rhs, /* negated = */ false);
+        return parse_regex_predicate(
+            tok, lhs, rhs, /* negated = */ false,
+        );
     }
     if let Some((lhs, rhs)) = tok.split_once("!~") {
-        return parse_msg_regex(tok, lhs, rhs, /* negated = */ true);
+        return parse_regex_predicate(tok, lhs, rhs, /* negated = */ true);
     }
     if let Some((lhs, rhs)) = tok.split_once(">=") {
         require_nonempty_name(tok, lhs)?;
@@ -201,22 +263,23 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
     Err(FilterParseError::NoOperator { token: tok.to_string() })
 }
 
-fn parse_msg_regex(
+fn parse_regex_predicate(
     tok: &str,
     lhs: &str,
     rhs: &str,
     negated: bool,
 ) -> Result<Predicate, FilterParseError> {
     require_nonempty_name(tok, lhs)?;
-    if lhs != "msg" {
-        return Err(FilterParseError::UnsupportedFieldOp {
-            name: lhs.to_string(),
-            op: if negated { "!~" } else { "=~" }.to_string(),
-        });
-    }
     let regex = Regex::new(rhs)
         .map_err(|e| FilterParseError::BadRegex(e.to_string()))?;
-    Ok(Predicate::MsgMatches { regex, negated })
+    match lhs {
+        "msg" => Ok(Predicate::MsgMatches { regex, negated }),
+        "source_id" => Ok(Predicate::SourceIdMatches { regex, negated }),
+        _ => Err(FilterParseError::UnsupportedFieldOp {
+            name: lhs.to_string(),
+            op: if negated { "!~" } else { "=~" }.to_string(),
+        }),
+    }
 }
 
 fn field_or_level(
@@ -228,6 +291,15 @@ fn field_or_level(
     require_nonempty_name(tok, lhs)?;
     if lhs == "level" {
         Ok(Predicate::LevelEquals { level: parse_level(rhs)?, negated })
+    } else if lhs == "source_id" {
+        // Source ids only support regex; equality of canonical paths
+        // is rarely what you want, and silently routing the token to
+        // FieldEquals would search inside `event.extra` and never
+        // match.  Fail loudly with a hint at the supported operator.
+        Err(FilterParseError::UnsupportedFieldOp {
+            name: lhs.to_string(),
+            op: if negated { "!=" } else { "=" }.to_string(),
+        })
     } else {
         Ok(Predicate::FieldEquals {
             name: lhs.to_string(),
@@ -288,6 +360,10 @@ impl fmt::Display for Predicate {
             Self::MsgMatches { regex, negated } => {
                 let op = if *negated { "!~" } else { "=~" };
                 write!(f, "msg{}{}", op, quote(regex.as_str()))
+            }
+            Self::SourceIdMatches { regex, negated } => {
+                let op = if *negated { "!~" } else { "=~" };
+                write!(f, "source_id{}{}", op, quote(regex.as_str()))
             }
         }
     }
@@ -900,6 +976,8 @@ mod tests {
             "name=Nexus",
             "component=nexus",
             "msg=~foo.*bar",
+            "source_id=~nexus",
+            "source_id!~debug",
             "level>=info name=Nexus msg=~boom",
         ];
         for src in inputs {
@@ -912,6 +990,111 @@ mod tests {
                 "round-trip drifted for {src:?}",
             );
         }
+    }
+
+    // ---------- source_id ----------
+
+    fn sid(s: &str) -> SourceId {
+        SourceId::from(s.to_string())
+    }
+
+    #[test]
+    fn parse_source_id_regex() {
+        let f = parse("source_id=~nexus");
+        match &f.predicates()[0] {
+            Predicate::SourceIdMatches { regex, negated } => {
+                assert_eq!(regex.as_str(), "nexus");
+                assert!(!negated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_source_id_negated_regex() {
+        let f = parse("source_id!~debug");
+        match &f.predicates()[0] {
+            Predicate::SourceIdMatches { regex, negated } => {
+                assert_eq!(regex.as_str(), "debug");
+                assert!(negated);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_source_id_equality_errors() {
+        // Source ids only support regex matching; a bare `=` would
+        // silently route to FieldEquals and never match (no key
+        // `source_id` lives in `extra`).  The parser must reject it.
+        for src in ["source_id=foo", "source_id!=foo"] {
+            let err = src.parse::<Filter>().unwrap_err();
+            assert!(matches!(
+                err,
+                FilterParseError::UnsupportedFieldOp { ref name, .. }
+                    if name == "source_id"
+            ));
+        }
+    }
+
+    #[test]
+    fn source_id_matches_against_canonical_path() {
+        let p = Predicate::SourceIdMatches {
+            regex: Regex::new("nexus").unwrap(),
+            negated: false,
+        };
+        assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
+        assert!(!p.matches_source_id(&sid("/var/log/sled-agent.log")));
+    }
+
+    #[test]
+    fn source_id_negated_inverts() {
+        let p = Predicate::SourceIdMatches {
+            regex: Regex::new("debug").unwrap(),
+            negated: true,
+        };
+        assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
+        assert!(!p.matches_source_id(&sid("/var/log/debug.log")));
+    }
+
+    #[test]
+    fn source_id_predicate_is_noop_at_event_level() {
+        // The bare event has no source-id field; the predicate must
+        // pass at event level so a `Filter::matches(event)` call after
+        // source-level pre-filtering doesn't double-reject.
+        let e = base_event();
+        assert!(
+            Predicate::SourceIdMatches {
+                regex: Regex::new("nope").unwrap(),
+                negated: false,
+            }
+            .matches(&e)
+        );
+    }
+
+    #[test]
+    fn filter_matches_source_id_is_conjunction() {
+        // Two source-id predicates AND together; the source must
+        // satisfy both.  Other predicate kinds don't constrain source
+        // selection.
+        let f: Filter =
+            "source_id=~log source_id!~debug name=Nexus".parse().unwrap();
+        assert!(f.matches_source_id(&sid("/var/log/nexus.log")));
+        // Has "log" but also "debug" — second predicate rejects.
+        assert!(!f.matches_source_id(&sid("/var/log/debug.log")));
+        // Doesn't have "log" — first predicate rejects.
+        assert!(!f.matches_source_id(&sid("/var/elsewhere/x.txt")));
+    }
+
+    #[test]
+    fn empty_filter_accepts_every_source() {
+        assert!(Filter::default().matches_source_id(&sid("anything")));
+    }
+
+    #[test]
+    fn other_predicates_dont_constrain_source_id() {
+        let f: Filter = "level>=warn name=Nexus msg=~boom".parse().unwrap();
+        assert!(f.matches_source_id(&sid("/anything.log")));
     }
 
     // ---------- serde ----------

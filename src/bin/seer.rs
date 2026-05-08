@@ -1131,10 +1131,10 @@ impl App {
     /// Supported keys: j/k (move bookmark cursor), Enter (navigate to
     /// the bookmark — switches tabs or opens a new one), x (open the
     /// delete-confirmation dialog), Tab/BackTab (cycle panes), q/Esc/
-    /// Ctrl-C (quit).  Everything else is dropped: filter edits,
-    /// search, time-step navigation, and Ctrl-T/Ctrl-W make no sense
-    /// in a list of bookmarks and would leave the user in a confusing
-    /// state if half-handled.
+    /// Ctrl-C (open the quit-confirmation dialog).  Everything else is
+    /// dropped: filter edits, search, time-step navigation, and Ctrl-T/
+    /// Ctrl-W make no sense in a list of bookmarks and would leave the
+    /// user in a confusing state if half-handled.
     fn handle_bookmarks_key(&mut self, key: KeyEvent) {
         match key {
             KeyEvent {
@@ -1152,7 +1152,7 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.quit = true;
+                self.dialog = Some(Dialog::confirm_quit());
             }
             KeyEvent {
                 code: KeyCode::Tab,
@@ -1420,6 +1420,10 @@ impl App {
                     self.dialog = None;
                     self.delete_bookmark(id);
                 }
+                DialogResult::ApplyQuit => {
+                    self.dialog = None;
+                    self.quit = true;
+                }
             }
             return;
         }
@@ -1462,7 +1466,7 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.quit = true;
+                self.dialog = Some(Dialog::confirm_quit());
             }
             KeyEvent {
                 code: KeyCode::Char('j') | KeyCode::Down,
@@ -1914,6 +1918,11 @@ enum Dialog {
     /// dialog title.  No editor: the user picks Cancel (Esc) or
     /// Confirm (Enter).
     ConfirmDeleteBookmark { id: BookmarkId, label: String },
+    /// Confirming a quit request triggered by `q`/`Esc`/`Ctrl-C` in
+    /// the main or Bookmarks pane.  No editor: Esc cancels, Enter
+    /// confirms.  Guards against accidental exits losing the user's
+    /// in-flight filter, search, and viewport state.
+    ConfirmQuit,
 }
 
 /// Outcome of one keystroke routed to the dialog.
@@ -1948,6 +1957,9 @@ enum DialogResult {
     /// but defending against stale state is cheap) the action is a
     /// no-op at the App layer.
     ApplyDeleteBookmark(BookmarkId),
+    /// Close the dialog and tear down the TUI: the user confirmed the
+    /// quit prompt.
+    ApplyQuit,
 }
 
 impl Dialog {
@@ -1990,13 +2002,17 @@ impl Dialog {
         Self::ConfirmDeleteBookmark { id, label }
     }
 
+    fn confirm_quit() -> Self {
+        Self::ConfirmQuit
+    }
+
     fn editor(&self) -> Option<&LineEditor> {
         match self {
             Self::Filter { editor, .. }
             | Self::Rename { editor }
             | Self::Search { editor, .. }
             | Self::BookmarkName { editor, .. } => Some(editor),
-            Self::ConfirmDeleteBookmark { .. } => None,
+            Self::ConfirmDeleteBookmark { .. } | Self::ConfirmQuit => None,
         }
     }
 
@@ -2006,7 +2022,8 @@ impl Dialog {
             | Self::Search { parse_error, .. } => parse_error.as_deref(),
             Self::Rename { .. }
             | Self::BookmarkName { .. }
-            | Self::ConfirmDeleteBookmark { .. } => None,
+            | Self::ConfirmDeleteBookmark { .. }
+            | Self::ConfirmQuit => None,
         }
     }
 
@@ -2031,6 +2048,9 @@ impl Dialog {
                     "Delete bookmark {label}? (Esc cancel · Enter \
                      confirm)"
                 )
+            }
+            Self::ConfirmQuit => {
+                "Quit? (Esc cancel · Enter confirm)".to_string()
             }
         }
     }
@@ -2078,10 +2098,12 @@ impl Dialog {
             | Self::Rename { editor }
             | Self::Search { editor, .. }
             | Self::BookmarkName { editor, .. } => editor.handle_edit(key),
-            // Confirmation dialog has no editor; non-Esc/Enter keys are
-            // dropped on the floor so a stray `j`/`q` doesn't fall
+            // Confirmation dialogs have no editor; non-Esc/Enter keys
+            // are dropped on the floor so a stray `j`/`q` doesn't fall
             // through to the underlying tab.
-            Self::ConfirmDeleteBookmark { .. } => return DialogResult::Stay,
+            Self::ConfirmDeleteBookmark { .. } | Self::ConfirmQuit => {
+                return DialogResult::Stay;
+            }
         };
         if let EditAction::Handled = editor_result {
             self.reparse_filter();
@@ -2143,6 +2165,7 @@ impl Dialog {
             Self::ConfirmDeleteBookmark { id, .. } => {
                 DialogResult::ApplyDeleteBookmark(*id)
             }
+            Self::ConfirmQuit => DialogResult::ApplyQuit,
         }
     }
 }
@@ -2256,8 +2279,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     if app.bookmarks_active() {
         render_bookmarks_pane(frame, app, content_area);
         render_bookmarks_footer(frame, app, bottom_area);
-        if let Some(d @ Dialog::ConfirmDeleteBookmark { .. }) =
-            app.dialog.as_ref()
+        if let Some(
+            d @ (Dialog::ConfirmDeleteBookmark { .. } | Dialog::ConfirmQuit),
+        ) = app.dialog.as_ref()
         {
             render_dialog(frame, d, area);
         }
@@ -2373,13 +2397,14 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Centered popups (Filter, Rename, BookmarkName,
-    // ConfirmDeleteBookmark) draw on top of the rest.  The Search
-    // prompt is laid out inline above and is skipped here.
+    // ConfirmDeleteBookmark, ConfirmQuit) draw on top of the rest.
+    // The Search prompt is laid out inline above and is skipped here.
     if let Some(
         dialog @ (Dialog::Filter { .. }
         | Dialog::Rename { .. }
         | Dialog::BookmarkName { .. }
-        | Dialog::ConfirmDeleteBookmark { .. }),
+        | Dialog::ConfirmDeleteBookmark { .. }
+        | Dialog::ConfirmQuit),
     ) = app.dialog.as_ref()
     {
         render_dialog(frame, dialog, area);
@@ -2528,8 +2553,9 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
 ///
 /// Variants with an editor (Filter/Rename/Search/BookmarkName) render
 /// their text and cursor on the first row; Filter/Search additionally
-/// render any parse error in red below.  ConfirmDeleteBookmark has no
-/// editor and shows only the question encoded in its title.
+/// render any parse error in red below.  ConfirmDeleteBookmark and
+/// ConfirmQuit have no editor and show only the question encoded in
+/// their title.
 fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     let popup = popup_area(area, 70, 5);
     // Clear the underlying rows so the editor isn't drawn on top of
@@ -2628,24 +2654,58 @@ mod tests {
     // ---------- top-level (no dialog) ----------
 
     #[test]
-    fn q_quits() {
+    fn q_opens_quit_confirmation() {
         let mut a = app(10, 5);
         a.handle_key(key(KeyCode::Char('q')));
-        assert!(a.quit);
+        assert!(!a.quit);
+        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
     }
 
     #[test]
-    fn esc_quits() {
+    fn esc_opens_quit_confirmation() {
         let mut a = app(10, 5);
         a.handle_key(key(KeyCode::Esc));
-        assert!(a.quit);
+        assert!(!a.quit);
+        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
     }
 
     #[test]
-    fn ctrl_c_quits() {
+    fn ctrl_c_opens_quit_confirmation() {
         let mut a = app(10, 5);
         a.handle_key(ctrl('c'));
+        assert!(!a.quit);
+        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
+    }
+
+    #[test]
+    fn quit_confirmation_enter_quits() {
+        let mut a = app(10, 5);
+        a.handle_key(key(KeyCode::Char('q')));
+        a.handle_key(key(KeyCode::Enter));
         assert!(a.quit);
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn quit_confirmation_esc_cancels() {
+        let mut a = app(10, 5);
+        a.handle_key(key(KeyCode::Char('q')));
+        a.handle_key(key(KeyCode::Esc));
+        assert!(!a.quit);
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn quit_confirmation_drops_other_keys() {
+        // Inside the confirm dialog, stray keys must not fall through
+        // to scroll the underlying tab or quit unilaterally.
+        let mut a = app(10, 5);
+        a.handle_key(key(KeyCode::Char('q')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(!a.quit);
+        assert_eq!(a.active_tab().viewport_top, 0);
+        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
     }
 
     // ---------- scrolling ----------
@@ -2758,6 +2818,7 @@ mod tests {
         k.kind = KeyEventKind::Release;
         a.handle_key(k);
         assert!(!a.quit);
+        assert!(a.dialog.is_none());
     }
 
     // ---------- top-level rendering ----------
