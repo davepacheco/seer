@@ -166,8 +166,21 @@ expected records.
 3. Engine merge maintaining per-source lookahead and lookbehind buffers, with
    a forward/backward step API for the TUI.
 4. Wire the TUI to query only its visible window plus a small over-fetch
-   buffer in each direction.
-5. Bookmarks as `(log_stream_id, cursor)`.
+   buffer in each direction.  The `Tab` gains a `StreamView` that owns the
+   bounded window; scroll/`g`/`G` slide it.  Search, `<`/`>`, and bookmark
+   navigation continue to scan the materialized cache as a transitional
+   step — they work correctly within the window but don't extend lazily
+   across its edges yet.
+5. Replumb the App's `apply_search` / `step_search`, `advance_time`, and
+   bookmark-navigation handlers through `StreamView::search_step`,
+   `advance_time`, and `seek_to_cursor` so they walk the engine lazily and
+   slide the window as needed.  Mechanical follow-up to step 4; the
+   `StreamView` methods already exist.
+6. Bookmarks as `(log_stream_id, cursor)`.  Replaces the
+   `LogStreamPosition` (source, time, ordinal) anchor with a byte cursor;
+   this also removes the window-relative-ordinal caveat from step 4's
+   `materialize_streamview` and makes bookmark resolve `O(1)` (just
+   `seek_to_cursor`) instead of `O(walk-from-start)`.
 
 ## Deferred
 

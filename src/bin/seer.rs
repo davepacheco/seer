@@ -30,8 +30,9 @@ use seer::SourceId;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
     LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
-    SummaryBuilder, format_event, format_summary,
+    StreamView, SummaryBuilder, format_summary,
 };
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -117,46 +118,87 @@ struct ParseStats {
     elapsed: Duration,
 }
 
+/// Default viewport height used when constructing a [`Tab`] before
+/// the actual terminal size is known.  The first render call replaces
+/// this with the real height via [`Tab::maintain_window`].  Set high
+/// enough to fill any reasonable terminal so the initial fetch covers
+/// the visible area; the streamview will extend further if needed.
+const INITIAL_VIEWPORT_HEIGHT: u16 = 80;
+
+/// Builds a Stream-tab's initial render state by populating a
+/// [`StreamView`] window and materializing it.
+///
+/// Returned [`StreamView`] is owned by the calling [`Tab`] so
+/// subsequent navigation (scroll past window edge, `G`, search) can
+/// slide it without re-walking the whole file.  [`RenderedRows`]
+/// reflects the StreamView's current window and is rebuilt on every
+/// slide via [`materialize_streamview`].
 fn render_rows(
     engine: &Engine,
     filter: &Filter,
     show_extras: bool,
-) -> RenderedRows {
+    viewport_height: u16,
+) -> (StreamView, RenderedRows) {
+    let mut view = StreamView::new(filter.clone(), show_extras);
+    view.ensure_window(engine, viewport_height);
+    let rows = materialize_streamview(&view);
+    (view, rows)
+}
+
+/// Translates a [`StreamView`]'s current window into the flat
+/// [`RenderedRows`] shape that the Tab/render pipeline expects.
+///
+/// Walks the cached records once, cloning their pre-formatted display
+/// lines into a single flat vector and accumulating the line/record
+/// index maps.  Computes a [`LogStreamPosition`] per `Ok` event by
+/// counting same-`(source, time)` records seen so far in the window;
+/// the ordinal is window-relative — accurate for filter-change starts
+/// (where the window begins at byte 0), best-effort otherwise.  Step 5
+/// switches bookmarks to byte cursors and removes this dependence on
+/// ordinals.
+fn materialize_streamview(view: &StreamView) -> RenderedRows {
     let mut events = Vec::new();
     let mut formatted = Vec::new();
     let mut event_for_line = Vec::new();
     let mut first_line_for_event = Vec::new();
-    let started = Instant::now();
-    let mut stream = engine.query_events(filter);
-    // `by_ref` keeps `stream` alive past the loop so we can read the
-    // final stats off it instead of plumbing them through the iterator
-    // chain.
-    for r in stream.by_ref() {
+    let mut ordinals: HashMap<
+        (seer::SourceId, chrono::DateTime<chrono::Utc>),
+        u64,
+    > = HashMap::new();
+    for (record, lines) in view.records() {
         let event_idx = events.len();
         first_line_for_event.push(formatted.len());
-        match r {
-            Ok(ee) => {
-                let lines = format_event(&ee.event, show_extras);
+        match &record.event {
+            Ok(event) => {
+                let key = (record.source_id.clone(), event.time);
+                let ordinal = *ordinals.entry(key.clone()).or_insert(0);
+                ordinals.insert(key, ordinal + 1);
+                let position = LogStreamPosition::new(
+                    record.source_id.clone(),
+                    event.time,
+                    ordinal,
+                );
                 for line in lines {
-                    formatted.push(line);
+                    formatted.push(line.clone());
                     event_for_line.push(event_idx);
                 }
-                events.push(Some(ee));
+                events.push(Some(EngineEvent {
+                    position,
+                    event: event.clone(),
+                }));
             }
             Err(err) => {
-                // SourceError's Display already says "I/O error: ...",
-                // "failed to parse ...", or "warning: ..." as
-                // appropriate; don't add another prefix.
                 formatted.push(err.to_string());
                 event_for_line.push(event_idx);
                 events.push(None);
             }
         }
     }
+    let stats = view.parse_stats();
     let parse_stats = ParseStats {
-        records: stream.records_parsed(),
-        bytes: stream.bytes_read(),
-        elapsed: started.elapsed(),
+        records: stats.records,
+        bytes: stats.bytes,
+        elapsed: stats.elapsed,
     };
     RenderedRows {
         events,
@@ -355,6 +397,14 @@ struct Tab {
     /// view; [`TabKind::Summary`] renders a field/time histogram (and
     /// leaves the per-record vectors empty).
     kind: TabKind,
+    /// For [`TabKind::Stream`]: the lazy windowed source.  Slides as
+    /// the user scrolls past the window's edges; survives filter
+    /// changes (resets to the top) and `show_extras` toggles
+    /// (reformats in place).  `None` for [`TabKind::Summary`] (which
+    /// keeps the existing full-pass render) and for test-only tabs
+    /// constructed via [`App::with_rows`] / [`App::with_events`] that
+    /// bypass the engine.
+    streamview: Option<StreamView>,
     events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
     /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
@@ -431,14 +481,23 @@ impl Tab {
         filter: &Filter,
         show_extras: bool,
     ) -> Self {
-        let rendered = match kind {
-            TabKind::Stream => render_rows(engine, filter, show_extras),
-            TabKind::Summary => render_summary_rows(engine, filter),
+        let (streamview, rendered) = match kind {
+            TabKind::Stream => {
+                let (view, rows) = render_rows(
+                    engine,
+                    filter,
+                    show_extras,
+                    INITIAL_VIEWPORT_HEIGHT,
+                );
+                (Some(view), rows)
+            }
+            TabKind::Summary => (None, render_summary_rows(engine, filter)),
         };
         Self {
             name,
             stream,
             kind,
+            streamview,
             events: rendered.events,
             formatted: rendered.formatted,
             event_for_line: rendered.event_for_line,
@@ -456,7 +515,16 @@ impl Tab {
     /// mutated.
     fn refresh(&mut self, engine: &Engine, filter: &Filter, show_extras: bool) {
         let rendered = match self.kind {
-            TabKind::Stream => render_rows(engine, filter, show_extras),
+            TabKind::Stream => {
+                let (view, rows) = render_rows(
+                    engine,
+                    filter,
+                    show_extras,
+                    INITIAL_VIEWPORT_HEIGHT,
+                );
+                self.streamview = Some(view);
+                rows
+            }
             TabKind::Summary => render_summary_rows(engine, filter),
         };
         self.events = rendered.events;
@@ -484,7 +552,21 @@ impl Tab {
     ) {
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
         let rendered = match self.kind {
-            TabKind::Stream => render_rows(engine, filter, show_extras),
+            TabKind::Stream => {
+                if let Some(view) = self.streamview.as_mut() {
+                    view.set_show_extras(show_extras);
+                    materialize_streamview(view)
+                } else {
+                    let (view, rows) = render_rows(
+                        engine,
+                        filter,
+                        show_extras,
+                        INITIAL_VIEWPORT_HEIGHT,
+                    );
+                    self.streamview = Some(view);
+                    rows
+                }
+            }
             TabKind::Summary => render_summary_rows(engine, filter),
         };
         self.events = rendered.events;
@@ -496,6 +578,86 @@ impl Tab {
             .and_then(|i| self.first_line_for_event.get(i).copied())
             .unwrap_or(0);
         self.search = None;
+    }
+
+    /// Slides the lazy window so it covers `viewport_top + viewport_height`
+    /// plus a small over-fetch buffer in each direction; re-materializes
+    /// the cached vectors and re-anchors `viewport_top` to the same
+    /// record/line.
+    ///
+    /// Called by the App after each scroll/jump so the user can keep
+    /// navigating past the initially-fetched window.  No-op for tabs
+    /// without a [`StreamView`] (Summary tabs and test fixtures).
+    fn maintain_window(
+        &mut self,
+        engine: &Engine,
+        viewport_height: u16,
+    ) {
+        let Some(view) = self.streamview.as_mut() else {
+            return;
+        };
+        // Snap the streamview's anchor to the user's current viewport
+        // top so subsequent extension targets the right region.
+        view.set_anchor_to_flat_line(self.viewport_top);
+        view.ensure_window(engine, viewport_height);
+        let rendered = materialize_streamview(view);
+        self.events = rendered.events;
+        self.formatted = rendered.formatted;
+        self.event_for_line = rendered.event_for_line;
+        self.first_line_for_event = rendered.first_line_for_event;
+        self.parse_stats = rendered.parse_stats;
+        self.viewport_top = view.anchor_flat_line();
+    }
+
+    /// Resets the viewport to the start of the merged stream and
+    /// rebuilds the materialized cache.  Falls back to plain
+    /// `viewport_top = 0` for tabs without a [`StreamView`] (test
+    /// fixtures and Summary tabs).
+    fn seek_to_start(
+        &mut self,
+        engine: &Engine,
+        viewport_height: u16,
+    ) {
+        let Some(view) = self.streamview.as_mut() else {
+            self.viewport_top = 0;
+            return;
+        };
+        view.seek_to_start(engine, viewport_height);
+        let rendered = materialize_streamview(view);
+        self.events = rendered.events;
+        self.formatted = rendered.formatted;
+        self.event_for_line = rendered.event_for_line;
+        self.first_line_for_event = rendered.first_line_for_event;
+        self.parse_stats = rendered.parse_stats;
+        self.viewport_top = 0;
+    }
+
+    /// Resets the viewport to the end of the merged stream and rebuilds
+    /// the materialized cache.  Falls back to `viewport_top = max_top`
+    /// for tabs without a [`StreamView`].
+    fn seek_to_end(
+        &mut self,
+        engine: &Engine,
+        viewport_height: u16,
+    ) -> std::io::Result<()> {
+        let Some(view) = self.streamview.as_mut() else {
+            self.viewport_top = self.max_top(viewport_height);
+            return Ok(());
+        };
+        view.seek_to_end(engine, viewport_height)?;
+        let anchor = view.anchor_flat_line();
+        let rendered = materialize_streamview(view);
+        self.events = rendered.events;
+        self.formatted = rendered.formatted;
+        self.event_for_line = rendered.event_for_line;
+        self.first_line_for_event = rendered.first_line_for_event;
+        self.parse_stats = rendered.parse_stats;
+        // After seek_to_end, anchor sits on the last record's last
+        // line; align the viewport so that line is at the bottom of
+        // the screen, matching the existing G/End behavior.
+        let max = self.max_top(viewport_height);
+        self.viewport_top = anchor.min(max);
+        Ok(())
     }
 
     /// Last *display line* index belonging to record `event_idx`,
@@ -821,6 +983,31 @@ impl App {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// Slides the active tab's lazy window so it covers the new
+    /// viewport position, fetching from the engine if the user
+    /// scrolled past the cached records' edge.  Called after every
+    /// scroll/jump; a no-op for tabs without a [`StreamView`].
+    fn maintain_active_window(&mut self) {
+        let h = self.viewport_height;
+        let active = self.active;
+        // Splitting the borrow: self.tabs[active] is mutable, &self.engine
+        // is shared; both fields of `self` so we go through field-level
+        // access rather than helper methods to keep the borrow checker
+        // happy.
+        self.tabs[active].maintain_window(&self.engine, h);
+    }
+
+    /// Resets the active tab to the end of the merged stream.  Errors
+    /// from `Source::byte_len()` (used to compute the end-of-file
+    /// cursor) surface as a notice; the prior viewport is unchanged.
+    fn seek_active_to_end(&mut self) {
+        let h = self.viewport_height;
+        let active = self.active;
+        if let Err(e) = self.tabs[active].seek_to_end(&self.engine, h) {
+            self.notice = Some(format!("seek_to_end failed: {e}"));
+        }
     }
 
     /// True iff the synthetic Bookmarks tab is the currently active
@@ -1478,6 +1665,11 @@ impl App {
             name: format!("Tab {}", a.next_tab_number),
             stream: stream_id,
             kind: TabKind::Stream,
+            // Test fixtures bypass the engine; no streamview to feed
+            // off.  `Tab::maintain_window` and the seek helpers are
+            // no-ops in this case so the materialized vecs above stay
+            // authoritative.
+            streamview: None,
             events: engine_events,
             formatted,
             event_for_line,
@@ -1594,6 +1786,7 @@ impl App {
             } => {
                 let h = self.viewport_height;
                 self.active_tab_mut().scroll_down(1, h);
+                self.maintain_active_window();
             }
             KeyEvent {
                 code: KeyCode::Char('k') | KeyCode::Up,
@@ -1601,6 +1794,7 @@ impl App {
                 ..
             } => {
                 self.active_tab_mut().scroll_up(1);
+                self.maintain_active_window();
             }
             KeyEvent {
                 code: KeyCode::Char('d'),
@@ -1609,6 +1803,7 @@ impl App {
             } => {
                 let h = self.viewport_height;
                 self.active_tab_mut().scroll_down(half_page, h);
+                self.maintain_active_window();
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
@@ -1617,6 +1812,7 @@ impl App {
             } => {
                 let h = self.viewport_height;
                 self.active_tab_mut().scroll_down(page, h);
+                self.maintain_active_window();
             }
             KeyEvent {
                 code: KeyCode::Char('u'),
@@ -1624,13 +1820,16 @@ impl App {
                 ..
             } => {
                 self.active_tab_mut().scroll_up(half_page);
+                self.maintain_active_window();
             }
             KeyEvent {
                 code: KeyCode::Char('g') | KeyCode::Home,
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.active_tab_mut().viewport_top = 0;
+                let h = self.viewport_height;
+                let active = self.active;
+                self.tabs[active].seek_to_start(&self.engine, h);
             }
             // Different terminals report `G` with NONE or SHIFT; accept
             // both.  Don't accept CONTROL/ALT — those are unrelated
@@ -1639,16 +1838,14 @@ impl App {
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                let max = self.active_tab().max_top(self.viewport_height);
-                self.active_tab_mut().viewport_top = max;
+                self.seek_active_to_end();
             }
             KeyEvent {
                 code: KeyCode::End,
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                let max = self.active_tab().max_top(self.viewport_height);
-                self.active_tab_mut().viewport_top = max;
+                self.seek_active_to_end();
             }
             KeyEvent {
                 code: KeyCode::Char('f'),

@@ -13,7 +13,7 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::source::{FileSource, Source, SourceError, SourceId};
+use crate::source::{ByteOffset, FileSource, Source, SourceError, SourceId};
 use crate::stream::LogStreamPosition;
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
@@ -80,6 +80,94 @@ impl Engine {
             .map(|s| s.as_ref())
             .collect();
         Stepper::new(sources, filter, cursor)
+    }
+
+    /// Returns a [`Cursor`] positioned at end-of-file for every source
+    /// the engine knows about (regardless of whether `filter` accepts
+    /// the source — the cursor includes all sources so it survives
+    /// later filter changes).  Suitable for "jump to end" navigation:
+    /// `engine.stepper(filter, &cursor)`'s `step_forward` returns
+    /// `None`, while `step_backward` walks the merged stream in
+    /// reverse from the latest event.
+    pub fn cursor_at_end(&self) -> std::io::Result<Cursor> {
+        let mut cursor = Cursor::new();
+        for s in &self.sources {
+            cursor.set(s.id().clone(), s.byte_len()?.into());
+        }
+        Ok(cursor)
+    }
+
+    /// Walks the unfiltered merge to find the event at `position` and
+    /// returns a [`Cursor`] just past that event — i.e., a cursor
+    /// such that `engine.stepper(filter, &cursor)`'s next `step_forward`
+    /// returns the event *after* `position` (or `step_backward` returns
+    /// `position`'s event itself).
+    ///
+    /// Returns `None` when `position`'s source isn't attached to this
+    /// engine, or when no event in that source matches the position's
+    /// time/ordinal pair.  Does not consult `filter`: bookmark
+    /// resolution must work even when the active filter excludes the
+    /// bookmarked event.
+    pub fn cursor_for_position(
+        &self,
+        position: &LogStreamPosition,
+    ) -> Option<Cursor> {
+        if !self.sources.iter().any(|s| s.id() == position.source()) {
+            return None;
+        }
+        // Walk the unfiltered merge.  We accumulate per-source offsets
+        // in a cursor as we see each event; when we hit the anchor, the
+        // cursor is "just before" it, so we update it once more to land
+        // just past the anchor and return.
+        let mut cursor = Cursor::new();
+        for s in &self.sources {
+            cursor.set(s.id().clone(), ByteOffset::ZERO);
+        }
+        let unfiltered = Filter::default();
+        let stepper_sources: Vec<&dyn Source> =
+            self.sources.iter().map(|s| s.as_ref()).collect();
+        let mut stepper =
+            Stepper::new(stepper_sources, unfiltered, &Cursor::new());
+        while let Some(rec) = stepper.step_forward() {
+            let Ok(event) = rec.event else { continue };
+            cursor.set(
+                rec.source_id.clone(),
+                ByteOffset::from(rec.offset.get() + rec.length),
+            );
+            if rec.source_id == *position.source()
+                && event.time == position.time()
+            {
+                // Walk same-time events with this source until we
+                // reach the requested ordinal.  `LogStreamPosition`
+                // ordinals reset to 0 on time change and increment on
+                // each same-time event from that source.
+                let mut ordinal_seen: u64 = 0;
+                if ordinal_seen == position.ordinal_within_time() {
+                    return Some(cursor);
+                }
+                ordinal_seen += 1;
+                while let Some(next) = stepper.step_forward() {
+                    let Ok(ev) = next.event else { continue };
+                    if next.source_id != *position.source()
+                        || ev.time != position.time()
+                    {
+                        // We walked off the same-time/source group
+                        // without finding the requested ordinal.
+                        return None;
+                    }
+                    cursor.set(
+                        next.source_id.clone(),
+                        ByteOffset::from(next.offset.get() + next.length),
+                    );
+                    if ordinal_seen == position.ordinal_within_time() {
+                        return Some(cursor);
+                    }
+                    ordinal_seen += 1;
+                }
+                return None;
+            }
+        }
+        None
     }
 
     /// Returns an iterator over every event in every source that
@@ -1061,6 +1149,107 @@ mod tests {
             engine.resolve_position(&Filter::default(), &first),
             ResolvePosition::Found(0),
         );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_at_end_positions_past_eof_for_every_source() {
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        append_bunyan_at(&a, "x", t(10), "a1");
+        append_bunyan_at(&b, "x", t(20), "b1");
+        let len_a = std::fs::metadata(&a).unwrap().len();
+        let len_b = std::fs::metadata(&b).unwrap().len();
+
+        let mut engine = Engine::new();
+        let id_a = engine.add_file_source(&a).unwrap();
+        let id_b = engine.add_file_source(&b).unwrap();
+        let cursor = engine.cursor_at_end().unwrap();
+        assert_eq!(cursor.get(&id_a), Some(ByteOffset::from(len_a)));
+        assert_eq!(cursor.get(&id_b), Some(ByteOffset::from(len_b)));
+
+        // A stepper at this cursor walks backward through the events
+        // in reverse time order and returns nothing on forward.
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        assert!(stepper.step_forward().is_none());
+        let r1 = stepper.step_backward().unwrap();
+        assert_eq!(r1.event.unwrap().msg, "b1");
+        let r2 = stepper.step_backward().unwrap();
+        assert_eq!(r2.event.unwrap().msg, "a1");
+        assert!(stepper.step_backward().is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_for_position_lands_just_past_anchor() {
+        // Build a multi-source fixture, anchor on a specific event,
+        // and confirm the resulting cursor walks forward to the
+        // anchor's successor in the merged stream.
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        append_bunyan_at(&a, "x", t(10), "a1");
+        append_bunyan_at(&a, "x", t(30), "a2");
+        append_bunyan_at(&b, "x", t(20), "b1");
+        append_bunyan_at(&b, "x", t(40), "b2");
+
+        let mut engine = Engine::new();
+        engine.add_file_source(&a).unwrap();
+        engine.add_file_source(&b).unwrap();
+        // Merge order: a1(10), b1(20), a2(30), b2(40).  Anchor on b1.
+        let anchor = nth_position(&engine, 1);
+        let cursor = engine.cursor_for_position(&anchor).unwrap();
+        // step_backward from this cursor must return b1; step_forward
+        // must return a2.
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        let back = stepper.step_backward().unwrap();
+        assert_eq!(back.event.unwrap().msg, "b1");
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        let fwd = stepper.step_forward().unwrap();
+        assert_eq!(fwd.event.unwrap().msg, "a2");
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_for_position_distinguishes_same_time_ordinals() {
+        // Two same-time events from one source.  cursor_for_position
+        // should land just past the requested ordinal, not the first.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        append_bunyan_at(&p, "x", t(10), "b");
+        append_bunyan_at(&p, "x", t(20), "c");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        let pos_b = nth_position(&engine, 1);
+        let cursor = engine.cursor_for_position(&pos_b).unwrap();
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        // Forward: c (skipping a, b which are behind).
+        assert_eq!(
+            stepper.step_forward().unwrap().event.unwrap().msg,
+            "c",
+        );
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        // Backward: b.
+        assert_eq!(
+            stepper.step_backward().unwrap().event.unwrap().msg,
+            "b",
+        );
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_for_position_returns_none_for_unattached_source() {
+        // The bookmark's source isn't attached to this engine.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        let mut engine_a = Engine::new();
+        engine_a.add_file_source(&p).unwrap();
+        let anchor = nth_position(&engine_a, 0);
+        let engine_b = Engine::new();
+        assert!(engine_b.cursor_for_position(&anchor).is_none());
         dir.cleanup();
     }
 }

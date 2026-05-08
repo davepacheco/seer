@@ -210,6 +210,15 @@ pub trait Source {
         count: usize,
         filter: &Filter,
     ) -> std::io::Result<Vec<QueryRecord>>;
+
+    /// Returns this source's current size in bytes.
+    ///
+    /// Used by callers that want to position a [`ByteOffset`] cursor
+    /// past the last record (e.g. for "jump to end" navigation).  The
+    /// engine's `Stepper` accepts a cursor whose offsets exceed the
+    /// file size — backward queries clamp internally — so this is
+    /// purely a convenience for synthesizing such a cursor.
+    fn byte_len(&self) -> std::io::Result<u64>;
 }
 
 /// Coarse-grained facts about a source's content, derived from its
@@ -351,6 +360,10 @@ impl Source for FileSource {
                 Err(e) => Some((0, Err(e.into()))),
             }
         }))
+    }
+
+    fn byte_len(&self) -> std::io::Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
     }
 
     fn query(

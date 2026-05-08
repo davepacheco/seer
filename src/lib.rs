@@ -11,6 +11,7 @@ pub mod render;
 pub mod session;
 pub mod source;
 pub mod stream;
+pub mod streamview;
 pub mod summary;
 
 #[cfg(test)]
@@ -31,6 +32,10 @@ pub use source::{
     SourceId, SourceMetadata,
 };
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
+pub use streamview::{
+    ParseStats as StreamViewParseStats, RecordKey, RenderedLine, SearchDir,
+    SearchOutcome, StreamView,
+};
 pub use summary::{
     FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,
     summarize,

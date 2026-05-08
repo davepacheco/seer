@@ -80,6 +80,12 @@ impl Cursor {
         self.offsets.get(source_id).copied()
     }
 
+    /// Sets the byte offset for `source_id`, overwriting any previous
+    /// entry.
+    pub fn set(&mut self, source_id: SourceId, offset: ByteOffset) {
+        self.offsets.insert(source_id, offset);
+    }
+
     /// Iterates over (source id, byte offset) pairs in ascending source
     /// id order.
     pub fn iter(&self) -> impl Iterator<Item = (&SourceId, ByteOffset)> {
@@ -994,6 +1000,9 @@ mod tests {
         ) -> std::io::Result<Vec<QueryRecord>> {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.inner.query(offset, direction, count, filter)
+        }
+        fn byte_len(&self) -> std::io::Result<u64> {
+            self.inner.byte_len()
         }
     }
 }
