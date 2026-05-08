@@ -220,9 +220,7 @@ Most Rust files should have a Rustdoc comment for the file.
 
 When we process each log, keep track of distinct top-level JSON field names.  Keep only the top 10.
 
-Let's add a summary view.  If the user hits `S` in the main view, a dialog pops up that lists the different available fields.  The user selects one.  Then the dialog shows the top N values for that field, whatever N fits in the box.  Alongside the values, print a little histogram.
-
-Imagine something like this:
+Let's add a new *kind* of tab, called a summary.  If the user hits `S` in the main view, a new tab is opened, starting with the filter dialog like usual.  But instead of displaying individual records, it displays summary stats.  For each of the top 10 fields (unioned across all sources), draw a histogram showing the top N distinct values, along with a histogram.  Here's inspiration, though I'd rather you put the most common values up top.
 
 ```
               key  ------------- Distribution ------------- count
@@ -263,7 +261,9 @@ Imagine something like this:
             lstat |████████████▍                            8754
 ```
 
-"Time" should be treated specially.  Summary by time should show the count of log entries for each distinct minute in the log file.  This should similarly show a histogram.
+"Time" should be treated specially.  Take the whole time range represented by the log file and figure out which of these intervals would produce about 30 buckets: 1m, 1h, 1d.  Then create buckets with that interval size and show the count of records in each bucket (again, with a histogram).
+
+Make sure there are comprehensive tests for the accuracy of this display.
 
 ### "Create filter" dialog
 

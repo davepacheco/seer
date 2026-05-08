@@ -11,6 +11,7 @@ pub mod render;
 pub mod session;
 pub mod source;
 pub mod stream;
+pub mod summary;
 
 #[cfg(test)]
 mod test_util;
@@ -24,3 +25,7 @@ pub use session::{
 };
 pub use source::{FileSource, Source, SourceError, SourceId};
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
+pub use summary::{
+    FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,
+    summarize,
+};

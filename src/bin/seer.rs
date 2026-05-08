@@ -30,7 +30,7 @@ use seer::SourceId;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
     LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
-    format_event,
+    SummaryBuilder, format_event, format_summary,
 };
 use std::time::{Duration, Instant};
 
@@ -50,10 +50,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.add_file_source(path)?;
     }
 
-    let session = load_session();
+    // Sessions are intentionally ephemeral right now: each run starts
+    // with no bookmarks, no saved streams, no resumed tabs.  The TODO
+    // for per-project persistence (canonicalized filename → session
+    // file, with a resume/new-saved/new-ephemeral startup dialog) is
+    // open work; until it lands, persisting state to a single global
+    // file would silently mix bookmarks across unrelated investigations.
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    let mut app = App::new_with_session(engine, session);
+    let mut app = App::new_with_session(engine, Session::new());
     while !app.quit {
         terminal.draw(|frame| render(frame, &mut app))?;
         if event::poll(Duration::from_millis(100))?
@@ -62,68 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.handle_key(key);
         }
     }
-    if let Err(err) = save_session(&app.session) {
-        // Best-effort: failing to persist shouldn't prevent quit.  The
-        // user has already asked to leave; surface the failure on
-        // stderr so they can investigate after the TUI tears down.
-        eprintln!("warning: failed to save session: {err}");
-    }
     Ok(())
-}
-
-/// Path used for the persisted [`Session`].  Returns `None` when
-/// `$HOME` is unset, in which case persistence is silently skipped.
-/// We intentionally don't fall back to `/tmp` or similar; a missing
-/// `$HOME` means we don't know where the user wants their state.
-fn session_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".seer").join("session.json"))
-}
-
-/// Loads the persisted session, falling back to an empty one on any
-/// failure (missing file, unreadable, parse error).  Failures are
-/// surfaced to stderr but never abort startup — bookmarks and (later)
-/// open tabs are nice-to-have, not critical, and a corrupt session
-/// shouldn't lock the user out of the tool.
-fn load_session() -> Session {
-    let Some(path) = session_path() else {
-        return Session::new();
-    };
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Session::new();
-        }
-        Err(err) => {
-            eprintln!("warning: could not read {}: {err}", path.display());
-            return Session::new();
-        }
-    };
-    match serde_json::from_str::<Session>(&contents) {
-        Ok(s) => s,
-        Err(err) => {
-            eprintln!(
-                "warning: ignoring unreadable session file {}: {err}",
-                path.display()
-            );
-            Session::new()
-        }
-    }
-}
-
-/// Writes `session` to [`session_path`] in pretty-printed JSON,
-/// creating the parent directory if needed.  Errors propagate; the
-/// caller decides how to surface them.
-fn save_session(session: &Session) -> std::io::Result<()> {
-    let Some(path) = session_path() else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(session)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, json)
 }
 
 /// Restores the terminal on drop so panics and `?`-returns don't leave
@@ -219,6 +163,44 @@ fn render_rows(
         formatted,
         event_for_line,
         first_line_for_event,
+        parse_stats,
+    }
+}
+
+/// Drives a single pass over `engine` and returns the formatted
+/// histogram lines for a Summary tab.
+///
+/// Shape mirrors [`render_rows`] (the regular log-view query) so a
+/// Summary tab's display path can reuse the [`Tab`] struct's
+/// `formatted`/`viewport_top`/search machinery: from the renderer's
+/// point of view, a Summary tab is just a tab whose `formatted` lines
+/// happen to be histogram rows instead of bunyan headers.  The
+/// `events`/`event_for_line`/`first_line_for_event` vectors are left
+/// empty since there are no underlying records — selection-mode and
+/// bookmark actions naturally no-op on an empty events vec.
+fn render_summary_rows(engine: &Engine, filter: &Filter) -> RenderedRows {
+    let started = Instant::now();
+    let mut stream = engine.query_events(filter);
+    let mut builder = SummaryBuilder::default();
+    // `by_ref` so we can read `records_parsed`/`bytes_read` after the
+    // loop without consuming the iterator.  `flatten` skips the
+    // per-line `Err` items (parse errors and out-of-order warnings):
+    // the summary describes only what was successfully parsed.
+    for ee in stream.by_ref().flatten() {
+        builder.observe(ee.position.source(), &ee.event);
+    }
+    let summary = builder.finish();
+    let formatted = format_summary(&summary);
+    let parse_stats = ParseStats {
+        records: stream.records_parsed(),
+        bytes: stream.bytes_read(),
+        elapsed: started.elapsed(),
+    };
+    RenderedRows {
+        events: Vec::new(),
+        formatted,
+        event_for_line: Vec::new(),
+        first_line_for_event: Vec::new(),
         parse_stats,
     }
 }
@@ -369,6 +351,10 @@ struct Tab {
     /// the filter and other persisted configuration; the display tab
     /// holds the transient render state.
     stream: LogStreamId,
+    /// What this tab displays.  [`TabKind::Stream`] is the regular log
+    /// view; [`TabKind::Summary`] renders a field/time histogram (and
+    /// leaves the per-record vectors empty).
+    kind: TabKind,
     events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
     /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
@@ -400,6 +386,19 @@ struct Tab {
     parse_stats: ParseStats,
 }
 
+/// What kind of view a [`Tab`] presents.  Today this is binary
+/// (records vs. histogram); when more kinds land we can fold per-kind
+/// state into the variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabKind {
+    /// One row per log record.  `events` and the line/event index
+    /// vectors are populated; selection and bookmark actions apply.
+    Stream,
+    /// Histogram summary of the active filter's events.  `events` is
+    /// empty; `formatted` holds the rendered histogram rows.
+    Summary,
+}
+
 /// What a select-mode commit will do.
 ///
 /// `x` → exclude (build `msg != <selected>`); `X` → include (build
@@ -426,15 +425,20 @@ struct Selection {
 impl Tab {
     fn new(
         name: String,
+        kind: TabKind,
         engine: &Engine,
         stream: LogStreamId,
         filter: &Filter,
         show_extras: bool,
     ) -> Self {
-        let rendered = render_rows(engine, filter, show_extras);
+        let rendered = match kind {
+            TabKind::Stream => render_rows(engine, filter, show_extras),
+            TabKind::Summary => render_summary_rows(engine, filter),
+        };
         Self {
             name,
             stream,
+            kind,
             events: rendered.events,
             formatted: rendered.formatted,
             event_for_line: rendered.event_for_line,
@@ -451,7 +455,10 @@ impl Tab {
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
     fn refresh(&mut self, engine: &Engine, filter: &Filter, show_extras: bool) {
-        let rendered = render_rows(engine, filter, show_extras);
+        let rendered = match self.kind {
+            TabKind::Stream => render_rows(engine, filter, show_extras),
+            TabKind::Summary => render_summary_rows(engine, filter),
+        };
         self.events = rendered.events;
         self.formatted = rendered.formatted;
         self.event_for_line = rendered.event_for_line;
@@ -476,7 +483,10 @@ impl Tab {
         show_extras: bool,
     ) {
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
-        let rendered = render_rows(engine, filter, show_extras);
+        let rendered = match self.kind {
+            TabKind::Stream => render_rows(engine, filter, show_extras),
+            TabKind::Summary => render_summary_rows(engine, filter),
+        };
         self.events = rendered.events;
         self.formatted = rendered.formatted;
         self.event_for_line = rendered.event_for_line;
@@ -745,16 +755,20 @@ impl App {
             bookmark_cursor: None,
             notice: None,
         };
-        a.push_tab(Filter::default());
+        a.push_tab(TabKind::Stream, Filter::default());
         a
     }
 
     /// Pushes a new tab backed by a fresh [`LogStream`] with the given
     /// filter.  Does *not* open the filter dialog — callers that want
     /// that (e.g. Ctrl-T) do it explicitly after.  Switches focus to
-    /// the new tab.
-    fn push_tab(&mut self, filter: Filter) {
-        let name = format!("Tab {}", self.next_tab_number);
+    /// the new tab.  `kind` decides whether the new tab is a regular
+    /// stream view or a Summary histogram.
+    fn push_tab(&mut self, kind: TabKind, filter: Filter) {
+        let name = match kind {
+            TabKind::Stream => format!("Tab {}", self.next_tab_number),
+            TabKind::Summary => format!("Summary {}", self.next_tab_number),
+        };
         self.next_tab_number += 1;
         let mut stream = LogStream::new(name.clone());
         stream.filter = filter;
@@ -766,6 +780,7 @@ impl App {
         let stream = self.session.streams.get(&stream_id).unwrap();
         let tab = Tab::new(
             name,
+            kind,
             &self.engine,
             stream_id,
             &stream.filter,
@@ -790,6 +805,7 @@ impl App {
             .expect("caller verified the stream exists");
         let tab = Tab::new(
             name,
+            TabKind::Stream,
             &self.engine,
             stream_id,
             &stream.filter,
@@ -1200,7 +1216,7 @@ impl App {
         }
         self.tabs.remove(self.active);
         if self.tabs.is_empty() {
-            self.push_tab(Filter::default());
+            self.push_tab(TabKind::Stream, Filter::default());
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
@@ -1461,6 +1477,7 @@ impl App {
         a.tabs.push(Tab {
             name: format!("Tab {}", a.next_tab_number),
             stream: stream_id,
+            kind: TabKind::Stream,
             events: engine_events,
             formatted,
             event_for_line,
@@ -1731,8 +1748,22 @@ impl App {
                 ..
             } => {
                 let cloned = self.active_filter().clone();
-                self.push_tab(cloned);
+                self.push_tab(TabKind::Stream, cloned);
                 self.dialog = Some(Dialog::filter(self.active_filter()));
+            }
+            // `S`: open a Summary tab over the same filter the user
+            // is already viewing.  Unlike Ctrl-T this does NOT drop
+            // into the filter dialog: the user almost always wants a
+            // histogram of "what I'm looking at right now", so we
+            // skip the prompt and let `f` adjust afterwards.  Some
+            // terminals report `S` with NONE, others with SHIFT;
+            // accept both so the binding is robust across them.
+            KeyEvent { code: KeyCode::Char('S'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                let cloned = self.active_filter().clone();
+                self.push_tab(TabKind::Summary, cloned);
             }
             // Tab cycles forward; Shift-Tab cycles back.  Some
             // terminals send Shift-Tab as `BackTab`, others as `Tab`
@@ -2482,11 +2513,31 @@ fn render(frame: &mut Frame, app: &mut App) {
                         entry_total,
                     ),
                 }
+            } else if tab.kind == TabKind::Summary {
+                // Summary tabs show histogram rows, not records: the
+                // exclude/include/bookmark/time-step keys would all be
+                // no-ops, and `F fields=` toggles extras for events
+                // that this tab doesn't display.  Hide them from the
+                // footer to avoid teaching the user actions that don't
+                // apply.
+                if total == 0 {
+                    "q quit · f filter · / search · ^T new · S summary · \
+                     ^W close · r rename · 0/0"
+                        .to_string()
+                } else {
+                    format!(
+                        "q quit · f filter · / search · ^T new · S summary · \
+                         ^W close · r rename · {}-{} of {}",
+                        top + 1,
+                        bottom,
+                        total,
+                    )
+                }
             } else if total == 0 {
                 format!(
                     "q quit · f filter · F fields={} · / search · \
                      </> step={} · x/X exclude/include · b bookmark · \
-                     ^T new · ^W close · r rename · 0/0",
+                     ^T new · S summary · ^W close · r rename · 0/0",
                     if app.active_show_extras() { "on" } else { "off" },
                     app.current_step_label(),
                 )
@@ -2494,7 +2545,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 format!(
                     "q quit · f filter · F fields={} · / search · \
                      </> step={} · x/X exclude/include · b bookmark · \
-                     ^T new · ^W close · r rename · {}-{} of {}",
+                     ^T new · S summary · ^W close · r rename · {}-{} of {}",
                     if app.active_show_extras() { "on" } else { "off" },
                     app.current_step_label(),
                     top + 1,
@@ -4936,5 +4987,162 @@ mod tests {
         let stream_id = a.tabs[a.active].stream;
         let stream = restored.streams.get(&stream_id).unwrap();
         assert!(!stream.show_extras);
+    }
+
+    // ---------- Summary tab ----------
+
+    #[test]
+    fn shift_s_opens_summary_tab_without_dialog() {
+        // `S` should mint a fresh tab of kind Summary and switch to it
+        // without prompting for a filter — the new tab inherits the
+        // active tab's filter and the user adjusts it afterwards via
+        // `f` if they want to.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+        ]);
+        let initial_tabs = a.tabs.len();
+        a.handle_key(shift('S'));
+        assert_eq!(a.tabs.len(), initial_tabs + 1);
+        assert_eq!(a.active, a.tabs.len() - 1);
+        assert_eq!(a.active_tab().kind, TabKind::Summary);
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn shift_s_inherits_active_filter() {
+        // Set a non-default filter on the current tab; the new
+        // Summary tab should pick that up rather than default.  We
+        // verify by making the filter accept zero events and then
+        // observing that the summary reports zero events.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "alpha", &[]),
+            (20, "beta", &[]),
+        ]);
+        let f: Filter = "msg=alpha".parse().unwrap();
+        a.apply_filter(f.clone());
+        a.handle_key(shift('S'));
+        assert_eq!(a.active_tab().kind, TabKind::Summary);
+        // Inherited filter should leave only the one matching event;
+        // the summary's first line records the count.
+        assert!(
+            a.active_tab().formatted[0].starts_with("Summary: 1 event"),
+            "summary should reflect inherited filter; got {:?}",
+            a.active_tab().formatted.first(),
+        );
+        // And the underlying stream's filter is the same the user had.
+        let stream_id = a.active_tab().stream;
+        let stream_filter = &a.session.streams.get(&stream_id).unwrap().filter;
+        assert_eq!(stream_filter.to_string(), f.to_string());
+    }
+
+    #[test]
+    fn summary_tab_f_opens_filter_dialog() {
+        // After landing on a Summary tab the user can still adjust
+        // the filter via `f`.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(shift('S'));
+        assert!(a.dialog.is_none());
+        a.handle_key(key(KeyCode::Char('f')));
+        assert!(matches!(a.dialog, Some(Dialog::Filter { .. })));
+    }
+
+    #[test]
+    fn bare_s_opens_summary_tab() {
+        // Some terminals report `S` with no SHIFT modifier; the binding
+        // accepts both forms so capital-S is reliable across them.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(key(KeyCode::Char('S')));
+        assert_eq!(a.active_tab().kind, TabKind::Summary);
+    }
+
+    #[test]
+    fn summary_tab_renders_field_and_time_sections() {
+        // Open a summary tab over a multi-record file; the rendered
+        // formatted lines should include the standard section headers
+        // ("Summary:", "== name ...", "== time ...").
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "first", &[]),
+            (30, "second", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        assert!(a.dialog.is_none());
+        assert_eq!(a.active_tab().kind, TabKind::Summary);
+        let lines = &a.active_tab().formatted;
+        assert!(lines.iter().any(|l| l.starts_with("Summary: 3 events")));
+        assert!(lines.iter().any(|l| l.starts_with("== name")));
+        assert!(lines.iter().any(|l| l.starts_with("== msg")));
+        assert!(lines.iter().any(|l| l.starts_with("== time")));
+    }
+
+    #[test]
+    fn summary_tab_filter_apply_re_renders() {
+        // After landing on a Summary tab, the user can open the
+        // filter dialog with `f` and apply a narrower filter; the
+        // histogram should re-render against the new filter.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        // Open the filter dialog with `f`, type a narrowing filter,
+        // and apply.
+        a.handle_key(key(KeyCode::Char('f')));
+        let d = a.dialog.as_mut().unwrap();
+        type_into(d, "msg=second");
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+        let lines = &a.active_tab().formatted;
+        assert!(
+            lines.iter().any(|l| l.starts_with("Summary: 1 event")),
+            "expected one-event summary, got:\n{}",
+            lines.join("\n"),
+        );
+    }
+
+    #[test]
+    fn summary_tab_keeps_select_mode_inactive() {
+        // x/X/b are no-ops on Summary tabs because there are no
+        // underlying records to act on.  A Summary tab whose key
+        // ignores the binding shouldn't suddenly drop into selection
+        // mode and trap the user.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(shift('S'));
+        a.handle_key(key(KeyCode::Char('x')));
+        assert!(a.active_tab().select.is_none());
+        a.handle_key(shift('X'));
+        assert!(a.active_tab().select.is_none());
+        a.handle_key(key(KeyCode::Char('b')));
+        assert!(a.active_tab().select.is_none());
+    }
+
+    #[test]
+    fn summary_tab_footer_omits_record_only_keys() {
+        // Summary tabs hide x/X/b/F/<>/= from the footer because those
+        // bindings either no-op (selection-mode) or operate on event
+        // state the summary view doesn't expose.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(shift('S'));
+        let backend = TestBackend::new(160, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // Summary footer should still mention quit, filter, search, S.
+        assert!(dump.contains("S summary"), "dump:\n{dump}");
+        // ...but not the record-oriented bindings.
+        assert!(!dump.contains("x/X exclude"), "dump:\n{dump}");
+        assert!(!dump.contains("F fields="), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn summary_tab_tab_name_is_summary_n() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(shift('S'));
+        assert!(
+            a.active_tab().name.starts_with("Summary "),
+            "expected `Summary N`, got {:?}",
+            a.active_tab().name,
+        );
     }
 }
