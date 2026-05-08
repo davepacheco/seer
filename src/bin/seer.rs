@@ -32,7 +32,7 @@ use seer::{
     LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
     format_event,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(about = "interactive log explorer")]
@@ -157,6 +157,20 @@ struct RenderedRows {
     formatted: Vec<String>,
     event_for_line: Vec<usize>,
     first_line_for_event: Vec<usize>,
+    parse_stats: ParseStats,
+}
+
+/// Snapshot of one render-driven parse pass: how many records came off
+/// disk, how many bytes those records totaled, and how long the whole
+/// thing took.  Drives the per-tab parse-rate status line.  Counts all
+/// successfully-parsed records, regardless of whether the active
+/// event-level filter accepted them — the user is asking "how fast
+/// did we read and parse?", not "how fast did we render?".
+#[derive(Clone, Debug, Default)]
+struct ParseStats {
+    records: u64,
+    bytes: u64,
+    elapsed: Duration,
 }
 
 fn render_rows(
@@ -168,7 +182,12 @@ fn render_rows(
     let mut formatted = Vec::new();
     let mut event_for_line = Vec::new();
     let mut first_line_for_event = Vec::new();
-    for r in engine.query_events(filter) {
+    let started = Instant::now();
+    let mut stream = engine.query_events(filter);
+    // `by_ref` keeps `stream` alive past the loop so we can read the
+    // final stats off it instead of plumbing them through the iterator
+    // chain.
+    for r in stream.by_ref() {
         let event_idx = events.len();
         first_line_for_event.push(formatted.len());
         match r {
@@ -190,7 +209,81 @@ fn render_rows(
             }
         }
     }
-    RenderedRows { events, formatted, event_for_line, first_line_for_event }
+    let parse_stats = ParseStats {
+        records: stream.records_parsed(),
+        bytes: stream.bytes_read(),
+        elapsed: started.elapsed(),
+    };
+    RenderedRows {
+        events,
+        formatted,
+        event_for_line,
+        first_line_for_event,
+        parse_stats,
+    }
+}
+
+/// Formats a byte count using binary (KiB/MiB/GiB) prefixes.  The 1024
+/// boundary keeps "below 1 KiB" displays as raw bytes (`"512 B"`);
+/// above that we shift to one decimal place since whole-prefix
+/// granularity is too coarse on a screen the user is watching tick by.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b < KIB {
+        format!("{bytes} B")
+    } else if b < MIB {
+        format!("{:.1} KiB", b / KIB)
+    } else if b < GIB {
+        format!("{:.1} MiB", b / MIB)
+    } else {
+        format!("{:.1} GiB", b / GIB)
+    }
+}
+
+/// Bytes-per-second variant of [`format_bytes`].  Floors to a B/sec
+/// whole number under 1 KiB to avoid noisy `"341.0 B/sec"` displays
+/// where the trailing decimal carries no information.
+fn format_byte_rate(bytes_per_sec: f64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    if bytes_per_sec < KIB {
+        format!("{:.0} B/sec", bytes_per_sec)
+    } else if bytes_per_sec < MIB {
+        format!("{:.1} KiB/sec", bytes_per_sec / KIB)
+    } else if bytes_per_sec < GIB {
+        format!("{:.1} MiB/sec", bytes_per_sec / MIB)
+    } else {
+        format!("{:.1} GiB/sec", bytes_per_sec / GIB)
+    }
+}
+
+/// Renders a [`ParseStats`] as the status-line string shown beneath
+/// each tab.  When the parse finished in zero measurable time (empty
+/// engine, all sources excluded by the source-id filter) the rate
+/// half is dropped — it would either divide by zero or be meaningless.
+fn format_parse_stats(stats: &ParseStats) -> String {
+    let secs = stats.elapsed.as_secs_f64();
+    let bytes = format_bytes(stats.bytes);
+    if stats.records == 0 || secs <= 0.0 {
+        return format!(
+            "{} records ({}) parsed in {:.3}s",
+            stats.records, bytes, secs,
+        );
+    }
+    let rps = stats.records as f64 / secs;
+    let bps = stats.bytes as f64 / secs;
+    format!(
+        "{} records ({}) parsed in {:.3}s ({:.1} records/sec, {})",
+        stats.records,
+        bytes,
+        secs,
+        rps,
+        format_byte_rate(bps),
+    )
 }
 
 /// Indices of every row in `rows` containing at least one match for
@@ -300,6 +393,11 @@ struct Tab {
     /// pin a bookmark to a position).  Cleared whenever the rows are
     /// re-queried so the index can't dangle.
     select: Option<Selection>,
+    /// Stats from the most recent parse pass that produced
+    /// `events`/`formatted` — used to render the per-tab status line.
+    /// Refreshed by [`Self::refresh`] / [`Self::rerender`] so users see
+    /// up-to-date numbers after every filter edit.
+    parse_stats: ParseStats,
 }
 
 /// What a select-mode commit will do.
@@ -344,6 +442,7 @@ impl Tab {
             viewport_top: 0,
             search: None,
             select: None,
+            parse_stats: rendered.parse_stats,
         }
     }
 
@@ -357,6 +456,7 @@ impl Tab {
         self.formatted = rendered.formatted;
         self.event_for_line = rendered.event_for_line;
         self.first_line_for_event = rendered.first_line_for_event;
+        self.parse_stats = rendered.parse_stats;
         self.viewport_top = 0;
         self.search = None;
         self.select = None;
@@ -381,6 +481,7 @@ impl Tab {
         self.formatted = rendered.formatted;
         self.event_for_line = rendered.event_for_line;
         self.first_line_for_event = rendered.first_line_for_event;
+        self.parse_stats = rendered.parse_stats;
         self.viewport_top = anchor_event
             .and_then(|i| self.first_line_for_event.get(i).copied())
             .unwrap_or(0);
@@ -1367,6 +1468,7 @@ impl App {
             viewport_top: 0,
             search: None,
             select: None,
+            parse_stats: ParseStats::default(),
         });
         a.next_tab_number += 1;
         a
@@ -2265,12 +2367,17 @@ fn render(frame: &mut Frame, app: &mut App) {
         Some(Dialog::Search { parse_error: Some(_), .. }) => 2,
         _ => 1,
     };
-    let [tabs_area, content_area, bottom_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(bottom_height),
-    ])
-    .areas(area);
+    // Bookmarks pane has no parse activity to report, so we omit the
+    // stats row there and reclaim the row for content.
+    let stats_height: u16 = if app.bookmarks_active() { 0 } else { 1 };
+    let [tabs_area, content_area, stats_area, bottom_area] =
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(stats_height),
+            Constraint::Length(bottom_height),
+        ])
+        .areas(area);
 
     render_tab_bar(frame, app, tabs_area);
 
@@ -2287,6 +2394,9 @@ fn render(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
+
+    let stats_text = format_parse_stats(&app.active_tab().parse_stats);
+    frame.render_widget(Paragraph::new(stats_text), stats_area);
 
     // Re-clamp in case the viewport just shrank past the previous top.
     let max_top = app.active_tab().max_top(app.viewport_height);
@@ -3964,9 +4074,10 @@ mod tests {
 
     #[test]
     fn render_paints_select_highlight() {
-        // Tall enough to fit the tab bar, two content rows, and a
-        // footer.  Selection is on row 1 (the second event).
-        let backend = TestBackend::new(20, 4);
+        // Tall enough to fit the tab bar, two content rows, the parse
+        // stats row, and a footer.  Selection is on row 1 (the second
+        // event).
+        let backend = TestBackend::new(20, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = select_app(3, 2);
         a.handle_key(key(KeyCode::Char('x')));
@@ -3974,7 +4085,8 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let buf = terminal.backend().buffer();
         // Layout: row 0 = tab bar, row 1 = first content row, row 2 =
-        // second content row (the selected one), row 3 = footer.
+        // second content row (the selected one), row 3 = parse stats,
+        // row 4 = footer.
         assert!(
             buf[(0, 2)].style().bg == Some(Color::DarkGray),
             "expected DarkGray bg on selected content row",
@@ -4011,6 +4123,106 @@ mod tests {
             dump.contains("Enter include msg"),
             "expected include-mode footer hint, got:\n{dump}",
         );
+    }
+
+    // ---------- parse stats ----------
+
+    #[test]
+    fn format_bytes_picks_prefix_at_1024_boundaries() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        // 1.5 KiB
+        assert_eq!(format_bytes(1024 + 512), "1.5 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        // The 2013-byte example from the user prompt: well above the
+        // 1 KiB boundary, so we shift to KiB rather than printing raw
+        // bytes.
+        assert_eq!(format_bytes(2013), "2.0 KiB");
+    }
+
+    #[test]
+    fn format_byte_rate_picks_prefix_at_1024_boundaries() {
+        assert_eq!(format_byte_rate(0.0), "0 B/sec");
+        assert_eq!(format_byte_rate(132.0), "132 B/sec");
+        assert_eq!(format_byte_rate(1024.0), "1.0 KiB/sec");
+        assert_eq!(format_byte_rate(1024.0 * 1024.0), "1.0 MiB/sec");
+    }
+
+    #[test]
+    fn format_parse_stats_includes_records_bytes_time_and_rates() {
+        let stats = ParseStats {
+            records: 1023,
+            bytes: 2013,
+            elapsed: Duration::from_millis(15_231),
+        };
+        let s = format_parse_stats(&stats);
+        // Spot-check each piece of information the user expects to see.
+        assert!(s.contains("1023 records"), "{s}");
+        assert!(s.contains("2.0 KiB"), "{s}");
+        assert!(s.contains("15.231s"), "{s}");
+        assert!(s.contains("records/sec"), "{s}");
+        assert!(s.contains("B/sec") || s.contains("KiB/sec"), "{s}");
+    }
+
+    #[test]
+    fn format_parse_stats_drops_rates_when_records_zero() {
+        // Empty engine (no sources or all filtered out): records and
+        // bytes are zero and the rate half would be meaningless.
+        let stats = ParseStats {
+            records: 0,
+            bytes: 0,
+            elapsed: Duration::from_millis(0),
+        };
+        let s = format_parse_stats(&stats);
+        assert!(s.contains("0 records"), "{s}");
+        assert!(!s.contains("records/sec"), "{s}");
+    }
+
+    #[test]
+    fn render_shows_parse_stats_row_above_footer() {
+        // Wide enough to hold the full status line; tall enough for
+        // tabs(1) + content(2) + stats(1) + footer(1).  The stats row
+        // sits one above the footer.
+        let backend = TestBackend::new(120, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        // Force a ParseStats with deterministic values rather than
+        // relying on whatever the test fixture produced.
+        a.active_tab_mut().parse_stats = ParseStats {
+            records: 42,
+            bytes: 4096,
+            elapsed: Duration::from_millis(100),
+        };
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("42 records"), "dump:\n{dump}");
+        assert!(dump.contains("4.0 KiB"), "dump:\n{dump}");
+        assert!(dump.contains("0.100s"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn render_omits_parse_stats_row_on_bookmarks_pane() {
+        // The bookmarks pane has no parse activity; the stats row
+        // collapses to 0 height there so the bookmark list keeps the
+        // full content area.
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, Some("first"));
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        // Make the active *regular* tab's stats distinctive — they
+        // should not appear when the bookmarks pane is showing.
+        a.tabs[0].parse_stats = ParseStats {
+            records: 9999,
+            bytes: 1024 * 1024,
+            elapsed: Duration::from_millis(1234),
+        };
+        let backend = TestBackend::new(120, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(!dump.contains("9999 records"), "dump:\n{dump}");
     }
 
     // ---------- time-step navigation ----------

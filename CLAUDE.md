@@ -212,8 +212,6 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## Next steps
 
-- Parsing real files -- doesn't work
-- Is it rendering all the fields?
 - Performance
 
 ## TODO list

@@ -15,7 +15,7 @@ pub mod stream;
 #[cfg(test)]
 mod test_util;
 
-pub use engine::{Engine, EngineEvent, ResolvePosition};
+pub use engine::{Engine, EngineEvent, EventStream, ResolvePosition};
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
 pub use render::format_event;

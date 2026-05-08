@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::iter;
 
 /// Identifier for a source.
 ///
@@ -77,11 +78,19 @@ pub trait Source {
     /// Returns this source's identifier.
     fn id(&self) -> &SourceId;
 
-    /// Returns an iterator that yields each event in turn, with parse and
-    /// I/O errors surfaced per item rather than aborting the stream.
+    /// Returns an iterator that yields each event in turn, paired with
+    /// the number of source bytes consumed for that record (including
+    /// the trailing newline, when present).
+    ///
+    /// Bytes are reported for parse errors too, since the error
+    /// originated from a line we read.  An I/O error returned for the
+    /// very first item (when the file can't be opened, for instance)
+    /// reports `0` bytes since nothing was read off disk.  The byte
+    /// counts are surfaced so the engine can show users a parse-rate
+    /// status line without re-walking the input.
     fn events<'a>(
         &'a self,
-    ) -> Box<dyn Iterator<Item = Result<Event, SourceError>> + 'a>;
+    ) -> Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a>;
 }
 
 /// Source backed by a single file on disk.
@@ -118,18 +127,30 @@ impl Source for FileSource {
 
     fn events<'a>(
         &'a self,
-    ) -> Box<dyn Iterator<Item = Result<Event, SourceError>> + 'a> {
+    ) -> Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a> {
         let file = match File::open(&self.path) {
             Ok(f) => f,
             Err(e) => {
-                return Box::new(std::iter::once(Err(e.into())));
+                return Box::new(iter::once((0, Err(e.into()))));
             }
         };
-        let reader = BufReader::new(file);
-        Box::new(reader.lines().map(|line| {
-            let line = line?;
-            let event: Event = serde_json::from_str(&line)?;
-            Ok(event)
+        // Drive the read with `read_line` rather than `lines()` so the
+        // byte count includes the line terminator — that's what we
+        // want to surface to the user as "bytes read off disk".
+        let mut reader = BufReader::new(file);
+        let mut buf = String::new();
+        Box::new(iter::from_fn(move || {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => None,
+                Ok(n) => {
+                    let line = buf.trim_end_matches(['\r', '\n']);
+                    let result = serde_json::from_str::<Event>(line)
+                        .map_err(SourceError::from);
+                    Some((n as u64, result))
+                }
+                Err(e) => Some((0, Err(e.into()))),
+            }
         }))
     }
 }
@@ -170,12 +191,37 @@ mod tests {
         let src = FileSource::open(&p).unwrap();
         let results: Vec<_> = src.events().collect();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].as_ref().unwrap().msg, "first");
+        assert_eq!(results[0].1.as_ref().unwrap().msg, "first");
         assert!(matches!(
-            results[1].as_ref().unwrap_err(),
-            SourceError::Parse(_)
+            results[1].1.as_ref().unwrap_err(),
+            SourceError::Parse(_),
         ));
-        assert_eq!(results[2].as_ref().unwrap().msg, "third");
+        assert_eq!(results[2].1.as_ref().unwrap().msg, "third");
+        // Each line consumed at least its content's bytes plus a
+        // trailing newline.  Parse-error lines are byte-counted too.
+        for (bytes, _) in &results {
+            assert!(*bytes > 0);
+        }
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn file_source_byte_counts_sum_to_file_size() {
+        // The engine sums per-record byte counts to drive the parse
+        // status line; the sum had better equal what `wc -c` would say.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan(&p, "a", |log| {
+            info!(log, "first");
+            info!(log, "second");
+        });
+        append_raw(&p, "not json");
+
+        let src = FileSource::open(&p).unwrap();
+        let total_bytes: u64 = src.events().map(|(b, _)| b).sum();
+        let file_size = std::fs::metadata(&p).unwrap().len();
+        assert_eq!(total_bytes, file_size);
 
         dir.cleanup();
     }

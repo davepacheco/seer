@@ -76,17 +76,14 @@ impl Engine {
     pub fn query_events<'a>(
         &'a self,
         filter: &'a Filter,
-    ) -> impl Iterator<Item = Result<EngineEvent, SourceError>> + 'a {
+    ) -> EventStream<'a> {
         let cursors = self
             .sources
             .iter()
             .filter(|s| filter.matches_source_id(s.id()))
             .map(|s| SourceCursor::new(s.as_ref()))
             .collect();
-        MergeIter { cursors }.filter(move |r| match r {
-            Ok(e) => filter.matches(&e.event),
-            Err(_) => true,
-        })
+        EventStream { cursors, filter, records_parsed: 0 }
     }
 
     /// Resolves `position` against the current sources, viewed through
@@ -259,7 +256,7 @@ pub enum ResolvePosition {
 /// makes the warning one-shot per source: a wildly unsorted file
 /// shouldn't drown its real entries in repeated warnings.
 struct SourceCursor<'a> {
-    iter: Box<dyn Iterator<Item = Result<Event, SourceError>> + 'a>,
+    iter: Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a>,
     pending: VecDeque<Result<EngineEvent, SourceError>>,
     last_time: Option<DateTime<Utc>>,
     /// Number of events already emitted whose `time` matches `last_time`.
@@ -270,6 +267,11 @@ struct SourceCursor<'a> {
     intra_time_count: u64,
     source_id: SourceId,
     out_of_order_warned: bool,
+    /// Total source bytes pulled off this source so far, including
+    /// bytes from parse-error lines and (when present) line
+    /// terminators.  Summed across cursors to drive the
+    /// [`EventStream::bytes_read`] accessor.
+    bytes_read: u64,
 }
 
 impl<'a> SourceCursor<'a> {
@@ -281,6 +283,7 @@ impl<'a> SourceCursor<'a> {
             intra_time_count: 0,
             source_id: source.id().clone(),
             out_of_order_warned: false,
+            bytes_read: 0,
         }
     }
 
@@ -292,9 +295,10 @@ impl<'a> SourceCursor<'a> {
         if !self.pending.is_empty() {
             return;
         }
-        let Some(item) = self.iter.next() else {
+        let Some((bytes, item)) = self.iter.next() else {
             return;
         };
+        self.bytes_read += bytes;
         match item {
             Err(e) => {
                 self.pending.push_back(Err(e));
@@ -342,6 +346,59 @@ impl<'a> SourceCursor<'a> {
     }
 }
 
+/// Streaming output of [`Engine::query_events`].
+///
+/// Wraps the per-source cursors plus the active filter, and surfaces
+/// running parse statistics that the TUI uses to render its
+/// "N records (M MiB) parsed in T..." status row.  The counters reflect
+/// what has been pulled so far; for the final totals, drain the
+/// iterator first and then read the accessors.
+///
+/// The event-level filter is applied here (errors and warnings always
+/// pass through); the source-id filter is applied at construction by
+/// only creating cursors for matching sources.
+pub struct EventStream<'a> {
+    cursors: Vec<SourceCursor<'a>>,
+    filter: &'a Filter,
+    records_parsed: u64,
+}
+
+impl<'a> EventStream<'a> {
+    /// Total number of `Ok` events produced by the underlying sources
+    /// so far, regardless of whether the active event filter accepted
+    /// them.  Counts events that came off disk and parsed cleanly —
+    /// the natural denominator for "records parsed per second".
+    pub fn records_parsed(&self) -> u64 {
+        self.records_parsed
+    }
+
+    /// Total source bytes consumed across all sources so far,
+    /// including bytes for parse-error lines and (when present) line
+    /// terminators.
+    pub fn bytes_read(&self) -> u64 {
+        self.cursors.iter().map(|c| c.bytes_read).sum()
+    }
+}
+
+impl<'a> Iterator for EventStream<'a> {
+    type Item = Result<EngineEvent, SourceError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = pop_next(&mut self.cursors)?;
+            if item.is_ok() {
+                self.records_parsed += 1;
+            }
+            if let Ok(ee) = &item
+                && !self.filter.matches(&ee.event)
+            {
+                continue;
+            }
+            return Some(item);
+        }
+    }
+}
+
 /// K-way merge over a `Vec<SourceCursor>`.
 ///
 /// On each `next` call: scan all cursors and pick the one to emit from.
@@ -359,42 +416,56 @@ impl<'a> Iterator for MergeIter<'a> {
     type Item = Result<EngineEvent, SourceError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut best: Option<usize> = None;
-        let mut best_time: Option<DateTime<Utc>> = None;
-        let mut best_is_err = false;
-
-        for i in 0..self.cursors.len() {
-            // Decide based on this cursor's head, then drop the borrow
-            // so the next iteration can mutably borrow another cursor.
-            let outcome = match self.cursors[i].peek() {
-                None => None,
-                Some(Err(_)) => Some((true, None)),
-                Some(Ok(ev)) => Some((false, Some(ev.event.time))),
-            };
-            let Some((is_err, time)) = outcome else {
-                continue;
-            };
-            if is_err {
-                if !best_is_err {
-                    best = Some(i);
-                    best_is_err = true;
-                }
-                // Earlier source already wins on err-vs-err tie.
-                continue;
-            }
-            if best_is_err {
-                continue;
-            }
-            let t = time.expect("non-error head has a time");
-            if best_time.is_none_or(|bt| t < bt) {
-                best = Some(i);
-                best_time = Some(t);
-            }
-        }
-
-        let idx = best?;
-        self.cursors[idx].pop()
+        pop_next(&mut self.cursors)
     }
+}
+
+/// Pops the next item across `cursors` using the rule documented on
+/// [`MergeIter`]: error/warning heads are emitted ahead of any event
+/// head; among event heads, smallest timestamp wins; ties break by
+/// add-order.  Returns `None` once every cursor is drained.
+fn pop_next<'a>(
+    cursors: &mut [SourceCursor<'a>],
+) -> Option<Result<EngineEvent, SourceError>> {
+    let mut best: Option<usize> = None;
+    let mut best_time: Option<DateTime<Utc>> = None;
+    let mut best_is_err = false;
+
+    // Index-based loop: each iteration mutably borrows a different
+    // cursor (peek takes `&mut self`), which `iter_mut().enumerate()`
+    // can't express without splitting the slice.
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..cursors.len() {
+        // Decide based on this cursor's head, then drop the borrow so
+        // the next iteration can mutably borrow another cursor.
+        let outcome = match cursors[i].peek() {
+            None => None,
+            Some(Err(_)) => Some((true, None)),
+            Some(Ok(ev)) => Some((false, Some(ev.event.time))),
+        };
+        let Some((is_err, time)) = outcome else {
+            continue;
+        };
+        if is_err {
+            if !best_is_err {
+                best = Some(i);
+                best_is_err = true;
+            }
+            // Earlier source already wins on err-vs-err tie.
+            continue;
+        }
+        if best_is_err {
+            continue;
+        }
+        let t = time.expect("non-error head has a time");
+        if best_time.is_none_or(|bt| t < bt) {
+            best = Some(i);
+            best_time = Some(t);
+        }
+    }
+
+    let idx = best?;
+    cursors[idx].pop()
 }
 
 #[cfg(test)]
