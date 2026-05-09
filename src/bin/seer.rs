@@ -5345,11 +5345,13 @@ mod tests {
         assert_eq!(tab.formatted.len(), 6);
         assert_eq!(tab.first_line_for_event, vec![0, 2, 3]);
         assert_eq!(tab.event_for_line, vec![0, 0, 1, 2, 2, 2]);
-        // Spot-check the indented-extras layout.
-        assert!(tab.formatted[0].ends_with(": starting"));
+        // Spot-check the indented-extras layout.  msg sits at the end
+        // of the header line, so the assertion latches onto its
+        // trailing word.
+        assert!(tab.formatted[0].ends_with(" starting"));
         assert_eq!(tab.formatted[1], r#"    build = "0.1.0""#);
-        assert!(tab.formatted[2].ends_with(": tick"));
-        assert!(tab.formatted[3].ends_with(": loaded"));
+        assert!(tab.formatted[2].ends_with(" tick"));
+        assert!(tab.formatted[3].ends_with(" loaded"));
         assert_eq!(tab.formatted[4], "    ms = 12");
         assert_eq!(tab.formatted[5], "    zones = 4");
     }
@@ -5474,8 +5476,8 @@ mod tests {
         let tab = a.active_tab();
         assert_eq!(tab.events.len(), 2);
         assert_eq!(tab.formatted.len(), 2, "extras should be hidden");
-        assert!(tab.formatted[0].ends_with(": first"));
-        assert!(tab.formatted[1].ends_with(": second"));
+        assert!(tab.formatted[0].ends_with(" first"));
+        assert!(tab.formatted[1].ends_with(" second"));
         assert!(!a.active_show_extras());
     }
 

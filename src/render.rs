@@ -58,16 +58,19 @@ pub fn format_event(
 ) -> Vec<String> {
     let cap = if show_extras { 1 + event.extra.len() } else { 1 };
     let mut lines = Vec::with_capacity(cap);
-    // Level is padded to 5 columns (the width of the longest variant,
-    // `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the column following it lines
-    // up across rows of mixed severity.
+    // Header column order: time, hostname, name/pid, level, msg.
+    // Hostname moves ahead of name/pid so the eye lands on the
+    // machine before the process; level sits adjacent to msg so the
+    // severity reads next to its text.  Level is padded to 5 columns
+    // (the width of `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the msg column
+    // lines up across rows of mixed severity.
     lines.push(format!(
-        "{} {:<5} {}/{} on {}: {}",
+        "{} {} {}/{} {:<5} {}",
         format_time(&event.time, show_date),
-        event.level,
+        event.hostname,
         event.name,
         event.pid,
-        event.hostname,
+        event.level,
         event.msg,
     ));
     if show_extras {
@@ -109,8 +112,8 @@ mod tests {
         // suffix, regardless of the source's nanosecond precision.
         assert_eq!(
             lines[0],
-            "2026-05-07T04:48:12.142Z INFO  \
-             Nexus/15797 on ivanova: Nexus starting up",
+            "2026-05-07T04:48:12.142Z ivanova \
+             Nexus/15797 INFO  Nexus starting up",
         );
     }
 
@@ -137,7 +140,7 @@ mod tests {
             /* show_date = */ true,
         );
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].ends_with(": Nexus starting up"));
+        assert!(lines[0].ends_with(" Nexus starting up"));
         assert_eq!(lines[1], r#"    build = "0.1.0""#);
         assert_eq!(lines[2], r#"    version = "0.1.0""#);
     }
@@ -165,14 +168,15 @@ mod tests {
             /* show_date = */ true,
         );
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].ends_with(": Nexus starting up"));
+        assert!(lines[0].ends_with(" Nexus starting up"));
     }
 
     #[test]
-    fn header_format_matches_looker_layout() {
-        // Asserts the exact layout users will compare against looker's
-        // output: timestamp, then level, then name/pid on hostname:
-        // msg.  Pin this so accidental refactors don't drift the format.
+    fn header_format_pins_column_order() {
+        // Pin the exact layout (time, hostname, name/pid, level, msg)
+        // so accidental refactors don't drift the format.  The msg sits
+        // last and runs to end-of-line, so any embedded spaces stay
+        // intact.
         let e = parse(
             r#"{
                 "v": 0,
@@ -191,7 +195,7 @@ mod tests {
         )[0];
         assert_eq!(
             header,
-            "2026-05-07T00:00:00.000Z ERROR Nexus/100 on host-a: kaboom",
+            "2026-05-07T00:00:00.000Z host-a Nexus/100 ERROR kaboom",
         );
     }
 
@@ -244,9 +248,12 @@ mod tests {
         let info_line = &format_event(&info, false, true)[0];
         let warn_line = &format_event(&warn, false, true)[0];
         let error_line = &format_event(&error, false, true)[0];
-        assert!(info_line.contains(" INFO  n/"));
-        assert!(warn_line.contains(" WARN  n/"));
-        assert!(error_line.contains(" ERROR n/"));
+        // The two characters following the level are always "  m" for
+        // 4-char levels (padded plus space plus msg) and " m" for the
+        // 5-char ones.
+        assert!(info_line.contains(" INFO  m"));
+        assert!(warn_line.contains(" WARN  m"));
+        assert!(error_line.contains(" ERROR m"));
     }
 
     #[test]
