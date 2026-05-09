@@ -22,7 +22,7 @@ pub use engine::{
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
-pub use render::format_event;
+pub use render::{format_event, format_time};
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
 };

@@ -78,18 +78,18 @@ impl RecordKey {
 }
 
 /// Per-record entry held in the window: the merged record itself plus
-/// its pre-formatted display lines under the current `show_extras`
-/// setting.  `lines.len() >= 1` always: a parse error contributes a
-/// single error line; a real event contributes a header plus zero or
-/// more extra-field lines.
+/// its pre-formatted display lines under the current `show_extras` and
+/// `show_date` settings.  `lines.len() >= 1` always: a parse error
+/// contributes a single error line; a real event contributes a header
+/// plus zero or more extra-field lines.
 struct WindowEntry {
     record: MergeRecord,
     lines: Vec<String>,
 }
 
 impl WindowEntry {
-    fn new(record: MergeRecord, show_extras: bool) -> Self {
-        let lines = format_record(&record, show_extras);
+    fn new(record: MergeRecord, show_extras: bool, show_date: bool) -> Self {
+        let lines = format_record(&record, show_extras, show_date);
         Self { record, lines }
     }
 
@@ -104,9 +104,13 @@ impl WindowEntry {
 /// produce a single line carrying the [`MergeError`]'s `Display`
 /// message — matching the existing TUI behavior of surfacing parse
 /// errors inline next to events.
-fn format_record(record: &MergeRecord, show_extras: bool) -> Vec<String> {
+fn format_record(
+    record: &MergeRecord,
+    show_extras: bool,
+    show_date: bool,
+) -> Vec<String> {
     match &record.event {
-        Ok(event) => format_event(event, show_extras),
+        Ok(event) => format_event(event, show_extras, show_date),
         Err(err) => vec![err.to_string()],
     }
 }
@@ -209,6 +213,7 @@ struct SearchResumePoint {
 pub struct StreamView {
     filter: Filter,
     show_extras: bool,
+    show_date: bool,
     /// Cursor at the front of the window: a stepper built at this
     /// cursor's `step_forward` would emit `records.front()` first; its
     /// `step_backward` would emit the record just before the window's
@@ -234,10 +239,11 @@ impl StreamView {
     /// Constructs an empty view at the start of the engine's content.
     /// The window is populated lazily on the first call to a method
     /// that requires content (e.g. [`Self::ensure_window`]).
-    pub fn new(filter: Filter, show_extras: bool) -> Self {
+    pub fn new(filter: Filter, show_extras: bool, show_date: bool) -> Self {
         Self {
             filter,
             show_extras,
+            show_date,
             front_cursor: Cursor::new(),
             back_cursor: Cursor::new(),
             records: VecDeque::new(),
@@ -255,6 +261,10 @@ impl StreamView {
 
     pub fn show_extras(&self) -> bool {
         self.show_extras
+    }
+
+    pub fn show_date(&self) -> bool {
+        self.show_date
     }
 
     pub fn parse_stats(&self) -> &ParseStats {
@@ -417,8 +427,9 @@ impl StreamView {
             return;
         }
         self.show_extras = show_extras;
+        let show_date = self.show_date;
         for entry in &mut self.records {
-            entry.lines = format_record(&entry.record, show_extras);
+            entry.lines = format_record(&entry.record, show_extras, show_date);
         }
         // Snap the anchor's line offset to 0 of the same record.  The
         // existing TUI's `rerender` does this implicitly by clearing
@@ -426,6 +437,23 @@ impl StreamView {
         // record under the cursor.
         if let Anchor::On { line, .. } = &mut self.anchor {
             *line = 0;
+        }
+    }
+
+    /// Toggles the `show_date` setting and reformats every cached
+    /// record so the display lines reflect the new setting.  The line
+    /// count per record is unchanged (only the timestamp's prefix
+    /// shrinks or grows), so the anchor's line offset is preserved
+    /// rather than snapped to 0 — unlike [`Self::set_show_extras`],
+    /// which can collapse multi-line records.
+    pub fn set_show_date(&mut self, show_date: bool) {
+        if show_date == self.show_date {
+            return;
+        }
+        self.show_date = show_date;
+        let show_extras = self.show_extras;
+        for entry in &mut self.records {
+            entry.lines = format_record(&entry.record, show_extras, show_date);
         }
     }
 
@@ -543,6 +571,7 @@ impl StreamView {
                     self.records.push_back(WindowEntry::new(
                         record,
                         self.show_extras,
+                        self.show_date,
                     ));
                 }
                 None => {
@@ -580,6 +609,7 @@ impl StreamView {
                     self.records.push_front(WindowEntry::new(
                         record,
                         self.show_extras,
+                        self.show_date,
                     ));
                 }
                 None => {
@@ -1331,7 +1361,7 @@ mod tests {
     #[test]
     fn empty_engine_produces_empty_view() {
         let engine = Engine::new();
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         assert!(view.is_empty());
         assert!(view.anchor_record().is_none());
@@ -1342,7 +1372,7 @@ mod tests {
     fn ensure_window_populates_from_default_cursor() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         assert_eq!(view.record_count(), 3);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
@@ -1359,7 +1389,7 @@ mod tests {
     fn seek_to_end_anchors_on_last_record() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.seek_to_end(&engine, 20).unwrap();
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
         // Forward EOF; backward walk replays records.
@@ -1371,7 +1401,7 @@ mod tests {
     fn scroll_lines_advances_anchor_through_records() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 40])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
         view.scroll_lines(&engine, 1, 20);
@@ -1401,7 +1431,7 @@ mod tests {
         let n = (BATCH_SIZE * 2 + 5) as i64;
         let secs: Vec<i64> = (0..n).collect();
         let engine = build_engine(&[("a", &secs)], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 5);
         // Initial window is BATCH_SIZE records.
         let initial = view.record_count();
@@ -1422,7 +1452,7 @@ mod tests {
             &[("nexus", &[10, 20, 30]), ("sled", &[15, 25, 35])],
             &dir,
         );
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         assert_eq!(view.record_count(), 6);
         // Apply a name filter - tighten to nexus only.
@@ -1442,7 +1472,7 @@ mod tests {
     fn set_show_extras_keeps_anchor_on_same_record() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         view.scroll_lines(&engine, 1, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
@@ -1454,10 +1484,42 @@ mod tests {
     }
 
     #[test]
+    fn set_show_date_reformats_window_timestamps() {
+        // Toggling `show_date` should rewrite each cached entry's
+        // pre-formatted lines so the next render reflects the new
+        // setting.  No anchor or line-count change is expected: only
+        // the leading timestamp shrinks.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10, 20])], &dir);
+        let mut view = StreamView::new(Filter::default(), false, true);
+        view.ensure_window(&engine, 20);
+        let dated_first =
+            view.records().next().map(|(_, lines)| lines[0].to_string()).unwrap();
+        assert!(
+            dated_first.starts_with("1970-01-01T00:00:10.000Z "),
+            "expected dated header, got {dated_first:?}",
+        );
+
+        view.set_show_date(false);
+        assert!(!view.show_date());
+        let undated_first =
+            view.records().next().map(|(_, lines)| lines[0].to_string()).unwrap();
+        assert!(
+            undated_first.starts_with("00:00:10.000Z "),
+            "expected time-only header after toggle, got {undated_first:?}",
+        );
+
+        // Idempotent: calling again with the current value is a no-op.
+        view.set_show_date(false);
+        assert!(!view.show_date());
+        dir.cleanup();
+    }
+
+    #[test]
     fn advance_time_jumps_to_target_record() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         view.advance_time(&engine, Duration::seconds(15), 20);
         // Anchor was at t=10; +15s = t=25, first event at or past
@@ -1482,7 +1544,7 @@ mod tests {
     fn search_step_finds_match_in_window() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
         let outcome = view.search_step(
@@ -1502,7 +1564,7 @@ mod tests {
     fn search_step_returns_not_found_when_no_match() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("nonexistent").unwrap();
         let outcome = view.search_step(
@@ -1521,7 +1583,7 @@ mod tests {
     fn search_step_exclusive_skips_current_match() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 20, 40])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
         // First match: m20 at idx 1.
@@ -1555,7 +1617,7 @@ mod tests {
     fn search_step_backward_walks_in_reverse() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         // Move anchor to last record.
         view.scroll_lines(&engine, 4, 20);
@@ -1582,7 +1644,7 @@ mod tests {
         // and Found on the second.
         let engine =
             build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m50").unwrap();
         let outcome = view.search_step_with_budget(
@@ -1618,7 +1680,7 @@ mod tests {
         let dir = TestDir::new();
         let engine =
             build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("nonexistent").unwrap();
         // Exhaust the budget without finding anything.
@@ -1656,7 +1718,7 @@ mod tests {
         let dir = TestDir::new();
         let engine =
             build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let r1 = Regex::new("nonexistent").unwrap();
         let outcome = view.search_step_with_budget(
@@ -1697,7 +1759,7 @@ mod tests {
         let dir = TestDir::new();
         let engine =
             build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m30").unwrap();
         // Find m30 (record 2) within a generous budget.
@@ -1742,7 +1804,7 @@ mod tests {
         // run.
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m30").unwrap();
         let outcome = view.search_step_with_budget(
@@ -1782,7 +1844,7 @@ mod tests {
         append_bunyan_at(&p, "x", t(20), "m20");
         let mut engine = Engine::new();
         engine.add_file_source(&p).unwrap();
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         assert_eq!(view.record_count(), 3);
         let rendered: Vec<&str> =
@@ -1808,7 +1870,7 @@ mod tests {
         let _ = stepper.step_forward();
         let mid_cursor = stepper.cursor();
 
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.seek_to_cursor(&engine, mid_cursor, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
         dir.cleanup();
@@ -1822,16 +1884,16 @@ mod tests {
         // verify the anchor lands on the expected record.
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 40])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         // First record's cursor is `front_cursor` itself.
         let c0 = view.cursor_before_record(0).unwrap();
-        let mut v0 = StreamView::new(Filter::default(), false);
+        let mut v0 = StreamView::new(Filter::default(), false, true);
         v0.seek_to_cursor(&engine, c0, 20);
         assert_eq!(anchor_msg(&v0).as_deref(), Some("m10"));
         // A middle record: walks past two preceding entries.
         let c2 = view.cursor_before_record(2).unwrap();
-        let mut v2 = StreamView::new(Filter::default(), false);
+        let mut v2 = StreamView::new(Filter::default(), false, true);
         v2.seek_to_cursor(&engine, c2, 20);
         assert_eq!(anchor_msg(&v2).as_deref(), Some("m30"));
         // Past the end is a clean None.
@@ -1850,12 +1912,12 @@ mod tests {
             &[("a", &[10, 30, 50]), ("b", &[20, 40, 60])],
             &dir,
         );
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         // Records are interleaved: m10(a), m20(b), m30(a), m40(b), ...
         // The cursor before index 3 (m40 from b) should land us on m40.
         let cursor = view.cursor_before_record(3).unwrap();
-        let mut v = StreamView::new(Filter::default(), false);
+        let mut v = StreamView::new(Filter::default(), false, true);
         v.seek_to_cursor(&engine, cursor, 20);
         assert_eq!(anchor_msg(&v).as_deref(), Some("m40"));
         dir.cleanup();
@@ -1865,7 +1927,7 @@ mod tests {
     fn rendered_lines_caps_at_viewport_height() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         let lines = view.rendered_lines(3);
         assert_eq!(lines.len(), 3);
@@ -1879,7 +1941,7 @@ mod tests {
     fn scroll_then_set_filter_resets_to_top() {
         let dir = TestDir::new();
         let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view = StreamView::new(Filter::default(), false);
+        let mut view = StreamView::new(Filter::default(), false, true);
         view.ensure_window(&engine, 20);
         view.scroll_lines(&engine, 2, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));

@@ -136,9 +136,10 @@ fn render_rows(
     engine: &Engine,
     filter: &Filter,
     show_extras: bool,
+    show_date: bool,
     viewport_height: u16,
 ) -> (StreamView, RenderedRows) {
-    let mut view = StreamView::new(filter.clone(), show_extras);
+    let mut view = StreamView::new(filter.clone(), show_extras, show_date);
     view.ensure_window(engine, viewport_height);
     let rows = materialize_streamview(&view);
     (view, rows)
@@ -508,6 +509,7 @@ impl Tab {
         stream: LogStreamId,
         filter: &Filter,
         show_extras: bool,
+        show_date: bool,
     ) -> Self {
         let (streamview, rendered) = match kind {
             TabKind::Stream => {
@@ -515,6 +517,7 @@ impl Tab {
                     engine,
                     filter,
                     show_extras,
+                    show_date,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 (Some(view), rows)
@@ -541,13 +544,20 @@ impl Tab {
     /// the cached rows, viewport, and transient selection/search state.
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
-    fn refresh(&mut self, engine: &Engine, filter: &Filter, show_extras: bool) {
+    fn refresh(
+        &mut self,
+        engine: &Engine,
+        filter: &Filter,
+        show_extras: bool,
+        show_date: bool,
+    ) {
         let rendered = match self.kind {
             TabKind::Stream => {
                 let (view, rows) = render_rows(
                     engine,
                     filter,
                     show_extras,
+                    show_date,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 self.streamview = Some(view);
@@ -567,28 +577,32 @@ impl Tab {
 
     /// Re-renders the host stream like [`Self::refresh`], but keeps the
     /// viewport pinned to the *record* that was at the top before — used
-    /// when only the rendering changed (e.g. toggling `show_extras`),
-    /// where the underlying events are the same and resetting to the top
-    /// would lose the user's place.  Search is cleared because match
-    /// indices are line-indexed and lines moved; selection is preserved
+    /// when only the rendering changed (e.g. toggling `show_extras` or
+    /// `show_date`), where the underlying events are the same and
+    /// resetting to the top would lose the user's place.  Search is
+    /// cleared because match indices are line-indexed and lines may have
+    /// moved (when `show_extras` toggled); selection is preserved
     /// because it sits on a record index, which is still valid.
     fn rerender(
         &mut self,
         engine: &Engine,
         filter: &Filter,
         show_extras: bool,
+        show_date: bool,
     ) {
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
         let rendered = match self.kind {
             TabKind::Stream => {
                 if let Some(view) = self.streamview.as_mut() {
                     view.set_show_extras(show_extras);
+                    view.set_show_date(show_date);
                     materialize_streamview(view)
                 } else {
                     let (view, rows) = render_rows(
                         engine,
                         filter,
                         show_extras,
+                        show_date,
                         INITIAL_VIEWPORT_HEIGHT,
                     );
                     self.streamview = Some(view);
@@ -1003,6 +1017,7 @@ impl App {
             stream_id,
             &stream.filter,
             stream.show_extras,
+            stream.show_date,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1028,6 +1043,7 @@ impl App {
             stream_id,
             &stream.filter,
             stream.show_extras,
+            stream.show_date,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1087,13 +1103,14 @@ impl App {
         stream.filter = filter;
         let new_filter = stream.filter.clone();
         let show_extras = stream.show_extras;
+        let show_date = stream.show_date;
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.refresh(&self.engine, &new_filter, show_extras);
+                tab.refresh(&self.engine, &new_filter, show_extras, show_date);
             }
         }
     }
@@ -1112,13 +1129,39 @@ impl App {
         stream.show_extras = !stream.show_extras;
         let new_filter = stream.filter.clone();
         let show_extras = stream.show_extras;
+        let show_date = stream.show_date;
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.rerender(&self.engine, &new_filter, show_extras);
+                tab.rerender(&self.engine, &new_filter, show_extras, show_date);
+            }
+        }
+    }
+
+    /// Toggles whether the leading timestamp on each rendered line
+    /// includes its `YYYY-MM-DD` prefix.  Persisted on the [`LogStream`]
+    /// so the preference outlives the session, and applied to every tab
+    /// targeting that stream so two tabs sharing a stream stay
+    /// consistent.
+    fn toggle_show_date(&mut self) {
+        let stream_id = self.tabs[self.active].stream;
+        let Some(mut stream) = self.session.streams.remove(&stream_id) else {
+            return;
+        };
+        stream.show_date = !stream.show_date;
+        let new_filter = stream.filter.clone();
+        let show_extras = stream.show_extras;
+        let show_date = stream.show_date;
+        self.session
+            .streams
+            .insert_unique(stream)
+            .expect("removed-then-reinserted id is unique");
+        for tab in self.tabs.iter_mut() {
+            if tab.stream == stream_id {
+                tab.rerender(&self.engine, &new_filter, show_extras, show_date);
             }
         }
     }
@@ -1137,6 +1180,14 @@ impl App {
     fn active_show_extras(&self) -> bool {
         let stream_id = self.tabs[self.active].stream;
         self.session.streams.get(&stream_id).expect("stream exists").show_extras
+    }
+
+    /// Returns whether the active stream is currently rendering the
+    /// `YYYY-MM-DD` prefix on timestamps.  Used by the footer to show
+    /// the D-key state.
+    fn active_show_date(&self) -> bool {
+        let stream_id = self.tabs[self.active].stream;
+        self.session.streams.get(&stream_id).expect("stream exists").show_date
     }
 
     fn rename_active_tab(&mut self, name: String) {
@@ -1969,6 +2020,14 @@ impl App {
                     || modifiers == KeyModifiers::SHIFT =>
             {
                 self.toggle_show_extras();
+            }
+            // `D`: toggle whether the leading timestamp carries its
+            // date prefix.  Same NONE/SHIFT permissiveness as `F`.
+            KeyEvent { code: KeyCode::Char('D'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.toggle_show_date();
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -2840,18 +2899,22 @@ fn render(frame: &mut Frame, app: &mut App) {
                 }
             } else if total == 0 {
                 format!(
-                    "q quit · f filter · F fields={} · / search · \
-                     </> step={} · x/X exclude/include · b bookmark · \
-                     ^T new · S summary · ^W close · r rename · 0/0",
+                    "q quit · f filter · F fields={} · D date={} · \
+                     / search · </> step={} · x/X exclude/include · \
+                     b bookmark · ^T new · S summary · ^W close · \
+                     r rename · 0/0",
                     if app.active_show_extras() { "on" } else { "off" },
+                    if app.active_show_date() { "on" } else { "off" },
                     app.current_step_label(),
                 )
             } else {
                 format!(
-                    "q quit · f filter · F fields={} · / search · \
-                     </> step={} · x/X exclude/include · b bookmark · \
-                     ^T new · S summary · ^W close · r rename · {}-{} of {}",
+                    "q quit · f filter · F fields={} · D date={} · \
+                     / search · </> step={} · x/X exclude/include · \
+                     b bookmark · ^T new · S summary · ^W close · \
+                     r rename · {}-{} of {}",
                     if app.active_show_extras() { "on" } else { "off" },
+                    if app.active_show_date() { "on" } else { "off" },
                     app.current_step_label(),
                     top + 1,
                     bottom,
@@ -2905,11 +2968,14 @@ fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
                 .to_string();
             let name =
                 bm.name.as_ref().map(|n| format!(" [{n}]")).unwrap_or_default();
+            // Bookmark rows use the same compact, millisecond-precision
+            // timestamp as the main pane so the two views read the same
+            // way and copy-paste between them is unambiguous.
             let row = format!(
                 "{} · {} · {} · {}{}",
-                bm.created_at.to_rfc3339(),
+                seer::format_time(&bm.created_at, true),
                 basename,
-                bm.display_time.to_rfc3339(),
+                seer::format_time(&bm.display_time, true),
                 bm.display_msg,
                 name,
             );
@@ -5473,6 +5539,105 @@ mod tests {
         let stream_id = a.tabs[a.active].stream;
         let stream = restored.streams.get(&stream_id).unwrap();
         assert!(!stream.show_extras);
+    }
+
+    // ---------- show_date toggle (D) ----------
+
+    #[test]
+    fn streams_default_to_showing_date() {
+        // A fresh stream's timestamps should include the date prefix:
+        // most triage starts with "what day was this?" and the user
+        // opts out (`D`) when they're zoomed in on a tight window.
+        let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert!(a.active_show_date());
+        let row = &a.active_tab().formatted[0];
+        // Timestamp prefix carries the date and ends in millisecond
+        // precision with a `Z` suffix.
+        assert!(
+            row.starts_with("1970-01-01T00:00:10.000Z "),
+            "expected dated header, got {row:?}",
+        );
+    }
+
+    #[test]
+    fn shift_d_toggles_show_date_and_repaints() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert!(a.active_show_date());
+        let dated = a.active_tab().formatted[0].clone();
+        assert!(dated.starts_with("1970-01-01T00:00:10.000Z "));
+
+        a.handle_key(shift('D'));
+        assert!(!a.active_show_date());
+        let undated = a.active_tab().formatted[0].clone();
+        assert!(
+            undated.starts_with("00:00:10.000Z "),
+            "expected time-only header, got {undated:?}",
+        );
+
+        // Bare `D` (some terminals don't set SHIFT) toggles back on.
+        a.handle_key(key(KeyCode::Char('D')));
+        assert!(a.active_show_date());
+        assert!(a.active_tab().formatted[0].starts_with("1970-01-01T"));
+    }
+
+    #[test]
+    fn show_date_toggle_preserves_viewport_position() {
+        // The line count per record is unchanged across a date toggle
+        // (only the timestamp prefix shrinks), so a viewport parked
+        // mid-buffer should stay where it is.  Contrast with the
+        // show_extras toggle, which can collapse multi-line records.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+            (30, "third", &[]),
+        ]);
+        // Hide extras so the buffer is exactly one line per event;
+        // that way `viewport_top` indexes records 1:1.
+        a.handle_key(shift('F'));
+        a.active_tab_mut().viewport_top = 1;
+        let lines_before = a.active_tab().formatted.len();
+        a.handle_key(shift('D'));
+        assert_eq!(a.active_tab().viewport_top, 1);
+        assert_eq!(a.active_tab().formatted.len(), lines_before);
+    }
+
+    #[test]
+    fn show_date_persists_into_session_round_trip() {
+        // The `D` toggle should round-trip through a session save/load
+        // for the same reason `F` does: the preference outlives one
+        // session.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert!(a.active_show_date());
+        a.handle_key(shift('D'));
+        assert!(!a.active_show_date());
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        let stream_id = a.tabs[a.active].stream;
+        let stream = restored.streams.get(&stream_id).unwrap();
+        assert!(!stream.show_date);
+    }
+
+    #[test]
+    fn legacy_session_without_show_date_defaults_to_true() {
+        // Sessions saved before `show_date` existed won't have the
+        // field in their JSON.  Loading such a session must default to
+        // `true` (the new default), not `false` (bool::default).  This
+        // guards against quietly dropping the date prefix on every
+        // pre-existing project.
+        let json = serde_json::json!({
+            "version": seer::CURRENT_SESSION_VERSION,
+            "streams": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Tab 1",
+                "show_extras": false,
+            }],
+            "bookmarks": [],
+            "next_bookmark_id": 1,
+        });
+        let restored: Session = serde_json::from_value(json).unwrap();
+        let streams: Vec<_> = restored.streams.iter().collect();
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].show_date);
     }
 
     // ---------- Summary tab ----------

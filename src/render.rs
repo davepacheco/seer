@@ -7,10 +7,12 @@
 //!
 //! The shape mirrors `looker --output long`: a header line built from the
 //! bunyan core fields, followed by one indented `key = value` line per
-//! additional structured field.  The differences from looker are
-//! deliberate: full RFC 3339 timestamps (no millisecond truncation) and
-//! no color, since both binaries emit either to a TTY-agnostic file or a
-//! ratatui buffer that owns its own styling.
+//! additional structured field.  Timestamps render with millisecond
+//! precision and a `Z` (UTC) suffix — bunyan's source files often carry
+//! nanosecond precision, but for human triage the milliseconds are more
+//! than enough and the trailing digits crowd the line.  No color: both
+//! binaries emit either to a TTY-agnostic file or a ratatui buffer that
+//! owns its own styling.
 //!
 //! Values are rendered as JSON via [`serde_json::Value`]'s `Display`
 //! impl.  That preserves the type distinction between `"42"` and `42`,
@@ -23,15 +25,37 @@
 //! newlines).  An event with `n` extra fields produces `1 + n` lines.
 
 use crate::event::Event;
+use chrono::{DateTime, Utc};
+
+/// Formats a UTC timestamp the way both binaries display it.
+///
+/// With `show_date` true the result is a full ISO-8601 date-time at
+/// millisecond precision (`2026-04-30T15:30:00.743Z`); with it false the
+/// date prefix is stripped, leaving only `15:30:00.743Z`.  The `Z`
+/// suffix is preserved either way so the value is still unambiguously
+/// UTC when the user copies it out.
+pub fn format_time(time: &DateTime<Utc>, show_date: bool) -> String {
+    let pattern = if show_date {
+        "%Y-%m-%dT%H:%M:%S%.3fZ"
+    } else {
+        "%H:%M:%S%.3fZ"
+    };
+    time.format(pattern).to_string()
+}
 
 /// Formats `event` into one or more display lines.
 ///
 /// The first line is the bunyan header
 /// (`<time> <LEVEL> <name>/<pid> on <hostname>: <msg>`); when
 /// `show_extras` is true, subsequent lines are `    <key> = <json-value>`,
-/// one per entry in `event.extra`, ordered by key.  The returned vec is
-/// non-empty.
-pub fn format_event(event: &Event, show_extras: bool) -> Vec<String> {
+/// one per entry in `event.extra`, ordered by key.  `show_date` controls
+/// whether the leading timestamp includes its `YYYY-MM-DD` prefix.  The
+/// returned vec is non-empty.
+pub fn format_event(
+    event: &Event,
+    show_extras: bool,
+    show_date: bool,
+) -> Vec<String> {
     let cap = if show_extras { 1 + event.extra.len() } else { 1 };
     let mut lines = Vec::with_capacity(cap);
     // Level is padded to 5 columns (the width of the longest variant,
@@ -39,7 +63,7 @@ pub fn format_event(event: &Event, show_extras: bool) -> Vec<String> {
     // up across rows of mixed severity.
     lines.push(format!(
         "{} {:<5} {}/{} on {}: {}",
-        event.time.to_rfc3339(),
+        format_time(&event.time, show_date),
         event.level,
         event.name,
         event.pid,
@@ -75,11 +99,17 @@ mod tests {
                 "msg": "Nexus starting up"
             }"#,
         );
-        let lines = format_event(&e, /* show_extras = */ true);
+        let lines = format_event(
+            &e,
+            /* show_extras = */ true,
+            /* show_date = */ true,
+        );
         assert_eq!(lines.len(), 1);
+        // Timestamp is truncated to milliseconds and printed with a `Z`
+        // suffix, regardless of the source's nanosecond precision.
         assert_eq!(
             lines[0],
-            "2026-05-07T04:48:12.142223551+00:00 INFO  \
+            "2026-05-07T04:48:12.142Z INFO  \
              Nexus/15797 on ivanova: Nexus starting up",
         );
     }
@@ -101,7 +131,11 @@ mod tests {
                 "build": "0.1.0"
             }"#,
         );
-        let lines = format_event(&e, /* show_extras = */ true);
+        let lines = format_event(
+            &e,
+            /* show_extras = */ true,
+            /* show_date = */ true,
+        );
         assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with(": Nexus starting up"));
         assert_eq!(lines[1], r#"    build = "0.1.0""#);
@@ -125,7 +159,11 @@ mod tests {
                 "build": "0.1.0"
             }"#,
         );
-        let lines = format_event(&e, /* show_extras = */ false);
+        let lines = format_event(
+            &e,
+            /* show_extras = */ false,
+            /* show_date = */ true,
+        );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].ends_with(": Nexus starting up"));
     }
@@ -146,11 +184,42 @@ mod tests {
                 "msg": "kaboom"
             }"#,
         );
-        let header = &format_event(&e, /* show_extras = */ true)[0];
+        let header = &format_event(
+            &e,
+            /* show_extras = */ true,
+            /* show_date = */ true,
+        )[0];
         assert_eq!(
             header,
-            "2026-05-07T00:00:00+00:00 ERROR Nexus/100 on host-a: kaboom",
+            "2026-05-07T00:00:00.000Z ERROR Nexus/100 on host-a: kaboom",
         );
+    }
+
+    #[test]
+    fn show_date_false_drops_the_date_prefix() {
+        // With `show_date = false` only the wall-clock part remains,
+        // still at millisecond precision and still suffixed with `Z`.
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "n",
+                "hostname": "h",
+                "pid": 1,
+                "time": "2026-04-30T15:30:00.743Z",
+                "msg": "m"
+            }"#,
+        );
+        let header = &format_event(
+            &e,
+            /* show_extras = */ false,
+            /* show_date = */ false,
+        )[0];
+        assert!(
+            header.starts_with("15:30:00.743Z "),
+            "expected leading time-only prefix, got {header:?}",
+        );
+        assert!(!header.contains("2026-04-30"));
     }
 
     #[test]
@@ -172,9 +241,9 @@ mod tests {
         );
         // The two characters following the level are always "  " for
         // 4-char levels and " <name>" for 5-char ones.
-        let info_line = &format_event(&info, false)[0];
-        let warn_line = &format_event(&warn, false)[0];
-        let error_line = &format_event(&error, false)[0];
+        let info_line = &format_event(&info, false, true)[0];
+        let warn_line = &format_event(&warn, false, true)[0];
+        let error_line = &format_event(&error, false, true)[0];
         assert!(info_line.contains(" INFO  n/"));
         assert!(warn_line.contains(" WARN  n/"));
         assert!(error_line.contains(" ERROR n/"));
@@ -199,7 +268,11 @@ mod tests {
                 "absent": null
             }"#,
         );
-        let lines = format_event(&e, /* show_extras = */ true);
+        let lines = format_event(
+            &e,
+            /* show_extras = */ true,
+            /* show_date = */ true,
+        );
         // Header + 6 extras, sorted: absent, count, enabled, meta, ratio, tags.
         assert_eq!(lines.len(), 7);
         assert_eq!(lines[1], "    absent = null");
@@ -208,5 +281,19 @@ mod tests {
         assert_eq!(lines[4], r#"    meta = {"k":"v"}"#);
         assert_eq!(lines[5], "    ratio = 0.5");
         assert_eq!(lines[6], r#"    tags = ["a","b"]"#);
+    }
+
+    #[test]
+    fn format_time_with_and_without_date() {
+        let time: DateTime<Utc> =
+            "2026-04-30T15:30:00.743162222Z".parse().unwrap();
+        assert_eq!(
+            format_time(&time, /* show_date = */ true),
+            "2026-04-30T15:30:00.743Z",
+        );
+        assert_eq!(
+            format_time(&time, /* show_date = */ false),
+            "15:30:00.743Z",
+        );
     }
 }

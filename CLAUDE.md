@@ -285,11 +285,14 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- Use millisecond-precision timestamps, no timezone, `Z` suffix
 - be able to hide individual fields: name, hostname, pid
+  - `H` to toggle between short hostname, no hostname, full hostname
 - filter time with >= / > / <= / <
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
+- progress bar, ^C option when:
+  - scanning to enter Summary view
+  - searching
 - parse SMF entries
 - parse CockroachDB log
 - persistent session state

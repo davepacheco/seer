@@ -118,11 +118,23 @@ pub struct LogStream {
     /// they need the details
     #[serde(default)]
     pub show_extras: bool,
+    /// when true, the leading timestamp on each rendered line carries
+    /// its `YYYY-MM-DD` prefix; when false, the date is dropped and
+    /// only the wall-clock part is shown.  Defaults to true: most
+    /// triage spans more than a single day, and you want the date in
+    /// view by default.  Toggled with `D` in the TUI.
+    #[serde(default = "default_show_date")]
+    pub show_date: bool,
+}
+
+fn default_show_date() -> bool {
+    true
 }
 
 impl LogStream {
     /// Returns a new log stream with a freshly-generated id, the given
-    /// display name, an empty filter, and extras hidden.
+    /// display name, an empty filter, extras hidden, and the date
+    /// prefix shown.
     // No `Default` impl: each call mints a distinct id, so a default
     // value would silently produce non-equal objects.
     #[allow(clippy::new_without_default)]
@@ -132,6 +144,7 @@ impl LogStream {
             name,
             filter: Filter::default(),
             show_extras: false,
+            show_date: true,
         }
     }
 }

@@ -37,9 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for result in engine.query_events(&filter) {
         match result {
             Ok(ee) => {
-                for line in
-                    format_event(&ee.event, /* show_extras = */ true)
-                {
+                for line in format_event(
+                    &ee.event,
+                    /* show_extras = */ true,
+                    /* show_date = */ true,
+                ) {
                     println!("{line}");
                 }
             }
