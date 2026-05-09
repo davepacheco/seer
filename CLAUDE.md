@@ -285,8 +285,7 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- be able to hide individual fields: name, hostname, pid
-  - `H` to toggle between short hostname, no hostname, full hostname
+- be able to hide individual fields: name, pid
 - filter time with >= / > / <= / <
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
@@ -302,3 +301,4 @@ New tabs should still open with this dialog.
     - create new saved session
     - create new session and don't save it
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
+- need to teach Claude about slog_error_chain -- see SourceError

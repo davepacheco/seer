@@ -26,6 +26,72 @@
 
 use crate::event::Event;
 use chrono::{DateTime, Utc};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+/// How [`format_event`] should render the bunyan `hostname` field.
+///
+/// Cycled with `H` in the TUI (Short → Full → None → Short …) and
+/// persisted on the host [`crate::stream::LogStream`] so the choice
+/// outlives a session.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HostnameDisplay {
+    /// Trim to the first dot-component, then collapse a trailing UUID
+    /// to its first 8-character group — see [`short_hostname`].  This
+    /// is the default because real Oxide hostnames carry a domain
+    /// suffix and a service-instance UUID that crowd the header
+    /// without informing the user.
+    #[default]
+    Short,
+    /// Render the hostname exactly as it appears in the event.
+    Full,
+    /// Don't render the hostname column at all (no field, no
+    /// surrounding spaces).
+    None,
+}
+
+/// Returns the "short" form of `hostname`:
+///
+/// 1. Trim everything after the first `.` (so `gimlet-01.oxide.test`
+///    becomes `gimlet-01`).
+/// 2. If what remains ends with a UUID (`8-4-4-4-12` lowercase or
+///    uppercase hex), strip all but the first 8-hex group of the UUID
+///    and the dash before it.  So
+///    `oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d` becomes
+///    `oxz_nexus_c53300fc`.
+///
+/// Inputs that don't match either rule are returned as-is.  The 8-hex
+/// prefix of the UUID has to sit at a boundary (preceded by a non-hex
+/// character or the start of the string) so an arbitrary string of hex
+/// digits doesn't get mistaken for a UUID's first group.
+pub fn short_hostname(hostname: &str) -> String {
+    // (?x) puts the regex in extended mode, where unescaped whitespace
+    // and `#` comments are ignored — keeps the multi-line form readable
+    // without smuggling literal whitespace into the pattern.
+    static UUID_TAIL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?x)
+              ^
+              ((?:.*[^0-9a-fA-F])?[0-9a-fA-F]{8})
+              -[0-9a-fA-F]{4}
+              -[0-9a-fA-F]{4}
+              -[0-9a-fA-F]{4}
+              -[0-9a-fA-F]{12}
+              $",
+        )
+        .expect("static regex compiles")
+    });
+    let head =
+        hostname.split_once('.').map(|(h, _)| h).unwrap_or(hostname);
+    if let Some(caps) = UUID_TAIL.captures(head) {
+        return caps[1].to_string();
+    }
+    head.to_string()
+}
 
 /// Formats a UTC timestamp the way both binaries display it.
 ///
@@ -46,28 +112,45 @@ pub fn format_time(time: &DateTime<Utc>, show_date: bool) -> String {
 /// Formats `event` into one or more display lines.
 ///
 /// The first line is the bunyan header
-/// (`<time> <LEVEL> <name>/<pid> on <hostname>: <msg>`); when
-/// `show_extras` is true, subsequent lines are `    <key> = <json-value>`,
-/// one per entry in `event.extra`, ordered by key.  `show_date` controls
-/// whether the leading timestamp includes its `YYYY-MM-DD` prefix.  The
-/// returned vec is non-empty.
+/// (`<time> [<hostname>] <name>/<pid> <LEVEL> <msg>`); when `show_extras`
+/// is true, subsequent lines are `    <key> = <json-value>`, one per
+/// entry in `event.extra`, ordered by key.  `show_date` controls
+/// whether the leading timestamp includes its `YYYY-MM-DD` prefix;
+/// `hostname` decides whether the hostname column is short, full, or
+/// elided.  The returned vec is non-empty.
 pub fn format_event(
     event: &Event,
     show_extras: bool,
     show_date: bool,
+    hostname: HostnameDisplay,
 ) -> Vec<String> {
     let cap = if show_extras { 1 + event.extra.len() } else { 1 };
     let mut lines = Vec::with_capacity(cap);
-    // Header column order: time, hostname, name/pid, level, msg.
+    // Header column order: time, [hostname], name/pid, level, msg.
     // Hostname moves ahead of name/pid so the eye lands on the
     // machine before the process; level sits adjacent to msg so the
     // severity reads next to its text.  Level is padded to 5 columns
     // (the width of `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the msg column
-    // lines up across rows of mixed severity.
+    // lines up across rows of mixed severity.  The hostname column is
+    // dropped entirely (along with its trailing space) under
+    // [`HostnameDisplay::None`] — printing an empty string would leave
+    // a stray double space and misalign the rest of the line.
+    let host_field = match hostname {
+        HostnameDisplay::Short => {
+            // `as_ref::<str>` to pin which AsRef impl resolves —
+            // Hostname forwards AsRef from its inner String, but a
+            // blanket `AsRef<Self>` impl shadows it without an
+            // annotation.
+            let raw: &str = event.hostname.as_ref();
+            format!("{} ", short_hostname(raw))
+        }
+        HostnameDisplay::Full => format!("{} ", event.hostname),
+        HostnameDisplay::None => String::new(),
+    };
     lines.push(format!(
-        "{} {} {}/{} {:<5} {}",
+        "{} {}{}/{} {:<5} {}",
         format_time(&event.time, show_date),
-        event.hostname,
+        host_field,
         event.name,
         event.pid,
         event.level,
@@ -106,10 +189,13 @@ mod tests {
             &e,
             /* show_extras = */ true,
             /* show_date = */ true,
+            HostnameDisplay::Short,
         );
         assert_eq!(lines.len(), 1);
         // Timestamp is truncated to milliseconds and printed with a `Z`
         // suffix, regardless of the source's nanosecond precision.
+        // Hostname `ivanova` is single-component and not UUID-suffixed,
+        // so `Short` leaves it unchanged.
         assert_eq!(
             lines[0],
             "2026-05-07T04:48:12.142Z ivanova \
@@ -138,6 +224,7 @@ mod tests {
             &e,
             /* show_extras = */ true,
             /* show_date = */ true,
+            HostnameDisplay::Short,
         );
         assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with(" Nexus starting up"));
@@ -166,6 +253,7 @@ mod tests {
             &e,
             /* show_extras = */ false,
             /* show_date = */ true,
+            HostnameDisplay::Short,
         );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].ends_with(" Nexus starting up"));
@@ -192,6 +280,7 @@ mod tests {
             &e,
             /* show_extras = */ true,
             /* show_date = */ true,
+            HostnameDisplay::Short,
         )[0];
         assert_eq!(
             header,
@@ -218,12 +307,82 @@ mod tests {
             &e,
             /* show_extras = */ false,
             /* show_date = */ false,
+            HostnameDisplay::Short,
         )[0];
         assert!(
             header.starts_with("15:30:00.743Z "),
             "expected leading time-only prefix, got {header:?}",
         );
         assert!(!header.contains("2026-04-30"));
+    }
+
+    #[test]
+    fn hostname_full_keeps_dotted_and_uuid_suffixes() {
+        // Full mode renders the hostname exactly as it sits in the
+        // event — no dotted truncation, no UUID collapse.
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "n",
+                "hostname": "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
+                "pid": 1,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "m"
+            }"#,
+        );
+        let header = &format_event(&e, false, true, HostnameDisplay::Full)[0];
+        assert!(
+            header.contains(
+                " oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test \
+                 n/1 ",
+            ),
+            "expected full hostname in header, got {header:?}",
+        );
+    }
+
+    #[test]
+    fn hostname_short_collapses_dotted_and_uuid_suffix() {
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "n",
+                "hostname": "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
+                "pid": 1,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "m"
+            }"#,
+        );
+        let header = &format_event(&e, false, true, HostnameDisplay::Short)[0];
+        assert!(
+            header.contains(" oxz_nexus_c53300fc n/1 "),
+            "expected dot-trimmed and UUID-collapsed hostname, got \
+             {header:?}",
+        );
+    }
+
+    #[test]
+    fn hostname_none_drops_the_field_and_its_separator() {
+        // With `None`, no hostname column exists: name/pid follows the
+        // timestamp directly, separated by exactly one space (no
+        // double-space artifact from a stripped placeholder).
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 50,
+                "name": "Nexus",
+                "hostname": "ivanova",
+                "pid": 100,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "kaboom"
+            }"#,
+        );
+        let header = &format_event(&e, false, true, HostnameDisplay::None)[0];
+        assert_eq!(
+            header,
+            "2026-05-07T00:00:00.000Z Nexus/100 ERROR kaboom",
+        );
     }
 
     #[test]
@@ -243,11 +402,12 @@ mod tests {
             r#"{"v":0,"level":50,"name":"n","hostname":"h","pid":1,
                 "time":"2026-05-07T00:00:00Z","msg":"m"}"#,
         );
-        // The two characters following the level are always "  " for
-        // 4-char levels and " <name>" for 5-char ones.
-        let info_line = &format_event(&info, false, true)[0];
-        let warn_line = &format_event(&warn, false, true)[0];
-        let error_line = &format_event(&error, false, true)[0];
+        let info_line =
+            &format_event(&info, false, true, HostnameDisplay::Short)[0];
+        let warn_line =
+            &format_event(&warn, false, true, HostnameDisplay::Short)[0];
+        let error_line =
+            &format_event(&error, false, true, HostnameDisplay::Short)[0];
         // The two characters following the level are always "  m" for
         // 4-char levels (padded plus space plus msg) and " m" for the
         // 5-char ones.
@@ -279,6 +439,7 @@ mod tests {
             &e,
             /* show_extras = */ true,
             /* show_date = */ true,
+            HostnameDisplay::Short,
         );
         // Header + 6 extras, sorted: absent, count, enabled, meta, ratio, tags.
         assert_eq!(lines.len(), 7);
@@ -301,6 +462,79 @@ mod tests {
         assert_eq!(
             format_time(&time, /* show_date = */ false),
             "15:30:00.743Z",
+        );
+    }
+
+    #[test]
+    fn short_hostname_passes_plain_names_through() {
+        // Single-component, no UUID suffix: no work to do.
+        assert_eq!(short_hostname("ivanova"), "ivanova");
+        assert_eq!(short_hostname("gimlet-01"), "gimlet-01");
+        assert_eq!(short_hostname(""), "");
+    }
+
+    #[test]
+    fn short_hostname_trims_dot_components() {
+        assert_eq!(
+            short_hostname("gimlet-01.oxide.test"),
+            "gimlet-01",
+        );
+        // Multiple dots: only the first component survives, the rest
+        // are domain-like suffixes.
+        assert_eq!(
+            short_hostname("a.b.c.d"),
+            "a",
+        );
+    }
+
+    #[test]
+    fn short_hostname_collapses_uuid_suffix() {
+        // Canonical example from the spec.
+        assert_eq!(
+            short_hostname(
+                "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d",
+            ),
+            "oxz_nexus_c53300fc",
+        );
+        // Bare UUID: collapses to its first 8-hex group.
+        assert_eq!(
+            short_hostname("c53300fc-84eb-490a-9e1e-9e18d372856d"),
+            "c53300fc",
+        );
+        // Uppercase hex is recognized too.
+        assert_eq!(
+            short_hostname("svc_C53300FC-84EB-490A-9E1E-9E18D372856D"),
+            "svc_C53300FC",
+        );
+    }
+
+    #[test]
+    fn short_hostname_combines_dot_trim_then_uuid_collapse() {
+        // Real Oxide hostname: dotted *and* UUID-suffixed.  The dotted
+        // trim runs first, so the UUID collapse only ever sees the
+        // first component.
+        assert_eq!(
+            short_hostname(
+                "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
+            ),
+            "oxz_nexus_c53300fc",
+        );
+    }
+
+    #[test]
+    fn short_hostname_ignores_lookalike_suffixes() {
+        // Trailing 4-4-4-12 hex with no preceding 8-hex boundary is
+        // not a UUID — leave the hostname alone rather than chopping
+        // mid-token.
+        assert_eq!(
+            short_hostname("not-uuid-1234-5678-90ab-cdef01234567"),
+            "not-uuid-1234-5678-90ab-cdef01234567",
+        );
+        // A non-hex character inside what would otherwise be the
+        // trailing 12-char group disqualifies the match.
+        assert_eq!(
+            short_hostname("svc_c53300fc-84eb-490a-9e1e-9e18d372856z"),
+            "svc_c53300fc-84eb-490a-9e1e-9e18d372856z",
         );
     }
 }

@@ -11,6 +11,7 @@
 //! Filters and source-set restrictions land here next.
 
 use crate::filter::Filter;
+use crate::render::HostnameDisplay;
 use crate::source::SourceId;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
@@ -125,6 +126,10 @@ pub struct LogStream {
     /// view by default.  Toggled with `D` in the TUI.
     #[serde(default = "default_show_date")]
     pub show_date: bool,
+    /// how the bunyan `hostname` field is rendered: short (the
+    /// default), full, or omitted.  Cycled with `H` in the TUI.
+    #[serde(default)]
+    pub hostname_display: HostnameDisplay,
 }
 
 fn default_show_date() -> bool {
@@ -133,8 +138,8 @@ fn default_show_date() -> bool {
 
 impl LogStream {
     /// Returns a new log stream with a freshly-generated id, the given
-    /// display name, an empty filter, extras hidden, and the date
-    /// prefix shown.
+    /// display name, an empty filter, extras hidden, the date prefix
+    /// shown, and the hostname rendered in short form.
     // No `Default` impl: each call mints a distinct id, so a default
     // value would silently produce non-equal objects.
     #[allow(clippy::new_without_default)]
@@ -145,6 +150,7 @@ impl LogStream {
             filter: Filter::default(),
             show_extras: false,
             show_date: true,
+            hostname_display: HostnameDisplay::default(),
         }
     }
 }

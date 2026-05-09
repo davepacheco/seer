@@ -27,9 +27,9 @@ use regex::Regex;
 use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
-    LogStream, LogStreamId, LogStreamPosition, Predicate, SEARCH_BUDGET,
-    SearchDir, SearchOutcome, Session, SourceId, StreamView, SummaryBuilder,
-    format_summary,
+    HostnameDisplay, LogStream, LogStreamId, LogStreamPosition, Predicate,
+    SEARCH_BUDGET, SearchDir, SearchOutcome, Session, SourceId, StreamView,
+    SummaryBuilder, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -137,9 +137,15 @@ fn render_rows(
     filter: &Filter,
     show_extras: bool,
     show_date: bool,
+    hostname_display: HostnameDisplay,
     viewport_height: u16,
 ) -> (StreamView, RenderedRows) {
-    let mut view = StreamView::new(filter.clone(), show_extras, show_date);
+    let mut view = StreamView::new(
+        filter.clone(),
+        show_extras,
+        show_date,
+        hostname_display,
+    );
     view.ensure_window(engine, viewport_height);
     let rows = materialize_streamview(&view);
     (view, rows)
@@ -317,6 +323,16 @@ fn compute_matches(rows: &[String], regex: &Regex) -> Vec<usize> {
         .enumerate()
         .filter_map(|(i, r)| regex.is_match(r).then_some(i))
         .collect()
+}
+
+/// Footer label for [`HostnameDisplay`]: matches the user-facing key
+/// names that show up next to the `H` hint.
+fn hostname_display_label(mode: HostnameDisplay) -> &'static str {
+    match mode {
+        HostnameDisplay::Short => "short",
+        HostnameDisplay::Full => "full",
+        HostnameDisplay::None => "off",
+    }
 }
 
 /// Cancellation hook for [`StreamView::search_step`]: drains the
@@ -502,6 +518,7 @@ struct Selection {
 }
 
 impl Tab {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         name: String,
         kind: TabKind,
@@ -510,6 +527,7 @@ impl Tab {
         filter: &Filter,
         show_extras: bool,
         show_date: bool,
+        hostname_display: HostnameDisplay,
     ) -> Self {
         let (streamview, rendered) = match kind {
             TabKind::Stream => {
@@ -518,6 +536,7 @@ impl Tab {
                     filter,
                     show_extras,
                     show_date,
+                    hostname_display,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 (Some(view), rows)
@@ -550,6 +569,7 @@ impl Tab {
         filter: &Filter,
         show_extras: bool,
         show_date: bool,
+        hostname_display: HostnameDisplay,
     ) {
         let rendered = match self.kind {
             TabKind::Stream => {
@@ -558,6 +578,7 @@ impl Tab {
                     filter,
                     show_extras,
                     show_date,
+                    hostname_display,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 self.streamview = Some(view);
@@ -589,6 +610,7 @@ impl Tab {
         filter: &Filter,
         show_extras: bool,
         show_date: bool,
+        hostname_display: HostnameDisplay,
     ) {
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
         let rendered = match self.kind {
@@ -596,6 +618,7 @@ impl Tab {
                 if let Some(view) = self.streamview.as_mut() {
                     view.set_show_extras(show_extras);
                     view.set_show_date(show_date);
+                    view.set_hostname_display(hostname_display);
                     materialize_streamview(view)
                 } else {
                     let (view, rows) = render_rows(
@@ -603,6 +626,7 @@ impl Tab {
                         filter,
                         show_extras,
                         show_date,
+                        hostname_display,
                         INITIAL_VIEWPORT_HEIGHT,
                     );
                     self.streamview = Some(view);
@@ -1018,6 +1042,7 @@ impl App {
             &stream.filter,
             stream.show_extras,
             stream.show_date,
+            stream.hostname_display,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1044,6 +1069,7 @@ impl App {
             &stream.filter,
             stream.show_extras,
             stream.show_date,
+            stream.hostname_display,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1104,13 +1130,20 @@ impl App {
         let new_filter = stream.filter.clone();
         let show_extras = stream.show_extras;
         let show_date = stream.show_date;
+        let hostname_display = stream.hostname_display;
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.refresh(&self.engine, &new_filter, show_extras, show_date);
+                tab.refresh(
+                    &self.engine,
+                    &new_filter,
+                    show_extras,
+                    show_date,
+                    hostname_display,
+                );
             }
         }
     }
@@ -1127,18 +1160,7 @@ impl App {
             return;
         };
         stream.show_extras = !stream.show_extras;
-        let new_filter = stream.filter.clone();
-        let show_extras = stream.show_extras;
-        let show_date = stream.show_date;
-        self.session
-            .streams
-            .insert_unique(stream)
-            .expect("removed-then-reinserted id is unique");
-        for tab in self.tabs.iter_mut() {
-            if tab.stream == stream_id {
-                tab.rerender(&self.engine, &new_filter, show_extras, show_date);
-            }
-        }
+        self.rerender_after_stream_mutation(stream_id, stream);
     }
 
     /// Toggles whether the leading timestamp on each rendered line
@@ -1152,16 +1174,51 @@ impl App {
             return;
         };
         stream.show_date = !stream.show_date;
+        self.rerender_after_stream_mutation(stream_id, stream);
+    }
+
+    /// Cycles the active stream's hostname-rendering mode through
+    /// Short → Full → None → Short.  Persisted on the [`LogStream`]
+    /// like the other render toggles.
+    fn cycle_hostname_display(&mut self) {
+        let stream_id = self.tabs[self.active].stream;
+        let Some(mut stream) = self.session.streams.remove(&stream_id) else {
+            return;
+        };
+        stream.hostname_display = match stream.hostname_display {
+            HostnameDisplay::Short => HostnameDisplay::Full,
+            HostnameDisplay::Full => HostnameDisplay::None,
+            HostnameDisplay::None => HostnameDisplay::Short,
+        };
+        self.rerender_after_stream_mutation(stream_id, stream);
+    }
+
+    /// Re-inserts `stream` into the session and triggers a `rerender`
+    /// on every tab targeting it.  Shared by the F/D/H toggles, all of
+    /// which mutate one rendering knob and want every tab to repaint
+    /// with the new value.
+    fn rerender_after_stream_mutation(
+        &mut self,
+        stream_id: LogStreamId,
+        stream: LogStream,
+    ) {
         let new_filter = stream.filter.clone();
         let show_extras = stream.show_extras;
         let show_date = stream.show_date;
+        let hostname_display = stream.hostname_display;
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.rerender(&self.engine, &new_filter, show_extras, show_date);
+                tab.rerender(
+                    &self.engine,
+                    &new_filter,
+                    show_extras,
+                    show_date,
+                    hostname_display,
+                );
             }
         }
     }
@@ -1188,6 +1245,17 @@ impl App {
     fn active_show_date(&self) -> bool {
         let stream_id = self.tabs[self.active].stream;
         self.session.streams.get(&stream_id).expect("stream exists").show_date
+    }
+
+    /// Returns the active stream's hostname-rendering mode.  Used by
+    /// the footer to show the H-key state.
+    fn active_hostname_display(&self) -> HostnameDisplay {
+        let stream_id = self.tabs[self.active].stream;
+        self.session
+            .streams
+            .get(&stream_id)
+            .expect("stream exists")
+            .hostname_display
     }
 
     fn rename_active_tab(&mut self, name: String) {
@@ -2028,6 +2096,14 @@ impl App {
                     || modifiers == KeyModifiers::SHIFT =>
             {
                 self.toggle_show_date();
+            }
+            // `H`: cycle the hostname-rendering mode through
+            // Short → Full → None → Short.
+            KeyEvent { code: KeyCode::Char('H'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.cycle_hostname_display();
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -2900,21 +2976,23 @@ fn render(frame: &mut Frame, app: &mut App) {
             } else if total == 0 {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     / search · </> step={} · x/X exclude/include · \
-                     b bookmark · ^T new · S summary · ^W close · \
-                     r rename · 0/0",
+                     H host={} · / search · </> step={} · \
+                     x/X exclude/include · b bookmark · ^T new · \
+                     S summary · ^W close · r rename · 0/0",
                     if app.active_show_extras() { "on" } else { "off" },
                     if app.active_show_date() { "on" } else { "off" },
+                    hostname_display_label(app.active_hostname_display()),
                     app.current_step_label(),
                 )
             } else {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     / search · </> step={} · x/X exclude/include · \
-                     b bookmark · ^T new · S summary · ^W close · \
-                     r rename · {}-{} of {}",
+                     H host={} · / search · </> step={} · \
+                     x/X exclude/include · b bookmark · ^T new · \
+                     S summary · ^W close · r rename · {}-{} of {}",
                     if app.active_show_extras() { "on" } else { "off" },
                     if app.active_show_date() { "on" } else { "off" },
+                    hostname_display_label(app.active_hostname_display()),
                     app.current_step_label(),
                     top + 1,
                     bottom,
@@ -3405,10 +3483,11 @@ mod tests {
     #[test]
     fn render_paints_rows_and_footer() {
         // Wide enough to hold the entire footer including the trailing
-        // dynamic info (step indicator, fields toggle, "1-3 of 3"
-        // counter) without truncation; the live footer is sized to be
-        // legible at 80 cols even when terminals truncate it.
-        let backend = TestBackend::new(160, 6);
+        // dynamic info (step indicator, fields/date/host toggles,
+        // "1-3 of 3" counter) without truncation; the live footer is
+        // sized to be legible at 80 cols even when terminals truncate
+        // it.
+        let backend = TestBackend::new(200, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
             "alpha line".to_string(),
@@ -5292,6 +5371,51 @@ mod tests {
     /// shape for the value (e.g. `r#""0.1.0""#`, `42`).
     type RecordSpec<'a> = (i64, &'a str, &'a [(&'a str, &'a str)]);
 
+    /// Builds an [`App`] over a synthetic bunyan file whose every
+    /// record uses the supplied `hostname`.  Companion to
+    /// [`multi_line_app`] for tests that need a non-trivial hostname
+    /// (e.g. to exercise the H-toggle's short/full/none cycle).
+    /// `records` is `(epoch_secs, msg)` pairs; extras aren't emitted
+    /// because the hostname tests don't need them.
+    fn host_app(
+        hostname: &str,
+        records: &[(i64, &str)],
+    ) -> (App, camino_tempfile::Utf8TempDir) {
+        use camino_tempfile::tempdir;
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        for (secs, msg) in records {
+            let time =
+                chrono::DateTime::<chrono::Utc>::from_timestamp(*secs, 0)
+                    .unwrap()
+                    .to_rfc3339();
+            let line = format!(
+                r#"{{"v":0,"level":30,"name":"Nexus","hostname":{},"pid":1,"time":"{time}","msg":{}}}"#,
+                serde_json::Value::String(hostname.to_string()),
+                serde_json::Value::String(msg.to_string()),
+            );
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        }
+        let mut engine = Engine::new();
+        engine.add_file_source(&path).unwrap();
+        let mut a = App::new(engine);
+        a.viewport_height = 10;
+        (a, dir)
+    }
+
     fn multi_line_app(
         records: &[RecordSpec<'_>],
     ) -> (App, camino_tempfile::Utf8TempDir) {
@@ -5640,6 +5764,102 @@ mod tests {
         let streams: Vec<_> = restored.streams.iter().collect();
         assert_eq!(streams.len(), 1);
         assert!(streams[0].show_date);
+    }
+
+    // ---------- hostname display cycle (H) ----------
+
+    #[test]
+    fn streams_default_to_short_hostname() {
+        let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+    }
+
+    #[test]
+    fn shift_h_cycles_short_full_none_short() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        a.handle_key(shift('H'));
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
+        a.handle_key(shift('H'));
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::None);
+        a.handle_key(shift('H'));
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        // Bare `H` (no SHIFT) advances too.
+        a.handle_key(key(KeyCode::Char('H')));
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
+    }
+
+    #[test]
+    fn shift_h_repaints_with_new_hostname_form() {
+        // Use a hostname that exercises both the dot-trim and the
+        // UUID-collapse, so each cycle step produces a visibly
+        // different rendered line.
+        let (mut a, _dir) = host_app(
+            "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
+            &[(10, "first")],
+        );
+        let short_line = a.active_tab().formatted[0].clone();
+        assert!(
+            short_line.contains(" oxz_nexus_c53300fc Nexus/"),
+            "expected short hostname, got {short_line:?}",
+        );
+
+        a.handle_key(shift('H')); // → Full
+        let full_line = a.active_tab().formatted[0].clone();
+        assert!(
+            full_line.contains(
+                " oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test \
+                 Nexus/",
+            ),
+            "expected full hostname, got {full_line:?}",
+        );
+
+        a.handle_key(shift('H')); // → None
+        let no_host_line = a.active_tab().formatted[0].clone();
+        assert!(
+            !no_host_line.contains("oxz_nexus_"),
+            "expected no hostname, got {no_host_line:?}",
+        );
+        assert!(
+            no_host_line.contains(" Nexus/"),
+            "expected name/pid still present, got {no_host_line:?}",
+        );
+    }
+
+    #[test]
+    fn hostname_display_persists_into_session_round_trip() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        // Cycle once: Short → Full.
+        a.handle_key(shift('H'));
+        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        let stream_id = a.tabs[a.active].stream;
+        let stream = restored.streams.get(&stream_id).unwrap();
+        assert_eq!(stream.hostname_display, HostnameDisplay::Full);
+    }
+
+    #[test]
+    fn legacy_session_without_hostname_display_defaults_to_short() {
+        // `hostname_display` was added after `show_extras`/`show_date`;
+        // legacy session JSON won't carry it.  Loading must default to
+        // `Short` (the new default) rather than crashing or silently
+        // falling back to a different variant.
+        let json = serde_json::json!({
+            "version": seer::CURRENT_SESSION_VERSION,
+            "streams": [{
+                "id": "00000000-0000-0000-0000-000000000001",
+                "name": "Tab 1",
+                "show_extras": false,
+            }],
+            "bookmarks": [],
+            "next_bookmark_id": 1,
+        });
+        let restored: Session = serde_json::from_value(json).unwrap();
+        let streams: Vec<_> = restored.streams.iter().collect();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].hostname_display, HostnameDisplay::Short);
     }
 
     // ---------- Summary tab ----------
