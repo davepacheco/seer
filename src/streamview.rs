@@ -152,10 +152,10 @@ pub enum SearchOutcome {
     /// direction) without finding a match.
     NotFound,
     /// The search hit its per-call budget.  The viewport position is
-    /// unchanged; calling `search_step` again resumes from where the
-    /// previous one stopped only if the caller has not navigated in
-    /// the meantime — today, we simply stop at the budget and the user
-    /// gets a notice.
+    /// unchanged.  Calling `search_step` again with the same regex and
+    /// direction, *without* navigating in between, resumes from where
+    /// the previous call stopped — see [`StreamView::search_step`] for
+    /// the conditions that invalidate the resume point.
     BudgetExhausted,
 }
 
@@ -171,6 +171,27 @@ pub enum SearchDir {
 enum TimeDir {
     Forward,
     Backward,
+}
+
+/// Snapshot of where a budget-exhausted search stopped, so a follow-up
+/// call can resume scanning instead of restarting from the anchor.
+///
+/// The resume is honored only when (a) the regex pattern matches, (b)
+/// the direction matches, and (c) the anchor hasn't moved since the
+/// snapshot — the first two guard against switching to a different
+/// search, the third detects user navigation between calls.  When the
+/// snapshot's record has been trimmed out of the window the snapshot
+/// is silently dropped (the user has scrolled far away; resuming would
+/// re-fetch from byte 0 anyway).
+#[derive(Clone, Debug)]
+struct SearchResumePoint {
+    pattern: String,
+    direction: SearchDir,
+    anchor_when_set: Anchor,
+    record_key: RecordKey,
+    /// Forward: lowest line within the record to scan next.
+    /// Backward: highest line within the record to scan next.
+    line_bound: usize,
 }
 
 /// Lazy-windowed materialization for one stream tab's view of the
@@ -197,6 +218,11 @@ pub struct StreamView {
     backward_eof: bool,
     anchor: Anchor,
     parse_stats: ParseStats,
+    /// Set when a search returns [`SearchOutcome::BudgetExhausted`] so
+    /// the next `search_step` call can pick up where this one stopped.
+    /// Cleared on `Found` and `NotFound`; ignored when the regex,
+    /// direction, or anchor changes between calls.
+    search_resume: Option<SearchResumePoint>,
 }
 
 impl StreamView {
@@ -214,6 +240,7 @@ impl StreamView {
             backward_eof: false,
             anchor: Anchor::PinFront,
             parse_stats: ParseStats::default(),
+            search_resume: None,
         }
     }
 
@@ -923,6 +950,14 @@ impl StreamView {
     /// initial scan (so `n` after a previous match doesn't re-find the
     /// same line); if false, includes it (the initial `/<pattern>` does
     /// match a line at the cursor's current position if applicable).
+    ///
+    /// Walks at most [`SEARCH_BUDGET`] records per call before
+    /// returning [`SearchOutcome::BudgetExhausted`].  When that
+    /// happens, the next `search_step` call with the same regex,
+    /// direction, and an unchanged anchor resumes from where this one
+    /// stopped; switching regex or direction or moving the anchor
+    /// (e.g. by scrolling) drops the resume point and restarts from
+    /// the anchor.
     pub fn search_step(
         &mut self,
         engine: &Engine,
@@ -931,13 +966,37 @@ impl StreamView {
         exclusive: bool,
         viewport_height: u16,
     ) -> SearchOutcome {
+        self.search_step_with_budget(
+            engine,
+            regex,
+            direction,
+            exclusive,
+            viewport_height,
+            SEARCH_BUDGET,
+        )
+    }
+
+    /// Same as [`Self::search_step`] but with a caller-supplied
+    /// budget.  Available to `pub(crate)` so streamview's own tests can
+    /// drive [`SearchOutcome::BudgetExhausted`] without having to build
+    /// 50,000-record fixtures.
+    pub(crate) fn search_step_with_budget(
+        &mut self,
+        engine: &Engine,
+        regex: &Regex,
+        direction: SearchDir,
+        exclusive: bool,
+        viewport_height: u16,
+        budget: usize,
+    ) -> SearchOutcome {
         if self.records.is_empty() {
             self.ensure_window(engine, viewport_height);
             if self.records.is_empty() {
                 return SearchOutcome::NotFound;
             }
         }
-        let mut budget = SEARCH_BUDGET;
+        let resume_idx = self.consume_valid_resume(regex, direction);
+        let mut budget = budget;
         match direction {
             SearchDir::Forward => self.search_step_forward(
                 engine,
@@ -945,6 +1004,7 @@ impl StreamView {
                 exclusive,
                 &mut budget,
                 viewport_height,
+                resume_idx,
             ),
             SearchDir::Backward => self.search_step_backward(
                 engine,
@@ -952,8 +1012,48 @@ impl StreamView {
                 exclusive,
                 &mut budget,
                 viewport_height,
+                resume_idx,
             ),
         }
+    }
+
+    /// Takes any saved resume point, validates it against the requested
+    /// scan, and returns the resolved `(record_idx, line_bound)` or
+    /// `None` if it doesn't apply.  A stale resume is dropped on the
+    /// way through so it can't outlive its window.
+    fn consume_valid_resume(
+        &mut self,
+        regex: &Regex,
+        direction: SearchDir,
+    ) -> Option<(usize, usize)> {
+        let resume = self.search_resume.take()?;
+        if resume.pattern != regex.as_str()
+            || resume.direction != direction
+            || resume.anchor_when_set != self.anchor
+        {
+            return None;
+        }
+        let idx = self.find_record_idx(&resume.record_key)?;
+        Some((idx, resume.line_bound))
+    }
+
+    /// Stores a resume point capturing where this scan stopped, so a
+    /// follow-up `search_step` with the same regex/direction and an
+    /// unchanged anchor can pick up where it left off.
+    fn save_search_resume(
+        &mut self,
+        regex: &Regex,
+        direction: SearchDir,
+        record_idx: usize,
+        line_bound: usize,
+    ) {
+        self.search_resume = Some(SearchResumePoint {
+            pattern: regex.as_str().to_string(),
+            direction,
+            anchor_when_set: self.anchor.clone(),
+            record_key: self.records[record_idx].key(),
+            line_bound,
+        });
     }
 
     fn search_step_forward(
@@ -963,12 +1063,21 @@ impl StreamView {
         exclusive: bool,
         budget: &mut usize,
         viewport_height: u16,
+        resume: Option<(usize, usize)>,
     ) -> SearchOutcome {
-        let (mut idx, anchor_line) = self.anchor_indices();
-        let mut start_line = if exclusive { anchor_line + 1 } else { anchor_line };
+        let (mut idx, mut start_line) = resume.unwrap_or_else(|| {
+            let (anchor_idx, anchor_line) = self.anchor_indices();
+            (anchor_idx, if exclusive { anchor_line + 1 } else { anchor_line })
+        });
         loop {
             while idx < self.records.len() {
                 if *budget == 0 {
+                    self.save_search_resume(
+                        regex,
+                        SearchDir::Forward,
+                        idx,
+                        start_line,
+                    );
                     return SearchOutcome::BudgetExhausted;
                 }
                 *budget -= 1;
@@ -992,10 +1101,11 @@ impl StreamView {
                 continue;
             }
             self.trim_front();
-            let (new_idx, _) = self.anchor_indices();
-            // Resume after the anchor — the records we just appended
-            // are at the back of the deque.
-            idx = new_idx + 1;
+            // Newly fetched records are at the back of the deque,
+            // i.e. indices [old_len - fetched .. records.len()).
+            // After trim_front we can locate the first new record by
+            // counting back from records.len().
+            idx = self.records.len() - fetched;
             start_line = 0;
         }
     }
@@ -1007,33 +1117,46 @@ impl StreamView {
         exclusive: bool,
         budget: &mut usize,
         viewport_height: u16,
+        resume: Option<(usize, usize)>,
     ) -> SearchOutcome {
-        loop {
-            let (anchor_idx, anchor_line) = self.anchor_indices();
-            // Initial pass: scan from anchor backward through cached
-            // records.  `end_line` is the inclusive upper bound for
-            // the first iteration (then `lines.len() - 1` for earlier
-            // records).
-            let mut idx = anchor_idx as isize;
-            let initial_end = if exclusive {
-                anchor_line.saturating_sub(1) as isize
-            } else {
-                anchor_line as isize
-            };
-            // If exclusive and anchor_line is 0, skip the current
-            // record entirely.
-            let mut end_line = if exclusive && anchor_line == 0 {
-                idx -= 1;
-                if idx < 0 {
-                    -1
+        let (mut idx, mut end_line): (isize, isize) = match resume {
+            Some((i, line)) => (i as isize, line as isize),
+            None => {
+                let (anchor_idx, anchor_line) = self.anchor_indices();
+                let mut idx = anchor_idx as isize;
+                // Initial scan upper bound: the anchor's line, or one
+                // before it under `exclusive`.  When `exclusive` and
+                // the anchor is on line 0, skip the current record
+                // entirely and start at the previous one.
+                let end = if exclusive && anchor_line == 0 {
+                    idx -= 1;
+                    if idx < 0 {
+                        -1
+                    } else {
+                        self.records[idx as usize].lines.len() as isize - 1
+                    }
+                } else if exclusive {
+                    anchor_line.saturating_sub(1) as isize
                 } else {
-                    self.records[idx as usize].lines.len() as isize - 1
-                }
-            } else {
-                initial_end
-            };
+                    anchor_line as isize
+                };
+                (idx, end)
+            }
+        };
+        loop {
             while idx >= 0 {
                 if *budget == 0 {
+                    // end_line is always >= 0 here: the initial setup
+                    // only emits -1 alongside idx < 0 (which would
+                    // skip the inner loop), and post-step updates
+                    // assign `lines.len() - 1 >= 0`.
+                    debug_assert!(end_line >= 0);
+                    self.save_search_resume(
+                        regex,
+                        SearchDir::Backward,
+                        idx as usize,
+                        end_line.max(0) as usize,
+                    );
                     return SearchOutcome::BudgetExhausted;
                 }
                 *budget -= 1;
@@ -1063,15 +1186,11 @@ impl StreamView {
                 continue;
             }
             self.trim_back();
-            // After prepending, the anchor's record_idx shifted; the
-            // new records are at the front of the deque.  Set anchor
-            // to the new front so the next loop iteration scans the
-            // freshly-fetched range.
-            let key = self.records.front().unwrap().key();
-            self.anchor = Anchor::On {
-                key,
-                line: self.records.front().unwrap().lines.len() - 1,
-            };
+            // Newly prepended records sit at indices [0, fetched);
+            // continue scanning from the most recent of them backward
+            // toward index 0.
+            idx = fetched as isize - 1;
+            end_line = self.records[idx as usize].lines.len() as isize - 1;
         }
     }
 
@@ -1387,6 +1506,157 @@ mod tests {
             view.search_step(&engine, &regex, SearchDir::Backward, true, 20);
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn search_step_resumes_after_budget_exhausted() {
+        let dir = TestDir::new();
+        // Five records; the match is the last.  A budget of 2 forces
+        // BudgetExhausted on the first call (records 0 and 1 scanned)
+        // and Found on the second.
+        let engine =
+            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        let regex = Regex::new("m50").unwrap();
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            2,
+        );
+        assert_eq!(outcome, SearchOutcome::BudgetExhausted);
+        // Anchor unchanged from initial position.
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
+        // Resume picks up from record 2 with the same regex/direction.
+        // A budget of 5 is plenty to finish.
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            5,
+        );
+        assert_eq!(outcome, SearchOutcome::Found);
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m50"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn search_step_resume_invalidated_by_anchor_move() {
+        let dir = TestDir::new();
+        let engine =
+            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        let regex = Regex::new("nonexistent").unwrap();
+        // Exhaust the budget without finding anything.
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            2,
+        );
+        assert_eq!(outcome, SearchOutcome::BudgetExhausted);
+        // User scrolls — the resume is now stale.
+        view.scroll_lines(&engine, 1, 20);
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        // Searching with a generous budget completes from the new
+        // anchor and reports NotFound (not BudgetExhausted on the same
+        // prefix).
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            100,
+        );
+        assert_eq!(outcome, SearchOutcome::NotFound);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn search_step_resume_invalidated_by_pattern_change() {
+        let dir = TestDir::new();
+        let engine =
+            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        let r1 = Regex::new("nonexistent").unwrap();
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &r1,
+            SearchDir::Forward,
+            false,
+            20,
+            2,
+        );
+        assert_eq!(outcome, SearchOutcome::BudgetExhausted);
+        // Different regex: the resume should be dropped and the new
+        // search starts from the anchor.  Match m20 sits at record 1,
+        // well within a budget of 2 starting from record 0.
+        let r2 = Regex::new("m20").unwrap();
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &r2,
+            SearchDir::Forward,
+            false,
+            20,
+            2,
+        );
+        assert_eq!(outcome, SearchOutcome::Found);
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn search_step_found_clears_resume() {
+        // After a Found, the next search should start from the new
+        // anchor (not from a leftover resume point).  We assert this
+        // indirectly: search exhausts → finds → search again with the
+        // same regex/dir/budget and a too-tight budget should now hit
+        // a fresh BudgetExhausted relative to the new anchor.
+        let dir = TestDir::new();
+        let engine =
+            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        let regex = Regex::new("m30").unwrap();
+        // Find m30 (record 2) within a generous budget.
+        let _ = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            10,
+        );
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
+        // Now search exclusively (n) for the SAME pattern with a
+        // budget of 1 from the anchor at m30.  No more m30 ahead, so
+        // it'll budget-exhaust before reaching the (nonexistent) next
+        // match — i.e., on record 3 (m40).  If the resume from a
+        // prior Found weren't cleared, this call would resume past
+        // record 2 with stale state and might report different
+        // behavior.
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            true,
+            20,
+            1,
+        );
+        assert_eq!(outcome, SearchOutcome::BudgetExhausted);
+        // The anchor stayed on m30 (BudgetExhausted doesn't move it).
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
         dir.cleanup();
     }
 

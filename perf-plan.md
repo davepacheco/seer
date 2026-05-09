@@ -199,14 +199,6 @@ each other.
   shape.  Switching those callers to read records via the streamview
   (by `RecordKey`) lets us drop the per-navigation rebuild.  Bounded but
   non-trivial — `WINDOW_SOFT_CAP` records of clones per `n`/`<`/`>`.
-- **Resumable search budget.**  `StreamView::search_step` returns
-  `BudgetExhausted` after `SEARCH_BUDGET` records; the streamview's
-  anchor is unchanged, so a follow-up `n` re-scans the same prefix and
-  hits the same wall.  The current TUI notice is honest about that
-  ("no match found in N records") but lacks a way to continue.  Fix
-  by tracking a scan-resume cursor on `TabSearch` (or on the
-  streamview itself) and advancing it when the budget trips, so the
-  next `n` picks up where we stopped.
 - **Single stepper construction in bookmark navigation.**
   `App::navigate_to_bookmark_cursor` builds an unfiltered stepper to
   read the bookmarked event for the filter check, *then* calls
@@ -225,15 +217,15 @@ each other.
   `materialize_streamview` still mints one per `Ok` event purely to
   feed the legacy shape `tab.events` expects — see the first deferred
   item).
-- **Sparse time index** (offset of every Kth record's timestamp, built
-  during the first full pass) to make "jump to time T" O(log) instead
-  of O(scan from start).  Add when time-jump feels slow on real data.
-- **Cross-run caching of per-file metadata.**  The first-record /
-  last-record probe should be cheap enough that this isn't pressing.
 
 Deferred indefinitely:
 
 - **`mmap`-based access.**  Sticking with `File` for now.
 - **Serialized parsed-record cache.**  Implementation cost is high
   relative to the savings once the cursor model is in place.
+- **Sparse time index** (offset of every Kth record's timestamp, built
+  during the first full pass) to make "jump to time T" O(log) instead
+  of O(scan from start).  Add when time-jump feels slow on real data.
+- **Cross-run caching of per-file metadata.**  The first-record /
+  last-record probe should be cheap enough that this isn't pressing.
 

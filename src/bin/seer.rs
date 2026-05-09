@@ -1380,15 +1380,12 @@ impl App {
             }
             SearchOutcome::NotFound => {}
             SearchOutcome::BudgetExhausted => {
-                // The streamview's anchor is unchanged on budget
-                // exhaustion, so a follow-up `n` would re-scan the
-                // same prefix and hit the same wall.  Surface that
-                // honestly rather than promising resumability we
-                // don't deliver until budget state can carry across
-                // calls.
+                // The streamview saved a resume point so a follow-up
+                // `n` (without intervening navigation) picks up where
+                // this scan stopped.
                 self.notice = Some(format!(
-                    "search exceeded the {SEARCH_BUDGET}-record \
-                     budget; no match found",
+                    "search hit the {SEARCH_BUDGET}-record budget \
+                     without a match; press n to keep searching",
                 ));
             }
         }
