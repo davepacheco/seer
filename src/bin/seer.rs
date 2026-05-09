@@ -584,29 +584,6 @@ impl Tab {
         self.search = None;
     }
 
-    /// Slides the lazy window so it covers `viewport_top + viewport_height`
-    /// plus a small over-fetch buffer in each direction; re-materializes
-    /// the cached vectors and re-anchors `viewport_top` to the same
-    /// record/line.
-    ///
-    /// Called by the App after each scroll/jump so the user can keep
-    /// navigating past the initially-fetched window.  No-op for tabs
-    /// without a [`StreamView`] (Summary tabs and test fixtures).
-    fn maintain_window(
-        &mut self,
-        engine: &Engine,
-        viewport_height: u16,
-    ) {
-        let Some(view) = self.streamview.as_mut() else {
-            return;
-        };
-        // Snap the streamview's anchor to the user's current viewport
-        // top so subsequent extension targets the right region.
-        view.set_anchor_to_flat_line(self.viewport_top);
-        view.ensure_window(engine, viewport_height);
-        self.resync_from_streamview(viewport_height);
-    }
-
     /// Resets the viewport to the start of the merged stream and
     /// rebuilds the materialized cache.  Falls back to plain
     /// `viewport_top = 0` for tabs without a [`StreamView`] (test
@@ -694,13 +671,41 @@ impl Tab {
         self.formatted.len().saturating_sub(viewport_height as usize)
     }
 
-    fn scroll_down(&mut self, n: usize, viewport_height: u16) {
-        let max = self.max_top(viewport_height);
-        self.viewport_top = (self.viewport_top + n).min(max);
+    /// Scrolls `n` display lines forward.  For streamview-backed tabs
+    /// this drives [`StreamView::scroll_lines`] so the lazy window can
+    /// extend past its initial fetch — without that path scrolling
+    /// would clamp at the cached records' edge and the user would never
+    /// see anything beyond the first batch.  Tabs without a streamview
+    /// (test fixtures and Summary tabs) keep the simple bump-and-clamp
+    /// path against the precomputed `formatted` vector.
+    fn scroll_down(
+        &mut self,
+        engine: &Engine,
+        n: usize,
+        viewport_height: u16,
+    ) {
+        if let Some(view) = self.streamview.as_mut() {
+            view.scroll_lines(engine, n as isize, viewport_height);
+            self.resync_from_streamview(viewport_height);
+        } else {
+            let max = self.max_top(viewport_height);
+            self.viewport_top = (self.viewport_top + n).min(max);
+        }
     }
 
-    fn scroll_up(&mut self, n: usize) {
-        self.viewport_top = self.viewport_top.saturating_sub(n);
+    /// Symmetric to [`Self::scroll_down`].
+    fn scroll_up(
+        &mut self,
+        engine: &Engine,
+        n: usize,
+        viewport_height: u16,
+    ) {
+        if let Some(view) = self.streamview.as_mut() {
+            view.scroll_lines(engine, -(n as isize), viewport_height);
+            self.resync_from_streamview(viewport_height);
+        } else {
+            self.viewport_top = self.viewport_top.saturating_sub(n);
+        }
     }
 
     /// Moves the select-mode highlight by `delta` *records* (positive
@@ -1010,20 +1015,6 @@ impl App {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
-    }
-
-    /// Slides the active tab's lazy window so it covers the new
-    /// viewport position, fetching from the engine if the user
-    /// scrolled past the cached records' edge.  Called after every
-    /// scroll/jump; a no-op for tabs without a [`StreamView`].
-    fn maintain_active_window(&mut self) {
-        let h = self.viewport_height;
-        let active = self.active;
-        // Splitting the borrow: self.tabs[active] is mutable, &self.engine
-        // is shared; both fields of `self` so we go through field-level
-        // access rather than helper methods to keep the borrow checker
-        // happy.
-        self.tabs[active].maintain_window(&self.engine, h);
     }
 
     /// Resets the active tab to the end of the merged stream.  Errors
@@ -1862,16 +1853,17 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
-                self.active_tab_mut().scroll_down(1, h);
-                self.maintain_active_window();
+                let active = self.active;
+                self.tabs[active].scroll_down(&self.engine, 1, h);
             }
             KeyEvent {
                 code: KeyCode::Char('k') | KeyCode::Up,
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.active_tab_mut().scroll_up(1);
-                self.maintain_active_window();
+                let h = self.viewport_height;
+                let active = self.active;
+                self.tabs[active].scroll_up(&self.engine, 1, h);
             }
             KeyEvent {
                 code: KeyCode::Char('d'),
@@ -1879,8 +1871,8 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
-                self.active_tab_mut().scroll_down(half_page, h);
-                self.maintain_active_window();
+                let active = self.active;
+                self.tabs[active].scroll_down(&self.engine, half_page, h);
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
@@ -1888,16 +1880,17 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
-                self.active_tab_mut().scroll_down(page, h);
-                self.maintain_active_window();
+                let active = self.active;
+                self.tabs[active].scroll_down(&self.engine, page, h);
             }
             KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                self.active_tab_mut().scroll_up(half_page);
-                self.maintain_active_window();
+                let h = self.viewport_height;
+                let active = self.active;
+                self.tabs[active].scroll_up(&self.engine, half_page, h);
             }
             KeyEvent {
                 code: KeyCode::Char('g') | KeyCode::Home,
@@ -3166,6 +3159,53 @@ mod tests {
         let mut a = app(100, 10);
         a.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(a.active_tab().viewport_top, 10);
+    }
+
+    /// Regression: scrolling forward past the streamview's initial fetch
+    /// must extend the lazy window instead of clamping at the cached
+    /// records' edge.  Before the fix, `Tab::scroll_down` clamped
+    /// `viewport_top` against `formatted.len()` and `maintain_window`
+    /// only filled an empty window, so a user could never see beyond the
+    /// initial batch (~256 records on a real engine, 100 here for speed).
+    #[test]
+    fn scroll_down_extends_streamview_past_initial_window() {
+        use camino_tempfile::tempdir;
+        use slog::{Drain, Logger, info, o};
+        use std::fs::OpenOptions;
+        use std::sync::Mutex;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let drain = slog_bunyan::with_name("Nexus", file).build().fuse();
+            let log = Logger::root(Mutex::new(drain).fuse(), o!());
+            for i in 0..1000 {
+                info!(log, "entry"; "i" => i);
+            }
+        }
+
+        let mut engine = Engine::new();
+        engine.add_file_source(&path).unwrap();
+        let mut a = App::new(engine);
+        a.viewport_height = 10;
+        let initial_len = a.active_tab().formatted.len();
+        // Page down a generous number of times — each press advances by
+        // viewport_height (10) lines, so 50 presses target line 500,
+        // well past the bug's clamp point.
+        for _ in 0..50 {
+            a.handle_key(key(KeyCode::Char(' ')));
+        }
+        let top = a.active_tab().viewport_top;
+        assert!(
+            top > initial_len,
+            "viewport_top {top} stuck at or below initial cache \
+             {initial_len}; lazy window did not extend",
+        );
     }
 
     #[test]
