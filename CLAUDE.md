@@ -303,3 +303,4 @@ New tabs should still open with this dialog.
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
+- when applying filter, the view gets reset to the top.  that's wrong.  should stay at the top of the viewport, or the next non-deleted record above
