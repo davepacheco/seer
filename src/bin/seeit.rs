@@ -20,8 +20,9 @@ struct Args {
     #[arg(required = true)]
     files: Vec<Utf8PathBuf>,
 
-    /// Filter expression, e.g. `level>=warn name=Nexus msg=~boom`.
-    /// See `seer::filter` docs for the full grammar.
+    /// Filter expression, e.g. `level>=warn name=Nexus msg=~boom
+    /// time>=2026-05-09T00:00:00Z`.  See `seer::filter` docs for the
+    /// full grammar.
     #[arg(short, long, default_value = "")]
     filter: String,
 }

@@ -286,7 +286,6 @@ New tabs should still open with this dialog.
 ### TODO
 
 - be able to hide individual fields: name, pid (pid off by default)
-- filter time with >= / > / <= / <
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
 - progress bar, ^C option when:

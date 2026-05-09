@@ -21,7 +21,7 @@ pub use engine::{
     Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
-pub use filter::{Filter, FilterParseError, Predicate};
+pub use filter::{Filter, FilterParseError, Predicate, TimeOp};
 pub use render::{HostnameDisplay, format_event, format_time, short_hostname};
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,

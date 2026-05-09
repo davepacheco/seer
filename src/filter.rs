@@ -17,9 +17,11 @@
 //!
 //! Tokens are split with [`shlex`], so values containing spaces can be
 //! double-quoted.  Each token is one predicate; the supported operators
-//! are `>=` (level only), `==` and `=` (equality), `!=` (negated
-//! equality), `=~` (regex, on `msg` and `source_id`), and `!~` (negated
-//! regex, on the same).  Level names are case-insensitive.
+//! are `>=` (level or time), `<=`, `>`, `<` (time only), `==` and `=`
+//! (equality), `!=` (negated equality), `=~` (regex, on `msg` and
+//! `source_id`), and `!~` (negated regex, on the same).  Level names
+//! are case-insensitive.  Time values are parsed as RFC 3339 (e.g.
+//! `time>=2026-05-09T12:00:00Z`).
 //!
 //! `source_id=~regex` (and `!~`) is special: it filters whole sources
 //! at query time, before any of their lines are read, rather than
@@ -33,6 +35,7 @@
 
 use crate::event::{Event, Level};
 use crate::source::SourceId;
+use chrono::{DateTime, SecondsFormat, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -131,6 +134,35 @@ pub enum Predicate {
         #[serde(default)]
         negated: bool,
     },
+    /// `event.time` compared against `value` using `op`.  Negation is
+    /// expressed by flipping the operator (e.g. `!(time >= X)` is
+    /// `time < X`), so there is no separate `negated` flag.
+    TimeBound { op: TimeOp, value: DateTime<Utc> },
+}
+
+/// Comparison operator for a [`Predicate::TimeBound`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeOp {
+    /// `event.time >= value`
+    AtLeast,
+    /// `event.time > value`
+    After,
+    /// `event.time <= value`
+    AtMost,
+    /// `event.time < value`
+    Before,
+}
+
+impl TimeOp {
+    /// Returns the DSL token for this operator (e.g. `>=`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AtLeast => ">=",
+            Self::After => ">",
+            Self::AtMost => "<=",
+            Self::Before => "<",
+        }
+    }
 }
 
 impl Predicate {
@@ -153,6 +185,12 @@ impl Predicate {
             // double-reject (or reject events whose source it can't
             // see).
             Self::SourceIdMatches { .. } => true,
+            Self::TimeBound { op, value } => match op {
+                TimeOp::AtLeast => event.time >= *value,
+                TimeOp::After => event.time > *value,
+                TimeOp::AtMost => event.time <= *value,
+                TimeOp::Before => event.time < *value,
+            },
         }
     }
 
@@ -168,7 +206,8 @@ impl Predicate {
             Self::LevelAtLeast(_)
             | Self::LevelEquals { .. }
             | Self::FieldEquals { .. }
-            | Self::MsgMatches { .. } => true,
+            | Self::MsgMatches { .. }
+            | Self::TimeBound { .. } => true,
         }
     }
 }
@@ -213,6 +252,8 @@ pub enum FilterParseError {
     BadLevel(String),
     #[error("invalid regex: {0}")]
     BadRegex(String),
+    #[error("invalid timestamp {value:?}: {error}")]
+    BadTime { value: String, error: String },
 }
 
 impl FromStr for Filter {
@@ -230,8 +271,9 @@ impl FromStr for Filter {
 
 fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
     // Order matters: multi-char operators that overlap with shorter ones
-    // must be probed first.  `!=` and `!~` come before `=`; `=~` and
-    // `==` and `>=` likewise.
+    // must be probed first.  `!=` and `!~` come before `=`; `=~`, `==`,
+    // `>=`, and `<=` likewise; bare `>` and `<` come after their `=`-
+    // suffixed forms.
     if let Some((lhs, rhs)) = tok.split_once("=~") {
         return parse_regex_predicate(
             tok, lhs, rhs, /* negated = */ false,
@@ -245,11 +287,12 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
         return if lhs == "level" {
             Ok(Predicate::LevelAtLeast(parse_level(rhs)?))
         } else {
-            Err(FilterParseError::UnsupportedFieldOp {
-                name: lhs.to_string(),
-                op: ">=".to_string(),
-            })
+            parse_time_compare(lhs, rhs, TimeOp::AtLeast)
         };
+    }
+    if let Some((lhs, rhs)) = tok.split_once("<=") {
+        require_nonempty_name(tok, lhs)?;
+        return parse_time_compare(lhs, rhs, TimeOp::AtMost);
     }
     if let Some((lhs, rhs)) = tok.split_once("==") {
         return field_or_level(tok, lhs, rhs, /* negated = */ false);
@@ -257,10 +300,42 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
     if let Some((lhs, rhs)) = tok.split_once("!=") {
         return field_or_level(tok, lhs, rhs, /* negated = */ true);
     }
+    if let Some((lhs, rhs)) = tok.split_once('>') {
+        require_nonempty_name(tok, lhs)?;
+        return parse_time_compare(lhs, rhs, TimeOp::After);
+    }
+    if let Some((lhs, rhs)) = tok.split_once('<') {
+        require_nonempty_name(tok, lhs)?;
+        return parse_time_compare(lhs, rhs, TimeOp::Before);
+    }
     if let Some((lhs, rhs)) = tok.split_once('=') {
         return field_or_level(tok, lhs, rhs, /* negated = */ false);
     }
     Err(FilterParseError::NoOperator { token: tok.to_string() })
+}
+
+fn parse_time_compare(
+    lhs: &str,
+    rhs: &str,
+    op: TimeOp,
+) -> Result<Predicate, FilterParseError> {
+    if lhs == "time" {
+        Ok(Predicate::TimeBound { op, value: parse_time(rhs)? })
+    } else {
+        Err(FilterParseError::UnsupportedFieldOp {
+            name: lhs.to_string(),
+            op: op.as_str().to_string(),
+        })
+    }
+}
+
+fn parse_time(s: &str) -> Result<DateTime<Utc>, FilterParseError> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .map_err(|e| FilterParseError::BadTime {
+            value: s.to_string(),
+            error: e.to_string(),
+        })
 }
 
 fn parse_regex_predicate(
@@ -364,6 +439,16 @@ impl fmt::Display for Predicate {
             Self::SourceIdMatches { regex, negated } => {
                 let op = if *negated { "!~" } else { "=~" };
                 write!(f, "source_id{}{}", op, quote(regex.as_str()))
+            }
+            Self::TimeBound { op, value } => {
+                // RFC 3339 with `Z` rather than `+00:00` for round-trip
+                // symmetry: shorter to read and parses identically.
+                write!(
+                    f,
+                    "time{}{}",
+                    op.as_str(),
+                    value.to_rfc3339_opts(SecondsFormat::AutoSi, true),
+                )
             }
         }
     }
@@ -979,6 +1064,11 @@ mod tests {
             "source_id=~nexus",
             "source_id!~debug",
             "level>=info name=Nexus msg=~boom",
+            "time>=2026-05-09T12:00:00Z",
+            "time>2026-05-09T12:00:00Z",
+            "time<=2026-05-09T12:00:00Z",
+            "time<2026-05-09T12:00:00Z",
+            "time>=2026-05-01T00:00:00Z time<=2026-05-09T23:59:59Z",
         ];
         for src in inputs {
             let parsed: Filter = src.parse().unwrap();
@@ -1094,6 +1184,165 @@ mod tests {
     #[test]
     fn other_predicates_dont_constrain_source_id() {
         let f: Filter = "level>=warn name=Nexus msg=~boom".parse().unwrap();
+        assert!(f.matches_source_id(&sid("/anything.log")));
+    }
+
+    // ---------- time bounds ----------
+
+    fn ev_at(time: &str) -> Event {
+        ev(&format!(
+            r#"{{
+                "v": 0,
+                "level": 30,
+                "name": "n",
+                "hostname": "h",
+                "pid": 1,
+                "time": "{time}",
+                "msg": "m"
+            }}"#
+        ))
+    }
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn time_bound_at_least_matches_at_and_after() {
+        let cutoff = t("2026-05-09T12:00:00Z");
+        let p = Predicate::TimeBound { op: TimeOp::AtLeast, value: cutoff };
+        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(p.matches(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+    }
+
+    #[test]
+    fn time_bound_after_matches_strictly_after() {
+        let cutoff = t("2026-05-09T12:00:00Z");
+        let p = Predicate::TimeBound { op: TimeOp::After, value: cutoff };
+        assert!(!p.matches(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(p.matches(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+    }
+
+    #[test]
+    fn time_bound_at_most_matches_at_and_before() {
+        let cutoff = t("2026-05-09T12:00:00Z");
+        let p = Predicate::TimeBound { op: TimeOp::AtMost, value: cutoff };
+        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(p.matches(&ev_at("2026-05-09T11:59:59Z")));
+    }
+
+    #[test]
+    fn time_bound_before_matches_strictly_before() {
+        let cutoff = t("2026-05-09T12:00:00Z");
+        let p = Predicate::TimeBound { op: TimeOp::Before, value: cutoff };
+        assert!(!p.matches(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(p.matches(&ev_at("2026-05-09T11:59:59Z")));
+    }
+
+    #[test]
+    fn time_bound_with_offset_input_matches_utc_event() {
+        // Non-UTC offsets in the filter must be normalized to UTC
+        // before comparison so equivalent instants compare equal.
+        let p: Filter = "time>=2026-05-09T07:00:00-05:00".parse().unwrap();
+        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+    }
+
+    #[test]
+    fn parse_time_bound_each_op() {
+        let cases = [
+            ("time>=2026-05-09T12:00:00Z", TimeOp::AtLeast),
+            ("time>2026-05-09T12:00:00Z", TimeOp::After),
+            ("time<=2026-05-09T12:00:00Z", TimeOp::AtMost),
+            ("time<2026-05-09T12:00:00Z", TimeOp::Before),
+        ];
+        for (src, expected_op) in cases {
+            let f = parse(src);
+            match &f.predicates()[0] {
+                Predicate::TimeBound { op, value } => {
+                    assert_eq!(*op, expected_op, "op for {src:?}");
+                    assert_eq!(*value, t("2026-05-09T12:00:00Z"));
+                }
+                other => panic!("unexpected for {src:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_bad_time_errors() {
+        // Plain dates aren't accepted (RFC 3339 requires a time and
+        // offset).  Missing offsets and arbitrary garbage also fail.
+        for src in [
+            "time>=2026-05-09",
+            "time>=2026-05-09T12:00:00",
+            "time>=tomorrow",
+        ] {
+            let err = src.parse::<Filter>().unwrap_err();
+            assert!(
+                matches!(err, FilterParseError::BadTime { .. }),
+                "expected BadTime for {src:?}, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_time_inequality_on_other_field_errors() {
+        // Only `time` accepts <, >, <=.  Any other lhs must be rejected
+        // (and `>=` on a non-level/non-time lhs likewise).
+        for (src, op) in [
+            ("name<foo", "<"),
+            ("name>foo", ">"),
+            ("name<=foo", "<="),
+            ("component>=bar", ">="),
+        ] {
+            let err = src.parse::<Filter>().unwrap_err();
+            match err {
+                FilterParseError::UnsupportedFieldOp {
+                    op: actual_op, ..
+                } => {
+                    assert_eq!(actual_op, op, "for {src:?}");
+                }
+                other => panic!("unexpected for {src:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn display_time_bound_uses_z_suffix() {
+        let p = Predicate::TimeBound {
+            op: TimeOp::AtLeast,
+            value: t("2026-05-09T12:00:00Z"),
+        };
+        let f = Filter { predicates: vec![p] };
+        assert_eq!(f.to_string(), "time>=2026-05-09T12:00:00Z");
+    }
+
+    #[test]
+    fn time_bound_round_trips_through_serde() {
+        let f = Filter {
+            predicates: vec![
+                Predicate::TimeBound {
+                    op: TimeOp::AtLeast,
+                    value: t("2026-05-01T00:00:00Z"),
+                },
+                Predicate::TimeBound {
+                    op: TimeOp::Before,
+                    value: t("2026-05-09T23:59:59Z"),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Filter = serde_json::from_str(&json).unwrap();
+        assert_eq!(f.to_string(), back.to_string());
+    }
+
+    #[test]
+    fn time_bound_does_not_constrain_source_id() {
+        let f: Filter = "time>=2026-05-09T00:00:00Z".parse().unwrap();
         assert!(f.matches_source_id(&sid("/anything.log")));
     }
 
