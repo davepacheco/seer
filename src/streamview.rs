@@ -157,6 +157,11 @@ pub enum SearchOutcome {
     /// the previous call stopped — see [`StreamView::search_step`] for
     /// the conditions that invalidate the resume point.
     BudgetExhausted,
+    /// The caller's `cancel` callback returned `true` mid-scan.  The
+    /// viewport position is unchanged and no resume point is saved, so
+    /// a follow-up `search_step` starts fresh from the current anchor
+    /// rather than picking up where this one stopped.
+    Cancelled,
 }
 
 /// Direction of a search step.
@@ -958,6 +963,11 @@ impl StreamView {
     /// stopped; switching regex or direction or moving the anchor
     /// (e.g. by scrolling) drops the resume point and restarts from
     /// the anchor.
+    ///
+    /// `cancel` is consulted once per scanned record; returning `true`
+    /// aborts the scan with [`SearchOutcome::Cancelled`], leaving the
+    /// anchor unchanged and saving no resume point.  Callers that have
+    /// no cancellation source can pass `&mut || false`.
     pub fn search_step(
         &mut self,
         engine: &Engine,
@@ -965,6 +975,7 @@ impl StreamView {
         direction: SearchDir,
         exclusive: bool,
         viewport_height: u16,
+        cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
         self.search_step_with_budget(
             engine,
@@ -973,6 +984,7 @@ impl StreamView {
             exclusive,
             viewport_height,
             SEARCH_BUDGET,
+            cancel,
         )
     }
 
@@ -980,6 +992,7 @@ impl StreamView {
     /// budget.  Available to `pub(crate)` so streamview's own tests can
     /// drive [`SearchOutcome::BudgetExhausted`] without having to build
     /// 50,000-record fixtures.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn search_step_with_budget(
         &mut self,
         engine: &Engine,
@@ -988,6 +1001,7 @@ impl StreamView {
         exclusive: bool,
         viewport_height: u16,
         budget: usize,
+        cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
         if self.records.is_empty() {
             self.ensure_window(engine, viewport_height);
@@ -1005,6 +1019,7 @@ impl StreamView {
                 &mut budget,
                 viewport_height,
                 resume_idx,
+                cancel,
             ),
             SearchDir::Backward => self.search_step_backward(
                 engine,
@@ -1013,6 +1028,7 @@ impl StreamView {
                 &mut budget,
                 viewport_height,
                 resume_idx,
+                cancel,
             ),
         }
     }
@@ -1056,6 +1072,7 @@ impl StreamView {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_step_forward(
         &mut self,
         engine: &Engine,
@@ -1064,6 +1081,7 @@ impl StreamView {
         budget: &mut usize,
         viewport_height: u16,
         resume: Option<(usize, usize)>,
+        cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
         let (mut idx, mut start_line) = resume.unwrap_or_else(|| {
             let (anchor_idx, anchor_line) = self.anchor_indices();
@@ -1071,6 +1089,9 @@ impl StreamView {
         });
         loop {
             while idx < self.records.len() {
+                if cancel() {
+                    return SearchOutcome::Cancelled;
+                }
                 if *budget == 0 {
                     self.save_search_resume(
                         regex,
@@ -1110,6 +1131,7 @@ impl StreamView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_step_backward(
         &mut self,
         engine: &Engine,
@@ -1118,6 +1140,7 @@ impl StreamView {
         budget: &mut usize,
         viewport_height: u16,
         resume: Option<(usize, usize)>,
+        cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
         let (mut idx, mut end_line): (isize, isize) = match resume {
             Some((i, line)) => (i as isize, line as isize),
@@ -1145,6 +1168,9 @@ impl StreamView {
         };
         loop {
             while idx >= 0 {
+                if cancel() {
+                    return SearchOutcome::Cancelled;
+                }
                 if *budget == 0 {
                     // end_line is always >= 0 here: the initial setup
                     // only emits -1 alongside idx < 0 (which would
@@ -1443,6 +1469,15 @@ mod tests {
         dir.cleanup();
     }
 
+    /// Helper: a no-op `cancel` callback for tests that don't exercise
+    /// the cancellation path.  Returns `false` every time, so the scan
+    /// runs to whichever of [`SearchOutcome::Found`],
+    /// [`SearchOutcome::NotFound`], or [`SearchOutcome::BudgetExhausted`]
+    /// it would have reached.
+    fn never_cancel() -> impl FnMut() -> bool {
+        || false
+    }
+
     #[test]
     fn search_step_finds_match_in_window() {
         let dir = TestDir::new();
@@ -1450,8 +1485,14 @@ mod tests {
         let mut view = StreamView::new(Filter::default(), false);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
-        let outcome =
-            view.search_step(&engine, &regex, SearchDir::Forward, false, 20);
+        let outcome = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            &mut never_cancel(),
+        );
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
         dir.cleanup();
@@ -1464,8 +1505,14 @@ mod tests {
         let mut view = StreamView::new(Filter::default(), false);
         view.ensure_window(&engine, 20);
         let regex = Regex::new("nonexistent").unwrap();
-        let outcome =
-            view.search_step(&engine, &regex, SearchDir::Forward, false, 20);
+        let outcome = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            &mut never_cancel(),
+        );
         assert_eq!(outcome, SearchOutcome::NotFound);
         dir.cleanup();
     }
@@ -1478,12 +1525,24 @@ mod tests {
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
         // First match: m20 at idx 1.
-        let _ =
-            view.search_step(&engine, &regex, SearchDir::Forward, false, 20);
+        let _ = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            &mut never_cancel(),
+        );
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
         // Next match (exclusive=true): the second m20 at idx 3.
-        let outcome =
-            view.search_step(&engine, &regex, SearchDir::Forward, true, 20);
+        let outcome = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            true,
+            20,
+            &mut never_cancel(),
+        );
         assert_eq!(outcome, SearchOutcome::Found);
         // Both records have msg "m20"; we can't distinguish by message
         // alone, but the offset must differ.
@@ -1502,8 +1561,14 @@ mod tests {
         view.scroll_lines(&engine, 4, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m50"));
         let regex = Regex::new("m20").unwrap();
-        let outcome =
-            view.search_step(&engine, &regex, SearchDir::Backward, true, 20);
+        let outcome = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Backward,
+            true,
+            20,
+            &mut never_cancel(),
+        );
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
         dir.cleanup();
@@ -1527,6 +1592,7 @@ mod tests {
             false,
             20,
             2,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::BudgetExhausted);
         // Anchor unchanged from initial position.
@@ -1540,6 +1606,7 @@ mod tests {
             false,
             20,
             5,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m50"));
@@ -1562,6 +1629,7 @@ mod tests {
             false,
             20,
             2,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::BudgetExhausted);
         // User scrolls — the resume is now stale.
@@ -1577,6 +1645,7 @@ mod tests {
             false,
             20,
             100,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::NotFound);
         dir.cleanup();
@@ -1597,6 +1666,7 @@ mod tests {
             false,
             20,
             2,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::BudgetExhausted);
         // Different regex: the resume should be dropped and the new
@@ -1610,6 +1680,7 @@ mod tests {
             false,
             20,
             2,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
@@ -1637,6 +1708,7 @@ mod tests {
             false,
             20,
             10,
+            &mut never_cancel(),
         );
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
         // Now search exclusively (n) for the SAME pattern with a
@@ -1653,9 +1725,50 @@ mod tests {
             true,
             20,
             1,
+            &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::BudgetExhausted);
         // The anchor stayed on m30 (BudgetExhausted doesn't move it).
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn search_step_cancelled_leaves_anchor_and_resume_untouched() {
+        // The cancel callback fires on the very first record check, so
+        // the scan returns Cancelled before touching the anchor.  A
+        // follow-up search with `never_cancel` then completes normally
+        // — proving no stale resume point lingered from the cancelled
+        // run.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        let regex = Regex::new("m30").unwrap();
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            10,
+            &mut || true,
+        );
+        assert_eq!(outcome, SearchOutcome::Cancelled);
+        // Anchor pinned at the start (m10), where it began.
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
+        // Re-running without cancellation finds m30 from the original
+        // anchor — a saved resume point would have skipped it.
+        let outcome = view.search_step_with_budget(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            20,
+            10,
+            &mut never_cancel(),
+        );
+        assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
         dir.cleanup();
     }

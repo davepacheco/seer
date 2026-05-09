@@ -285,8 +285,6 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- Should be able to ^C during a search
-- Should be able to cancel search by deleting the `/`
 - Use millisecond-precision timestamps, no timezone, `Z` suffix
 - be able to hide individual fields: name, hostname, pid
 - filter time with >= / > / <= / <

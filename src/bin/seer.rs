@@ -318,6 +318,30 @@ fn compute_matches(rows: &[String], regex: &Regex) -> Vec<usize> {
         .collect()
 }
 
+/// Cancellation hook for [`StreamView::search_step`]: drains the
+/// terminal's pending event queue and returns `true` if any of those
+/// events is Ctrl-C.  Other events seen along the way are discarded —
+/// during a synchronous search the user is waiting on the search to
+/// complete, and unrelated keystrokes are best ignored rather than
+/// applied against a half-stale view.
+///
+/// `event::poll(Duration::ZERO)` is non-blocking; running it once per
+/// scanned record keeps the cancel latency a single record's worth of
+/// work even on tight regex loops.
+fn ctrl_c_cancel() -> bool {
+    let mut cancelled = false;
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(k)) = event::read()
+            && k.kind != KeyEventKind::Release
+            && k.code == KeyCode::Char('c')
+            && k.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            cancelled = true;
+        }
+    }
+    cancelled
+}
+
 /// Direction of a `less`-style search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchDirection {
@@ -1364,7 +1388,14 @@ impl App {
             .streamview
             .as_mut()
             .unwrap()
-            .search_step(&self.engine, &regex, dir, exclusive, h);
+            .search_step(
+                &self.engine,
+                &regex,
+                dir,
+                exclusive,
+                h,
+                &mut ctrl_c_cancel,
+            );
         match outcome {
             SearchOutcome::Found => {
                 self.tabs[active].resync_from_streamview(h);
@@ -1378,6 +1409,11 @@ impl App {
                     "search hit the {SEARCH_BUDGET}-record budget \
                      without a match; press n to keep searching",
                 ));
+            }
+            SearchOutcome::Cancelled => {
+                // The user hit Ctrl-C during the scan.  Anchor and
+                // resume point are untouched, so the pane looks
+                // exactly as it did before they pressed `/` (or `n`).
             }
         }
     }
@@ -2484,6 +2520,18 @@ impl Dialog {
                 ..
             } => return self.try_apply(),
             _ => {}
+        }
+        // Backspacing past the leading `/` (or `?`) of an empty search
+        // prompt is treated as "I changed my mind" — the same as Esc.
+        // The Filter, Rename, and BookmarkName dialogs deliberately
+        // don't share this shortcut: their empty state is a meaningful
+        // intermediate step (clear-and-retype), whereas an empty search
+        // prompt is just the prompt sitting there with nothing to do.
+        if let Self::Search { editor, .. } = self
+            && editor.text.is_empty()
+            && matches!(key.code, KeyCode::Backspace)
+        {
+            return DialogResult::Cancel;
         }
         let editor_result = match self {
             Self::Filter { editor, .. }
@@ -3866,6 +3914,53 @@ mod tests {
         assert!(a.dialog.is_some());
         assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "alpha ");
         assert_eq!(a.tabs.len(), 1);
+    }
+
+    #[test]
+    fn backspace_on_empty_search_prompt_cancels_dialog() {
+        // Open the prompt, type one character, then backspace twice:
+        // the first delete returns the buffer to empty, the second is
+        // the "back over the leading `/`" gesture and should close the
+        // dialog without applying anything.
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        a.handle_key(key(KeyCode::Char('a')));
+        a.handle_key(key(KeyCode::Backspace));
+        assert!(a.dialog.is_some());
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "");
+        a.handle_key(key(KeyCode::Backspace));
+        assert!(a.dialog.is_none());
+        assert!(a.last_search.is_none());
+        assert!(a.active_tab().search.is_none());
+    }
+
+    #[test]
+    fn backspace_on_freshly_opened_search_prompt_cancels_dialog() {
+        // No characters typed at all: the very first Backspace should
+        // close the dialog, mirroring less / vim's behaviour.
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        assert!(a.dialog.is_some());
+        a.handle_key(key(KeyCode::Backspace));
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn backspace_on_empty_filter_dialog_does_not_cancel() {
+        // The empty-buffer-Backspace shortcut is search-only; the
+        // filter dialog should keep its (preexisting) behaviour of
+        // treating Backspace as a no-op when there's nothing to delete.
+        let mut a = app(10, 5);
+        a.handle_key(key(KeyCode::Char('f')));
+        assert!(a.dialog.is_some());
+        // Clear whatever default text the filter dialog opened with.
+        let len = a.dialog.as_ref().unwrap().editor().unwrap().text.len();
+        for _ in 0..len {
+            a.handle_key(key(KeyCode::Backspace));
+        }
+        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "");
+        a.handle_key(key(KeyCode::Backspace));
+        assert!(a.dialog.is_some(), "filter dialog should stay open");
     }
 
     #[test]
