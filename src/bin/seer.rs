@@ -25,12 +25,10 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
 use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
-#[cfg(test)]
-use seer::SourceId;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
-    LogStreamId, LogStreamPosition, Predicate, ResolvePosition, SEARCH_BUDGET,
-    SearchDir, SearchOutcome, Session, StreamView, SummaryBuilder,
+    Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
+    LogStream, LogStreamId, LogStreamPosition, Predicate, SEARCH_BUDGET,
+    SearchDir, SearchOutcome, Session, SourceId, StreamView, SummaryBuilder,
     format_summary,
 };
 use std::collections::HashMap;
@@ -154,9 +152,9 @@ fn render_rows(
 /// index maps.  Computes a [`LogStreamPosition`] per `Ok` event by
 /// counting same-`(source, time)` records seen so far in the window;
 /// the ordinal is window-relative — accurate for filter-change starts
-/// (where the window begins at byte 0), best-effort otherwise.  Step 5
-/// switches bookmarks to byte cursors and removes this dependence on
-/// ordinals.
+/// (where the window begins at byte 0), best-effort otherwise.  The
+/// position is used by exclude-mode and is decoupled from bookmarks,
+/// which now store byte cursors directly.
 fn materialize_streamview(view: &StreamView) -> RenderedRows {
     let mut events = Vec::new();
     let mut formatted = Vec::new();
@@ -1139,18 +1137,17 @@ impl App {
     fn add_bookmark(
         &mut self,
         name: Option<BookmarkName>,
-        position: LogStreamPosition,
-        display_time: chrono::DateTime<chrono::Utc>,
-        display_msg: String,
+        draft: BookmarkDraft,
     ) {
         let stream_id = self.tabs[self.active].stream;
         let bookmark = Bookmark {
             id: BookmarkId::new_v4(),
             created_at: chrono::Utc::now(),
-            position,
+            cursor: draft.cursor,
             name,
-            display_time,
-            display_msg,
+            display_source: draft.display_source,
+            display_time: draft.display_time,
+            display_msg: draft.display_msg,
         };
         self.session.add_bookmark(stream_id, bookmark);
     }
@@ -1205,10 +1202,10 @@ impl App {
 
     /// Navigates to the bookmark at the bookmark-pane cursor.  Switches
     /// to the existing tab if its stream is open, otherwise opens a
-    /// new tab targeting that stream.  Resolves the bookmarked
-    /// position against the active filter; on `FilteredOut` or `Gone`
-    /// stashes a one-shot footer notice so the user knows what
-    /// happened.
+    /// new tab targeting that stream.  Seeks the tab's streamview to
+    /// the bookmark's saved cursor; on a filter mismatch stashes a
+    /// one-shot footer notice so the user knows the anchor landed on
+    /// the nearest visible entry instead of the bookmarked one.
     fn navigate_to_bookmark_cursor(&mut self) {
         let Some(idx) = self.bookmark_cursor_idx() else {
             return;
@@ -1222,7 +1219,7 @@ impl App {
             .find(|(_, v)| v.iter().any(|b| b.id == bm.id))
             .map(|(s, _)| *s)
             .expect("bookmark belongs to some stream");
-        let position = bm.position.clone();
+        let cursor = bm.cursor.clone();
         // Switch to the tab showing the target stream, opening one if
         // none exists.
         let existing = self.tabs.iter().position(|t| t.stream == target_stream);
@@ -1236,21 +1233,11 @@ impl App {
         self.active = tab_idx;
         let filter =
             self.session.streams.get(&target_stream).unwrap().filter.clone();
-        // Convert the time/ordinal anchor into a byte cursor, then
-        // (a) decide whether the bookmarked event survives the active
-        // filter and (b) seek the StreamView to that cursor.  Detecting
-        // FilteredOut requires reading the bookmarked event itself,
-        // which sits one forward step past the cursor under an
-        // unfiltered stepper.
-        let Some(cursor) = self.engine.cursor_for_position(&position) else {
-            self.notice = Some(
-                "bookmarked entry is no longer present in any \
-                 loaded source"
-                    .to_string(),
-            );
-            self.bookmark_cursor = None;
-            return;
-        };
+        // Decide whether the bookmarked event survives the active
+        // filter by reading it through an unfiltered stepper.  The
+        // streamview's seek will hit it (or the nearest visible
+        // neighbor) regardless; the check just feeds the post-jump
+        // footer notice.
         let bookmarked_passes_filter = self
             .engine
             .stepper(Filter::default(), &cursor)
@@ -1259,29 +1246,12 @@ impl App {
             .is_some_and(|e| filter.matches(&e));
         let h = self.viewport_height;
         if let Some(view) = self.tabs[tab_idx].streamview.as_mut() {
-            // The streamview applies the active filter on its stepper,
-            // so seek lands the anchor on the bookmarked event when it
-            // survives, or on the next visible event after when it
-            // doesn't.
             view.seek_to_cursor(&self.engine, cursor, h);
             self.tabs[tab_idx].resync_from_streamview(h);
-        } else {
-            // Test-fixture tabs without a streamview keep the legacy
-            // resolve-by-row-index path.  Production tabs always have
-            // a streamview after `Tab::new` / `refresh`.
-            match self.engine.resolve_position(&filter, &position) {
-                ResolvePosition::Found(event_idx)
-                | ResolvePosition::FilteredOut(event_idx) => {
-                    let line = self.tabs[tab_idx]
-                        .first_line_for_event
-                        .get(event_idx)
-                        .copied()
-                        .unwrap_or(0);
-                    self.tabs[tab_idx].viewport_top = line;
-                }
-                ResolvePosition::Gone => {}
-            }
         }
+        // Tabs constructed by test fixtures without a streamview have
+        // no rows to seek across; the tab switch above is the only
+        // observable effect.  Production tabs always have a streamview.
         if !bookmarked_passes_filter {
             self.notice = Some(
                 "bookmarked entry is hidden by the active filter; \
@@ -1689,17 +1659,23 @@ impl App {
                 self.apply_filter(new_filter);
             }
             SelectionAction::Bookmark => {
-                // Snapshot what the bookmark needs at creation time so
-                // the Bookmarks-tab row can render even when the source
-                // isn't currently loaded.
+                // Test fixtures with synthesized events have no source
+                // attached to the engine; fall back to a default
+                // cursor so the bookmark still renders and can be
+                // deleted, even if "jump to it" lands at the start of
+                // an empty merge.
                 let position = ee.position.clone();
-                let display_time = ee.event.time;
-                let display_msg = preview_msg(&ee.event.msg);
-                self.dialog = Some(Dialog::bookmark_name(
-                    position,
-                    display_time,
-                    display_msg,
-                ));
+                let cursor = self
+                    .engine
+                    .cursor_for_position(&position)
+                    .unwrap_or_default();
+                let draft = BookmarkDraft {
+                    cursor,
+                    display_source: position.source().clone(),
+                    display_time: ee.event.time,
+                    display_msg: preview_msg(&ee.event.msg),
+                };
+                self.dialog = Some(Dialog::bookmark_name(draft));
                 self.active_tab_mut().select = None;
             }
         }
@@ -1824,19 +1800,9 @@ impl App {
                     self.dialog = None;
                     self.repeat_last_search(direction);
                 }
-                DialogResult::ApplyBookmark {
-                    name,
-                    position,
-                    display_time,
-                    display_msg,
-                } => {
+                DialogResult::ApplyBookmark { name, draft } => {
                     self.dialog = None;
-                    self.add_bookmark(
-                        name,
-                        position,
-                        display_time,
-                        display_msg,
-                    );
+                    self.add_bookmark(name, draft);
                 }
                 DialogResult::ApplyDeleteBookmark(id) => {
                     self.dialog = None;
@@ -2320,6 +2286,17 @@ impl LineEditor {
     }
 }
 
+/// All the data a freshly-created bookmark carries through the
+/// name-dialog flow until the user commits it.  The cursor anchors
+/// navigation; the display fields are cached so the Bookmarks tab can
+/// render the row even when the source isn't currently loaded.
+struct BookmarkDraft {
+    cursor: Cursor,
+    display_source: SourceId,
+    display_time: chrono::DateTime<chrono::Utc>,
+    display_msg: String,
+}
+
 /// Modal text dialog overlaying the main view.
 ///
 /// Both variants share the same UX (Esc cancels, Enter applies) and
@@ -2345,15 +2322,10 @@ enum Dialog {
         parse_error: Option<String>,
     },
     /// Naming a new bookmark just created via the `b` flow.  Carries
-    /// the position (and its rendering preview) the bookmark will
-    /// anchor to.  Empty buffer → unnamed bookmark.  No parse feedback;
-    /// any string is a valid name.
-    BookmarkName {
-        editor: LineEditor,
-        position: LogStreamPosition,
-        display_time: chrono::DateTime<chrono::Utc>,
-        display_msg: String,
-    },
+    /// the draft (cursor + display fields) the bookmark will anchor
+    /// to.  Empty buffer → unnamed bookmark.  No parse feedback; any
+    /// string is a valid name.
+    BookmarkName { editor: LineEditor, draft: BookmarkDraft },
     /// Confirming the deletion of a bookmark from the Bookmarks tab.
     /// `id` identifies the bookmark; `label` is what to display in the
     /// dialog title.  No editor: the user picks Cancel (Esc) or
@@ -2387,12 +2359,7 @@ enum DialogResult {
     /// Close the dialog and add this bookmark to the session.  The
     /// bookmark's id and `created_at` are minted at apply time so they
     /// reflect the moment the user actually committed the name.
-    ApplyBookmark {
-        name: Option<BookmarkName>,
-        position: LogStreamPosition,
-        display_time: chrono::DateTime<chrono::Utc>,
-        display_msg: String,
-    },
+    ApplyBookmark { name: Option<BookmarkName>, draft: BookmarkDraft },
     /// Close the dialog and delete the bookmark with this id.  If the
     /// id is no longer present (concurrent edits aren't a thing here,
     /// but defending against stale state is cheap) the action is a
@@ -2426,17 +2393,8 @@ impl Dialog {
     /// Builds the bookmark-name dialog for a freshly-selected row.
     /// Empty initial buffer means "unnamed by default"; the user types
     /// to add a name.
-    fn bookmark_name(
-        position: LogStreamPosition,
-        display_time: chrono::DateTime<chrono::Utc>,
-        display_msg: String,
-    ) -> Self {
-        Self::BookmarkName {
-            editor: LineEditor::new(String::new()),
-            position,
-            display_time,
-            display_msg,
-        }
+    fn bookmark_name(draft: BookmarkDraft) -> Self {
+        Self::BookmarkName { editor: LineEditor::new(String::new()), draft }
     }
 
     fn confirm_delete_bookmark(id: BookmarkId, label: String) -> Self {
@@ -2584,12 +2542,7 @@ impl Dialog {
                     }
                 }
             }
-            Self::BookmarkName {
-                editor,
-                position,
-                display_time,
-                display_msg,
-            } => {
+            Self::BookmarkName { editor, draft } => {
                 let trimmed = editor.text.trim();
                 let name = if trimmed.is_empty() {
                     None
@@ -2598,9 +2551,12 @@ impl Dialog {
                 };
                 DialogResult::ApplyBookmark {
                     name,
-                    position: position.clone(),
-                    display_time: *display_time,
-                    display_msg: display_msg.clone(),
+                    draft: BookmarkDraft {
+                        cursor: draft.cursor.clone(),
+                        display_source: draft.display_source.clone(),
+                        display_time: draft.display_time,
+                        display_msg: draft.display_msg.clone(),
+                    },
                 }
             }
             Self::ConfirmDeleteBookmark { id, .. } => {
@@ -2900,7 +2856,7 @@ fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .take(area.height as usize)
         .map(|bm| {
-            let source_str: &str = bm.position.source().as_ref();
+            let source_str: &str = bm.display_source.as_ref();
             let basename = std::path::Path::new(source_str)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -5031,6 +4987,93 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         assert!(!a.bookmarks_active());
         assert_eq!(a.active, original_tab);
+    }
+
+    #[test]
+    fn bookmark_captures_nondefault_cursor_under_real_engine() {
+        // With a real engine source attached, creating a bookmark on
+        // a non-first record should capture a cursor whose offset is
+        // non-zero — proof that the byte position of the bookmarked
+        // event flowed through `commit_selection`'s
+        // `cursor_for_position` call.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+            (30, "third", &[]),
+        ]);
+        // Without extras: each event is one display line.  Hide them
+        // so row 2 == third event, regardless of the multi_line_app
+        // default.
+        a.handle_key(shift('F'));
+        create_bookmark(&mut a, 2, Some("third"));
+        let bm = a.flat_bookmarks()[0];
+        // The bookmarked event sits well past byte 0.  The cursor's
+        // entry for the source should match that position.
+        let (_, offset) = bm.cursor.iter().next().expect("source recorded");
+        assert!(
+            offset.get() > 0,
+            "expected non-zero offset, got {}",
+            offset.get()
+        );
+        assert_eq!(bm.display_msg, "third");
+    }
+
+    #[test]
+    fn bookmark_navigation_lands_on_bookmarked_event() {
+        // Real-engine round-trip: bookmark the third event, scroll back
+        // to the top, navigate to the bookmark, and verify the
+        // streamview's window starts at the bookmarked record (so the
+        // first formatted line carries its msg).
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+            (30, "third", &[]),
+        ]);
+        a.handle_key(shift('F')); // hide extras: 3 events == 3 lines
+        create_bookmark(&mut a, 2, Some("third"));
+        // Scroll back to the top so the navigation has somewhere to go.
+        a.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(a.active_tab().viewport_top, 0);
+        // Open Bookmarks tab and navigate.
+        a.handle_key(key(KeyCode::Tab));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('k')));
+        a.handle_key(key(KeyCode::Enter));
+        // After seek_to_cursor the window starts at the bookmarked
+        // record, so its rendered line is at index 0 of the
+        // materialized view.
+        assert_eq!(a.active_tab().viewport_top, 0);
+        let line0 = &a.active_tab().formatted[0];
+        assert!(
+            line0.contains("third"),
+            "first formatted line was {line0:?}"
+        );
+        // No filter mismatch, so no notice.
+        assert!(a.notice.is_none());
+    }
+
+    #[test]
+    fn bookmark_navigation_under_hiding_filter_sets_notice() {
+        // After a filter hides the bookmarked event, navigating to the
+        // bookmark should still work (anchor on the nearest visible
+        // neighbor) and stash a notice telling the user.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+            (30, "third", &[]),
+        ]);
+        a.handle_key(shift('F'));
+        create_bookmark(&mut a, 1, Some("second"));
+        // Apply a filter that excludes the bookmarked event's msg.
+        let filter: Filter = "msg!=second".parse().unwrap();
+        a.apply_filter(filter);
+        // Open Bookmarks tab and navigate.
+        a.handle_key(key(KeyCode::Tab));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('k')));
+        a.handle_key(key(KeyCode::Enter));
+        let n = a.notice.as_deref().unwrap_or_default();
+        assert!(n.contains("hidden"), "notice was: {n:?}");
     }
 
     // ---------- multi-line rendering ----------

@@ -19,6 +19,8 @@
 //! existing field is what bumps the version and requires a migration
 //! shim keyed on `version`.
 
+use crate::engine::Cursor;
+use crate::source::SourceId;
 use crate::stream::{LogStream, LogStreamId, LogStreamPosition};
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
@@ -29,7 +31,7 @@ use uuid::Uuid;
 
 /// Current on-disk schema version.  Bump only on changes that aren't
 /// serde-default-compatible (renames, restructured fields).
-pub const CURRENT_SESSION_VERSION: u32 = 1;
+pub const CURRENT_SESSION_VERSION: u32 = 2;
 
 fn current_session_version() -> u32 {
     CURRENT_SESSION_VERSION
@@ -83,11 +85,12 @@ impl BookmarkId {
 
 /// A user-created bookmark: a deliberate landmark in a log stream.
 ///
-/// A bookmark refers to its target by [`LogStreamPosition`], which is
-/// stable under filter changes — adding or removing predicates won't
-/// move what the bookmark points at.  When the active filter hides the
-/// bookmarked event, navigation to the bookmark falls back to the
-/// nearest visible neighbor (see [`crate::engine::Engine::resolve_position`]).
+/// A bookmark refers to its target by a byte-offset [`Cursor`] — feeding
+/// the cursor to [`crate::StreamView::seek_to_cursor`] lands the viewport
+/// on the bookmarked record.  This makes navigation `O(1)` (no walk from
+/// byte 0) and is stable across filter changes: a filter can hide the
+/// bookmarked event from view, but the cursor still names the same byte
+/// position regardless of what the active filter is.
 ///
 /// `display_time` and `display_msg` are captured at creation time so the
 /// Bookmarks tab can render the row even when the source isn't currently
@@ -97,9 +100,13 @@ impl BookmarkId {
 pub struct Bookmark {
     pub id: BookmarkId,
     pub created_at: DateTime<Utc>,
-    pub position: LogStreamPosition,
+    pub cursor: Cursor,
     #[serde(default)]
     pub name: Option<BookmarkName>,
+    /// Source the bookmarked event came from, captured at creation
+    /// time so the Bookmarks tab can show its filename without
+    /// re-resolving the cursor against the engine.
+    pub display_source: SourceId,
     /// Timestamp of the bookmarked event, cached so the Bookmarks tab
     /// can show it without re-querying the engine.
     pub display_time: DateTime<Utc>,
@@ -193,7 +200,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::SourceId;
+    use crate::source::{ByteOffset, SourceId};
     use chrono::TimeZone;
 
     fn t(secs: i64) -> DateTime<Utc> {
@@ -204,12 +211,20 @@ mod tests {
         LogStreamPosition::new(SourceId::from("a.log".to_string()), t(secs), 0)
     }
 
+    fn cursor_at(offset: u64) -> Cursor {
+        Cursor::with([(
+            SourceId::from("a.log".to_string()),
+            ByteOffset::from(offset),
+        )])
+    }
+
     fn make_bookmark(secs: i64, name: Option<&str>) -> Bookmark {
         Bookmark {
             id: BookmarkId::new_v4(),
             created_at: t(0),
-            position: position(secs),
+            cursor: cursor_at(secs as u64 * 100),
             name: name.map(|s| BookmarkName::from(s.to_string())),
+            display_source: SourceId::from("a.log".to_string()),
             display_time: t(secs),
             display_msg: format!("msg @ {secs}"),
         }
@@ -256,7 +271,9 @@ mod tests {
             bms[0].name.as_ref().map(|n| n.to_string()),
             Some("start".to_string())
         );
+        assert_eq!(bms[0].cursor, cursor_at(0));
         assert_eq!(bms[1].name, None);
+        assert_eq!(bms[1].cursor, cursor_at(100 * 100));
     }
 
     #[test]

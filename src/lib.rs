@@ -18,8 +18,7 @@ pub mod summary;
 mod test_util;
 
 pub use engine::{
-    Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord,
-    ResolvePosition, Stepper,
+    Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Predicate};
