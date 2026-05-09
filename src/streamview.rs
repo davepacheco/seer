@@ -48,10 +48,12 @@ const WINDOW_SOFT_CAP: usize = 1024;
 /// a blank tail.
 const OVER_FETCH_LINES: usize = 128;
 
-/// Cap on records walked per `search_step` call before returning
-/// `BudgetExhausted`.  A regex that matches nothing on a 100M-line
-/// file would otherwise scan the whole thing on every `n`.
-const SEARCH_BUDGET: usize = 50_000;
+/// Cap on records walked per [`StreamView::search_step`] call before
+/// returning [`SearchOutcome::BudgetExhausted`].  A regex that matches
+/// nothing on a 100M-line file would otherwise scan the whole thing on
+/// every `n`.  Exposed so the TUI can name the bound in user-facing
+/// notices.
+pub const SEARCH_BUDGET: usize = 50_000;
 
 /// Stable identity for a record in the merged stream.
 ///

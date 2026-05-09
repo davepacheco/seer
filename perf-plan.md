@@ -184,11 +184,50 @@ expected records.
 
 ## Deferred
 
-- **Sparse time index** (offset of every Kth record's timestamp, built during
-  the first full pass) to make "jump to time T" O(log) instead of O(scan from
-  start).  Add only if time-jump feels slow on real data.
-- **Cross-run caching of per-file metadata.**  The first-record/last-record
-  probe should be cheap enough that this isn't pressing.
+Carried forward from steps 4 and 5; can land in any order, none block
+each other.
+
+- **Drop `materialize_streamview` from the navigation hot path.**  Today
+  every search step / time step / bookmark seek that lands on a result
+  rebuilds `Tab::events` / `formatted` / `event_for_line` /
+  `first_line_for_event` from the streamview's window, cloning every
+  cached `Event` and formatted line.  The render path already reads
+  directly from `StreamView::rendered_lines`; the materialized vectors
+  exist mainly to keep selection-mode, bookmark commit, and exclude
+  filters working against the legacy `events: Vec<Option<EngineEvent>>`
+  shape.  Switching those callers to read records via the streamview
+  (by `RecordKey`) lets us drop the per-navigation rebuild.  Bounded but
+  non-trivial — `WINDOW_SOFT_CAP` records of clones per `n`/`<`/`>`.
+- **Resumable search budget.**  `StreamView::search_step` returns
+  `BudgetExhausted` after `SEARCH_BUDGET` records; the streamview's
+  anchor is unchanged, so a follow-up `n` re-scans the same prefix and
+  hits the same wall.  The current TUI notice is honest about that
+  ("no match found in N records") but lacks a way to continue.  Fix
+  by tracking a scan-resume cursor on `TabSearch` (or on the
+  streamview itself) and advancing it when the budget trips, so the
+  next `n` picks up where we stopped.
+- **Single stepper construction in bookmark navigation.**
+  `App::navigate_to_bookmark_cursor` builds an unfiltered stepper to
+  read the bookmarked event for the filter check, *then* calls
+  `StreamView::seek_to_cursor` which constructs another stepper at
+  the same cursor under the active filter.  Either have
+  `seek_to_cursor` return the first record it lands on so the filter
+  check can read it from there, or push the filter check down into
+  the streamview.
+- **Retire the legacy bookmark-navigation fallback.**
+  `App::navigate_to_bookmark_cursor` still has a `resolve_position`
+  branch for tabs without a `StreamView` (test fixtures with
+  `App::with_rows`).  Once those fixtures construct a real engine + tab
+  the branch can go, and the binary stops depending on
+  `Engine::resolve_position` entirely.
+- **Sparse time index** (offset of every Kth record's timestamp, built
+  during the first full pass) to make "jump to time T" O(log) instead
+  of O(scan from start).  Same fix would speed up
+  `Engine::cursor_for_position`, which today walks the unfiltered merge
+  from byte 0 on every bookmark resolve.  Add when either time-jump or
+  bookmark navigation feels slow on real data.
+- **Cross-run caching of per-file metadata.**  The first-record /
+  last-record probe should be cheap enough that this isn't pressing.
 - **`mmap`-based access.**  Sticking with `File` for now.
-- **Serialized parsed-record cache.**  Implementation cost is high relative
-  to the savings once the cursor model is in place.
+- **Serialized parsed-record cache.**  Implementation cost is high
+  relative to the savings once the cursor model is in place.

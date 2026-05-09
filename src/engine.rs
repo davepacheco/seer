@@ -98,14 +98,17 @@ impl Engine {
     }
 
     /// Walks the unfiltered merge to find the event at `position` and
-    /// returns a [`Cursor`] just past that event — i.e., a cursor
+    /// returns a [`Cursor`] just *before* that event — i.e., a cursor
     /// such that `engine.stepper(filter, &cursor)`'s next `step_forward`
-    /// returns the event *after* `position` (or `step_backward` returns
-    /// `position`'s event itself).
+    /// returns `position`'s event itself.
+    ///
+    /// "Before" rather than "after" is the semantic the navigation
+    /// callers want: feeding the result to [`crate::StreamView::seek_to_cursor`]
+    /// places the viewport's anchor on the bookmarked record.
     ///
     /// Returns `None` when `position`'s source isn't attached to this
     /// engine, or when no event in that source matches the position's
-    /// time/ordinal pair.  Does not consult `filter`: bookmark
+    /// time/ordinal pair.  Does not consult any filter: bookmark
     /// resolution must work even when the active filter excludes the
     /// bookmarked event.
     pub fn cursor_for_position(
@@ -116,9 +119,12 @@ impl Engine {
             return None;
         }
         // Walk the unfiltered merge.  We accumulate per-source offsets
-        // in a cursor as we see each event; when we hit the anchor, the
-        // cursor is "just before" it, so we update it once more to land
-        // just past the anchor and return.
+        // in a cursor as we see each event; when we hit the anchor we
+        // return *before* updating, so the returned cursor names "just
+        // before" the bookmarked event.  Other sources' offsets in the
+        // cursor reflect the latest event we've seen from them prior
+        // to the bookmark — which is exactly what merging from this
+        // cursor wants.
         let mut cursor = Cursor::new();
         for s in &self.sources {
             cursor.set(s.id().clone(), ByteOffset::ZERO);
@@ -128,44 +134,39 @@ impl Engine {
             self.sources.iter().map(|s| s.as_ref()).collect();
         let mut stepper =
             Stepper::new(stepper_sources, unfiltered, &Cursor::new());
+        let mut ordinal_seen: u64 = 0;
+        let mut in_same_time_group = false;
         while let Some(rec) = stepper.step_forward() {
-            let Ok(event) = rec.event else { continue };
-            cursor.set(
-                rec.source_id.clone(),
-                ByteOffset::from(rec.offset.get() + rec.length),
-            );
-            if rec.source_id == *position.source()
-                && event.time == position.time()
-            {
-                // Walk same-time events with this source until we
-                // reach the requested ordinal.  `LogStreamPosition`
-                // ordinals reset to 0 on time change and increment on
-                // each same-time event from that source.
-                let mut ordinal_seen: u64 = 0;
+            let Ok(event) = rec.event else {
+                // Per-line errors don't carry a time/source pair the
+                // bookmark could be anchored to; advance the cursor
+                // past them and continue.
+                cursor.set(
+                    rec.source_id.clone(),
+                    ByteOffset::from(rec.offset.get() + rec.length),
+                );
+                continue;
+            };
+            let on_target_group = rec.source_id == *position.source()
+                && event.time == position.time();
+            if on_target_group {
+                if !in_same_time_group {
+                    in_same_time_group = true;
+                    ordinal_seen = 0;
+                }
                 if ordinal_seen == position.ordinal_within_time() {
                     return Some(cursor);
                 }
                 ordinal_seen += 1;
-                while let Some(next) = stepper.step_forward() {
-                    let Ok(ev) = next.event else { continue };
-                    if next.source_id != *position.source()
-                        || ev.time != position.time()
-                    {
-                        // We walked off the same-time/source group
-                        // without finding the requested ordinal.
-                        return None;
-                    }
-                    cursor.set(
-                        next.source_id.clone(),
-                        ByteOffset::from(next.offset.get() + next.length),
-                    );
-                    if ordinal_seen == position.ordinal_within_time() {
-                        return Some(cursor);
-                    }
-                    ordinal_seen += 1;
-                }
+            } else if in_same_time_group {
+                // We walked off the matching group without finding
+                // the requested ordinal.
                 return None;
             }
+            cursor.set(
+                rec.source_id.clone(),
+                ByteOffset::from(rec.offset.get() + rec.length),
+            );
         }
         None
     }
@@ -1182,10 +1183,10 @@ mod tests {
     }
 
     #[test]
-    fn cursor_for_position_lands_just_past_anchor() {
+    fn cursor_for_position_lands_just_before_anchor() {
         // Build a multi-source fixture, anchor on a specific event,
-        // and confirm the resulting cursor walks forward to the
-        // anchor's successor in the merged stream.
+        // and confirm step_forward from the resulting cursor returns
+        // the anchored event itself.
         let dir = TestDir::new();
         let a = dir.path().join("a.log");
         let b = dir.path().join("b.log");
@@ -1200,21 +1201,21 @@ mod tests {
         // Merge order: a1(10), b1(20), a2(30), b2(40).  Anchor on b1.
         let anchor = nth_position(&engine, 1);
         let cursor = engine.cursor_for_position(&anchor).unwrap();
-        // step_backward from this cursor must return b1; step_forward
-        // must return a2.
-        let mut stepper = engine.stepper(Filter::default(), &cursor);
-        let back = stepper.step_backward().unwrap();
-        assert_eq!(back.event.unwrap().msg, "b1");
+        // step_forward from this cursor returns b1; step_backward
+        // returns the previous event a1.
         let mut stepper = engine.stepper(Filter::default(), &cursor);
         let fwd = stepper.step_forward().unwrap();
-        assert_eq!(fwd.event.unwrap().msg, "a2");
+        assert_eq!(fwd.event.unwrap().msg, "b1");
+        let mut stepper = engine.stepper(Filter::default(), &cursor);
+        let back = stepper.step_backward().unwrap();
+        assert_eq!(back.event.unwrap().msg, "a1");
         dir.cleanup();
     }
 
     #[test]
     fn cursor_for_position_distinguishes_same_time_ordinals() {
         // Two same-time events from one source.  cursor_for_position
-        // should land just past the requested ordinal, not the first.
+        // should land just before the requested ordinal, not the first.
         let dir = TestDir::new();
         let p = dir.path().join("c.log");
         append_bunyan_at(&p, "x", t(10), "a");
@@ -1225,16 +1226,16 @@ mod tests {
         let pos_b = nth_position(&engine, 1);
         let cursor = engine.cursor_for_position(&pos_b).unwrap();
         let mut stepper = engine.stepper(Filter::default(), &cursor);
-        // Forward: c (skipping a, b which are behind).
+        // Forward: b (the anchored same-time second event).
         assert_eq!(
             stepper.step_forward().unwrap().event.unwrap().msg,
-            "c",
+            "b",
         );
         let mut stepper = engine.stepper(Filter::default(), &cursor);
-        // Backward: b.
+        // Backward: a (the same-time first event preceding b).
         assert_eq!(
             stepper.step_backward().unwrap().event.unwrap().msg,
-            "b",
+            "a",
         );
         dir.cleanup();
     }

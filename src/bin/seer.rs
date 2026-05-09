@@ -29,8 +29,9 @@ use seer::Event as LogEvent;
 use seer::SourceId;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Engine, EngineEvent, Filter, LogStream,
-    LogStreamId, LogStreamPosition, Predicate, ResolvePosition, Session,
-    StreamView, SummaryBuilder, format_summary,
+    LogStreamId, LogStreamPosition, Predicate, ResolvePosition, SEARCH_BUDGET,
+    SearchDir, SearchOutcome, Session, StreamView, SummaryBuilder,
+    format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -345,10 +346,15 @@ impl SearchDirection {
     }
 }
 
-/// State of the active search on a tab.  `matches` is sorted ascending
-/// and is the list of row indices in [`Tab::rows`] where `regex` finds
-/// at least one match.  Cleared whenever `rows` changes (e.g. after a
-/// filter edit), since the indices would no longer line up.
+/// State of the active search on a tab.
+///
+/// `matches` is the precomputed list of line indices in
+/// [`Tab::formatted`] where `regex` finds at least one match.
+/// Populated only for tabs without a [`StreamView`] (test fixtures and
+/// Summary tabs); production stream tabs use [`StreamView::search_step`]
+/// to navigate, scanning records lazily as needed, and `matches` stays
+/// empty.  Render uses `regex` to highlight matches in the visible
+/// window for both paths.
 struct TabSearch {
     pattern: String,
     regex: Regex,
@@ -600,13 +606,7 @@ impl Tab {
         // top so subsequent extension targets the right region.
         view.set_anchor_to_flat_line(self.viewport_top);
         view.ensure_window(engine, viewport_height);
-        let rendered = materialize_streamview(view);
-        self.events = rendered.events;
-        self.formatted = rendered.formatted;
-        self.event_for_line = rendered.event_for_line;
-        self.first_line_for_event = rendered.first_line_for_event;
-        self.parse_stats = rendered.parse_stats;
-        self.viewport_top = view.anchor_flat_line();
+        self.resync_from_streamview(viewport_height);
     }
 
     /// Resets the viewport to the start of the merged stream and
@@ -623,13 +623,7 @@ impl Tab {
             return;
         };
         view.seek_to_start(engine, viewport_height);
-        let rendered = materialize_streamview(view);
-        self.events = rendered.events;
-        self.formatted = rendered.formatted;
-        self.event_for_line = rendered.event_for_line;
-        self.first_line_for_event = rendered.first_line_for_event;
-        self.parse_stats = rendered.parse_stats;
-        self.viewport_top = 0;
+        self.resync_from_streamview(viewport_height);
     }
 
     /// Resets the viewport to the end of the merged stream and rebuilds
@@ -645,6 +639,31 @@ impl Tab {
             return Ok(());
         };
         view.seek_to_end(engine, viewport_height)?;
+        self.resync_from_streamview(viewport_height);
+        Ok(())
+    }
+
+    /// Returns the precomputed match indices over `formatted` for tabs
+    /// without a [`StreamView`]; an empty vec for streamview tabs
+    /// (which navigate via [`StreamView::search_step`] and don't need
+    /// a precomputed index).
+    fn match_indices(&self, regex: &Regex) -> Vec<usize> {
+        if self.streamview.is_some() {
+            Vec::new()
+        } else {
+            compute_matches(&self.formatted, regex)
+        }
+    }
+
+    /// Copies the streamview's current window into the materialized
+    /// `events`/`formatted`/index vectors and clamps `viewport_top` to
+    /// the streamview's anchor.  Caller must have just driven a
+    /// streamview operation that left the anchor on the desired
+    /// record/line.  No-op for tabs without a [`StreamView`].
+    fn resync_from_streamview(&mut self, viewport_height: u16) {
+        let Some(view) = self.streamview.as_ref() else {
+            return;
+        };
         let anchor = view.anchor_flat_line();
         let rendered = materialize_streamview(view);
         self.events = rendered.events;
@@ -652,12 +671,8 @@ impl Tab {
         self.event_for_line = rendered.event_for_line;
         self.first_line_for_event = rendered.first_line_for_event;
         self.parse_stats = rendered.parse_stats;
-        // After seek_to_end, anchor sits on the last record's last
-        // line; align the viewport so that line is at the bottom of
-        // the screen, matching the existing G/End behavior.
         let max = self.max_top(viewport_height);
         self.viewport_top = anchor.min(max);
-        Ok(())
     }
 
     /// Last *display line* index belonging to record `event_idx`,
@@ -773,7 +788,21 @@ impl Tab {
     /// get" rather than silently doing nothing, which would be
     /// confusing when the user expects motion.  No-op when the tab
     /// holds no parsed events.
-    fn advance_time(&mut self, delta: chrono::Duration, viewport_height: u16) {
+    fn advance_time(
+        &mut self,
+        engine: &Engine,
+        delta: chrono::Duration,
+        viewport_height: u16,
+    ) {
+        if let Some(view) = self.streamview.as_mut() {
+            // Lazy path: walks the engine's stepper, fetching only as
+            // far as needed to land on the target time.
+            view.advance_time(engine, delta, viewport_height);
+            self.resync_from_streamview(viewport_height);
+            return;
+        }
+        // Fallback for tabs without a StreamView (test fixtures and
+        // Summary tabs): scan the materialized events vector.
         let go_forward = delta.num_milliseconds() > 0;
         let Some(anchor_idx) = self.time_anchor_idx(go_forward) else {
             return;
@@ -1205,40 +1234,60 @@ impl App {
             }
         };
         self.active = tab_idx;
-        // Resolve the bookmark to a row in the now-active tab and
-        // update the viewport.  resolve_position needs a borrow on the
-        // engine, so unwrap the filter first.
         let filter =
             self.session.streams.get(&target_stream).unwrap().filter.clone();
-        match self.engine.resolve_position(&filter, &position) {
-            ResolvePosition::Found(event_idx) => {
-                let line = self.tabs[tab_idx].first_line_for_event[event_idx];
-                self.tabs[tab_idx].viewport_top = line;
+        // Convert the time/ordinal anchor into a byte cursor, then
+        // (a) decide whether the bookmarked event survives the active
+        // filter and (b) seek the StreamView to that cursor.  Detecting
+        // FilteredOut requires reading the bookmarked event itself,
+        // which sits one forward step past the cursor under an
+        // unfiltered stepper.
+        let Some(cursor) = self.engine.cursor_for_position(&position) else {
+            self.notice = Some(
+                "bookmarked entry is no longer present in any \
+                 loaded source"
+                    .to_string(),
+            );
+            self.bookmark_cursor = None;
+            return;
+        };
+        let bookmarked_passes_filter = self
+            .engine
+            .stepper(Filter::default(), &cursor)
+            .step_forward()
+            .and_then(|r| r.event.ok())
+            .is_some_and(|e| filter.matches(&e));
+        let h = self.viewport_height;
+        if let Some(view) = self.tabs[tab_idx].streamview.as_mut() {
+            // The streamview applies the active filter on its stepper,
+            // so seek lands the anchor on the bookmarked event when it
+            // survives, or on the next visible event after when it
+            // doesn't.
+            view.seek_to_cursor(&self.engine, cursor, h);
+            self.tabs[tab_idx].resync_from_streamview(h);
+        } else {
+            // Test-fixture tabs without a streamview keep the legacy
+            // resolve-by-row-index path.  Production tabs always have
+            // a streamview after `Tab::new` / `refresh`.
+            match self.engine.resolve_position(&filter, &position) {
+                ResolvePosition::Found(event_idx)
+                | ResolvePosition::FilteredOut(event_idx) => {
+                    let line = self.tabs[tab_idx]
+                        .first_line_for_event
+                        .get(event_idx)
+                        .copied()
+                        .unwrap_or(0);
+                    self.tabs[tab_idx].viewport_top = line;
+                }
+                ResolvePosition::Gone => {}
             }
-            ResolvePosition::FilteredOut(event_idx) => {
-                // resolve_position guarantees the index is in range
-                // when at least one event matches the filter; if the
-                // filter strips everything the convention is `0`,
-                // which is a valid line index for the empty viewport.
-                let line = self.tabs[tab_idx]
-                    .first_line_for_event
-                    .get(event_idx)
-                    .copied()
-                    .unwrap_or(0);
-                self.tabs[tab_idx].viewport_top = line;
-                self.notice = Some(
-                    "bookmarked entry is hidden by the active filter; \
-                     jumped to the nearest visible entry"
-                        .to_string(),
-                );
-            }
-            ResolvePosition::Gone => {
-                self.notice = Some(
-                    "bookmarked entry is no longer present in any \
-                     loaded source"
-                        .to_string(),
-                );
-            }
+        }
+        if !bookmarked_passes_filter {
+            self.notice = Some(
+                "bookmarked entry is hidden by the active filter; \
+                 jumped to the nearest visible entry"
+                    .to_string(),
+            );
         }
     }
 
@@ -1254,11 +1303,13 @@ impl App {
         regex: Regex,
         direction: SearchDirection,
     ) {
-        let matches =
-            compute_matches(&self.tabs[self.active].formatted, &regex);
-        let tab = &mut self.tabs[self.active];
-        tab.search =
-            Some(TabSearch { pattern: pattern.clone(), regex, matches });
+        let active = self.active;
+        let matches = self.tabs[active].match_indices(&regex);
+        self.tabs[active].search = Some(TabSearch {
+            pattern: pattern.clone(),
+            regex,
+            matches,
+        });
         self.last_search = Some(LastSearch { pattern, direction });
         self.jump_to_match(direction, /* exclusive = */ false);
     }
@@ -1309,16 +1360,75 @@ impl App {
         let Ok(regex) = Regex::new(pattern) else {
             return;
         };
-        let matches = compute_matches(&tab.formatted, &regex);
+        let matches = tab.match_indices(&regex);
         tab.search =
             Some(TabSearch { pattern: pattern.to_string(), regex, matches });
     }
 
-    /// Move `viewport_top` to the next match in `direction`.  When
-    /// `exclusive`, a match exactly at `viewport_top` is skipped (used
-    /// for repeats — otherwise `/<enter>` would re-land on the current
-    /// match forever).  Stays put if no further match exists.
+    /// Moves the viewport to the next match in `direction`.
+    ///
+    /// For tabs with a [`StreamView`]: walks the engine lazily via
+    /// [`StreamView::search_step`], extending the window as needed.
+    /// For tabs without one (test fixtures, Summary): scans the
+    /// precomputed `matches` list relative to `viewport_top`.
+    ///
+    /// `exclusive`: skip a match at the current position (used by `n`
+    /// repeats so the cursor advances rather than re-landing).
     fn jump_to_match(&mut self, direction: SearchDirection, exclusive: bool) {
+        let active = self.active;
+        if self.tabs[active].streamview.is_some() {
+            self.jump_to_match_via_streamview(direction, exclusive);
+        } else {
+            self.jump_to_match_via_matches(direction, exclusive);
+        }
+    }
+
+    fn jump_to_match_via_streamview(
+        &mut self,
+        direction: SearchDirection,
+        exclusive: bool,
+    ) {
+        let active = self.active;
+        let Some(regex) =
+            self.tabs[active].search.as_ref().map(|s| s.regex.clone())
+        else {
+            return;
+        };
+        let h = self.viewport_height;
+        let dir = match direction {
+            SearchDirection::Forward => SearchDir::Forward,
+            SearchDirection::Backward => SearchDir::Backward,
+        };
+        let outcome = self.tabs[active]
+            .streamview
+            .as_mut()
+            .unwrap()
+            .search_step(&self.engine, &regex, dir, exclusive, h);
+        match outcome {
+            SearchOutcome::Found => {
+                self.tabs[active].resync_from_streamview(h);
+            }
+            SearchOutcome::NotFound => {}
+            SearchOutcome::BudgetExhausted => {
+                // The streamview's anchor is unchanged on budget
+                // exhaustion, so a follow-up `n` would re-scan the
+                // same prefix and hit the same wall.  Surface that
+                // honestly rather than promising resumability we
+                // don't deliver until budget state can carry across
+                // calls.
+                self.notice = Some(format!(
+                    "search exceeded the {SEARCH_BUDGET}-record \
+                     budget; no match found",
+                ));
+            }
+        }
+    }
+
+    fn jump_to_match_via_matches(
+        &mut self,
+        direction: SearchDirection,
+        exclusive: bool,
+    ) {
         let tab = &self.tabs[self.active];
         let Some(search) = &tab.search else {
             return;
@@ -1376,7 +1486,8 @@ impl App {
             delta = -delta;
         }
         let h = self.viewport_height;
-        self.active_tab_mut().advance_time(delta, h);
+        let active = self.active;
+        self.tabs[active].advance_time(&self.engine, delta, h);
     }
 
     fn next_tab(&mut self) {
