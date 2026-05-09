@@ -177,12 +177,11 @@ expected records.
    slide the window as needed.  Mechanical follow-up to step 4; the
    `StreamView` methods already exist.
 6. Bookmarks as `(log_stream_id, cursor)`.  Replaces the
-   `LogStreamPosition` (source, time, ordinal) anchor with a byte cursor;
-   bookmark navigation is now `O(1)` (just `seek_to_cursor`) instead of
-   `O(walk-from-start)`.  Bookmark *creation* still walks the unfiltered
-   merge once (via `Engine::cursor_for_position`) — see Deferred for
-   making that O(1) too by reading the cursor directly from the
-   `StreamView`'s cached record.
+   `LogStreamPosition` (source, time, ordinal) anchor with a byte cursor.
+   Both bookmark navigation (`seek_to_cursor`) and bookmark creation
+   (`StreamView::cursor_before_record`, derived from the window's
+   `front_cursor` plus the records preceding the selection) are now
+   `O(1)` — no walk from byte 0 on either path.
 
 ## Deferred
 
@@ -216,31 +215,25 @@ each other.
   `seek_to_cursor` return the first record it lands on so the filter
   check can read it from there, or push the filter check down into
   the streamview.
-- **O(1) bookmark creation.**  Step 6 made bookmark *navigation* O(1)
-  but creation still calls `Engine::cursor_for_position`, which walks
-  the unfiltered merge from byte 0 to find the bookmarked event's byte
-  offset.  The selected event already lives in the StreamView's
-  window, so its `MergeRecord.offset` is in hand — but the merged
-  cursor needs every other source's "just before" offset too, which
-  isn't captured today.  Two paths: (a) thread the merged cursor
-  through `MergeRecord` so the Stepper hands it out alongside each
-  emitted record, paying a small per-step cost; (b) keep
-  `cursor_for_position` for creation since it's a one-time interactive
-  cost and the deferred sparse time index speeds up its inner walk.
-- **Retire `Engine::resolve_position` entirely.**  Step 6 dropped the
-  binary's last consumer.  The function and ~6 tests for it can come
-  out once `LogStreamPosition` is no longer needed for selection-mode
-  exclude filters either (today `materialize_streamview` still mints
-  one per `Ok` event purely to feed the legacy shape `tab.events`
-  expects — see the first deferred item).
+- **Retire `Engine::resolve_position` and `cursor_for_position`.**
+  Step 6 dropped the binary's last consumer of `resolve_position`, and
+  the deferred O(1) bookmark-creation work removed the binary's last
+  consumer of `cursor_for_position` from the hot path (it remains as a
+  fallback for test fixtures with synthesized events).  Both functions
+  and their tests can come out once `LogStreamPosition` is no longer
+  needed for selection-mode exclude filters either (today
+  `materialize_streamview` still mints one per `Ok` event purely to
+  feed the legacy shape `tab.events` expects — see the first deferred
+  item).
 - **Sparse time index** (offset of every Kth record's timestamp, built
   during the first full pass) to make "jump to time T" O(log) instead
-  of O(scan from start).  Same fix would speed up
-  `Engine::cursor_for_position`, which today walks the unfiltered merge
-  from byte 0 on every bookmark create.  Add when either time-jump or
-  bookmark creation feels slow on real data.
+  of O(scan from start).  Add when time-jump feels slow on real data.
 - **Cross-run caching of per-file metadata.**  The first-record /
   last-record probe should be cheap enough that this isn't pressing.
+
+Deferred indefinitely:
+
 - **`mmap`-based access.**  Sticking with `File` for now.
 - **Serialized parsed-record cache.**  Implementation cost is high
   relative to the savings once the cursor model is in place.
+

@@ -1659,19 +1659,22 @@ impl App {
                 self.apply_filter(new_filter);
             }
             SelectionAction::Bookmark => {
-                // Test fixtures with synthesized events have no source
-                // attached to the engine; fall back to a default
-                // cursor so the bookmark still renders and can be
-                // deleted, even if "jump to it" lands at the start of
-                // an empty merge.
-                let position = ee.position.clone();
-                let cursor = self
-                    .engine
-                    .cursor_for_position(&position)
+                // Production tabs derive the cursor directly from the
+                // streamview's window — the selected record is at
+                // `event_idx` in `view.records()`, and the window
+                // already knows its `front_cursor` plus every record
+                // preceding the selection.  Test fixtures without a
+                // streamview synthesize events and have no source on
+                // the engine, so fall back to a default cursor; the
+                // bookmark still renders and can be deleted.
+                let cursor = tab
+                    .streamview
+                    .as_ref()
+                    .and_then(|v| v.cursor_before_record(sel.event_idx))
                     .unwrap_or_default();
                 let draft = BookmarkDraft {
                     cursor,
-                    display_source: position.source().clone(),
+                    display_source: ee.position.source().clone(),
                     display_time: ee.event.time,
                     display_msg: preview_msg(&ee.event.msg),
                 };

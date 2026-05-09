@@ -317,6 +317,29 @@ impl StreamView {
         self.find_record(key)
     }
 
+    /// Returns the [`Cursor`] "just before" the record at window index
+    /// `idx` — i.e., a cursor such that
+    /// `engine.stepper(filter, &cursor)`'s next `step_forward` (under
+    /// the same filter the window was built with) returns that record.
+    ///
+    /// Derived from `front_cursor` plus the trailing records preceding
+    /// `idx` in the window — no I/O, no merge walk.  Returns `None`
+    /// when `idx` is out of range.
+    pub fn cursor_before_record(&self, idx: usize) -> Option<Cursor> {
+        if idx >= self.records.len() {
+            return None;
+        }
+        let mut cursor = self.front_cursor.clone();
+        for entry in self.records.iter().take(idx) {
+            let r = &entry.record;
+            cursor.set(
+                r.source_id.clone(),
+                ByteOffset::from(r.offset.get() + r.length),
+            );
+        }
+        Some(cursor)
+    }
+
     /// Returns true iff the window is empty.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
@@ -1405,6 +1428,53 @@ mod tests {
         let mut view = StreamView::new(Filter::default(), false);
         view.seek_to_cursor(&engine, mid_cursor, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_before_record_round_trips_through_seek() {
+        // The cursor returned for record `i` should land a stepper
+        // exactly on record `i` when stepped forward — i.e., it's "just
+        // before".  Drive that round-trip through `seek_to_cursor` and
+        // verify the anchor lands on the expected record.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10, 20, 30, 40])], &dir);
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        // First record's cursor is `front_cursor` itself.
+        let c0 = view.cursor_before_record(0).unwrap();
+        let mut v0 = StreamView::new(Filter::default(), false);
+        v0.seek_to_cursor(&engine, c0, 20);
+        assert_eq!(anchor_msg(&v0).as_deref(), Some("m10"));
+        // A middle record: walks past two preceding entries.
+        let c2 = view.cursor_before_record(2).unwrap();
+        let mut v2 = StreamView::new(Filter::default(), false);
+        v2.seek_to_cursor(&engine, c2, 20);
+        assert_eq!(anchor_msg(&v2).as_deref(), Some("m30"));
+        // Past the end is a clean None.
+        assert!(view.cursor_before_record(view.record_count()).is_none());
+        dir.cleanup();
+    }
+
+    #[test]
+    fn cursor_before_record_handles_multiple_sources() {
+        // With two interleaved sources, the cursor for a record from
+        // source B must capture A's "just past last seen" offset too —
+        // otherwise a forward step from the cursor would re-emit A's
+        // earlier records.
+        let dir = TestDir::new();
+        let engine = build_engine(
+            &[("a", &[10, 30, 50]), ("b", &[20, 40, 60])],
+            &dir,
+        );
+        let mut view = StreamView::new(Filter::default(), false);
+        view.ensure_window(&engine, 20);
+        // Records are interleaved: m10(a), m20(b), m30(a), m40(b), ...
+        // The cursor before index 3 (m40 from b) should land us on m40.
+        let cursor = view.cursor_before_record(3).unwrap();
+        let mut v = StreamView::new(Filter::default(), false);
+        v.seek_to_cursor(&engine, cursor, 20);
+        assert_eq!(anchor_msg(&v).as_deref(), Some("m40"));
         dir.cleanup();
     }
 
