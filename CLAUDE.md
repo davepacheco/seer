@@ -285,7 +285,6 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- be able to hide individual fields: name, pid (pid off by default)
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
 - progress bar, ^C option when:
@@ -302,4 +301,3 @@ New tabs should still open with this dialog.
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
-- when applying filter, the view gets reset to the top.  that's wrong.  should stay at the top of the viewport, or the next non-deleted record above

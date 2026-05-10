@@ -552,20 +552,35 @@ impl Tab {
     /// the cached rows, viewport, and transient selection/search state.
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
+    /// Re-runs the host stream's filter against the engine and
+    /// refreshes the cached rows, viewport, and transient
+    /// selection/search state.  Call after the [`LogStream::filter`]
+    /// for `self.stream` has been mutated.
+    ///
+    /// `anchor` controls where the new viewport lands:
+    ///
+    /// - `None`: top of the new stream, like a fresh tab.
+    /// - `Some(cursor)`: seek the new streamview to `cursor`.  The
+    ///   streamview itself handles the filter-mismatch fallback —
+    ///   forward to the next visible record, or backward to the
+    ///   previous one if no later record survives — so the user lands
+    ///   as close to where they were as the filter allows.
     fn refresh(
         &mut self,
         engine: &Engine,
         filter: &Filter,
         opts: RenderOpts,
+        anchor: Option<Cursor>,
     ) {
         let rendered = match self.kind {
             TabKind::Stream => {
-                let (view, rows) = render_rows(
-                    engine,
-                    filter,
-                    opts,
-                    INITIAL_VIEWPORT_HEIGHT,
-                );
+                let mut view = StreamView::new(filter.clone(), opts);
+                let h = INITIAL_VIEWPORT_HEIGHT;
+                match anchor {
+                    Some(cursor) => view.seek_to_cursor(engine, cursor, h),
+                    None => view.ensure_window(engine, h),
+                }
+                let rows = materialize_streamview(&view);
                 self.streamview = Some(view);
                 rows
             }
@@ -576,7 +591,16 @@ impl Tab {
         self.event_for_line = rendered.event_for_line;
         self.first_line_for_event = rendered.first_line_for_event;
         self.parse_stats = rendered.parse_stats;
-        self.viewport_top = 0;
+        // The streamview's anchor sits on whichever record we want at
+        // the top of the viewport: byte 0 for a fresh tab, the
+        // matching record (or its visible neighbor) when seeking to
+        // `anchor`.  Read its flat-line index so the backward-fallback
+        // case (anchor on `records.back()`) doesn't get pinned to 0.
+        self.viewport_top = self
+            .streamview
+            .as_ref()
+            .map(|v| v.anchor_flat_line())
+            .unwrap_or(0);
         self.search = None;
         self.select = None;
     }
@@ -1090,14 +1114,22 @@ impl App {
     }
 
     /// Replaces the active stream's filter, re-queries the engine,
-    /// and resets every tab targeting that stream to the top.  Two
-    /// tabs sharing a stream therefore share their filter — that's the
-    /// model that lets a bookmark-driven "open in a new tab" carry the
-    /// stream's filter forward.
+    /// and refreshes every tab targeting that stream.  Two tabs
+    /// sharing a stream therefore share their filter — that's the
+    /// model that lets a bookmark-driven "open in a new tab" carry
+    /// the stream's filter forward.
+    ///
+    /// Each refreshed tab keeps its viewport as close as possible to
+    /// where it was: a Cursor is captured from the streamview's
+    /// current anchor (when one exists), and the post-refresh
+    /// streamview seeks to that cursor.  When the anchored record is
+    /// hidden by the new filter, [`StreamView::seek_to_cursor`] slides
+    /// to the nearest visible neighbor (forward first, backward as a
+    /// fallback) instead of leaving an empty view.  Tabs without a
+    /// streamview (test fixtures, Summary tabs) fall back to a
+    /// top-of-stream refresh.
     fn apply_filter(&mut self, filter: Filter) {
         let stream_id = self.tabs[self.active].stream;
-        // Mutate the persisted filter, then re-derive every tab whose
-        // stream is the one we just changed.
         let Some(mut stream) = self.session.streams.remove(&stream_id) else {
             return;
         };
@@ -1110,7 +1142,11 @@ impl App {
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.refresh(&self.engine, &new_filter, opts);
+                let anchor = tab
+                    .streamview
+                    .as_ref()
+                    .and_then(|v| v.cursor_at_anchor());
+                tab.refresh(&self.engine, &new_filter, opts, anchor);
             }
         }
     }
@@ -1634,19 +1670,14 @@ impl App {
     /// user in a confusing state if half-handled.
     fn handle_bookmarks_key(&mut self, key: KeyEvent) {
         match key {
+            // Only `q` opens the quit prompt: Esc and Ctrl-C are easy
+            // to hit by accident (Esc on a misfired dialog cancel,
+            // Ctrl-C from terminal muscle memory) and an unwanted quit
+            // would tear down the user's in-flight viewport, search,
+            // and any unsaved exclude/include drafts.
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 self.dialog = Some(Dialog::confirm_quit());
@@ -1767,7 +1798,10 @@ impl App {
                 };
                 let mut new_filter = self.active_filter().clone();
                 new_filter.add_predicate(new_pred);
-                // apply_filter resets viewport_top, search, and select.
+                // apply_filter clears search and select; the viewport
+                // slides to the nearest visible record under the new
+                // filter rather than snapping to the top, so the user
+                // stays where they were.
                 self.apply_filter(new_filter);
             }
             SelectionAction::Bookmark => {
@@ -1958,19 +1992,11 @@ impl App {
         let page = self.viewport_height as usize;
         let half_page = page / 2;
         match key {
+            // Only `q` opens the quit prompt; see `handle_bookmarks_key`
+            // for the rationale behind not accepting Esc or Ctrl-C.
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 self.dialog = Some(Dialog::confirm_quit());
@@ -2473,10 +2499,12 @@ enum Dialog {
     /// dialog title.  No editor: the user picks Cancel (Esc) or
     /// Confirm (Enter).
     ConfirmDeleteBookmark { id: BookmarkId, label: String },
-    /// Confirming a quit request triggered by `q`/`Esc`/`Ctrl-C` in
-    /// the main or Bookmarks pane.  No editor: Esc cancels, Enter
-    /// confirms.  Guards against accidental exits losing the user's
-    /// in-flight filter, search, and viewport state.
+    /// Confirming a quit request triggered by `q` in the main or
+    /// Bookmarks pane.  No editor: Esc cancels, Enter confirms.
+    /// Esc and Ctrl-C are deliberately *not* bound to open this
+    /// dialog at the top level — they're easy to hit by accident and
+    /// an unwanted quit would tear down the user's in-flight viewport,
+    /// search, and any unsaved exclude/include drafts.
     ConfirmQuit,
     /// Choosing which header columns to render: timestamp format,
     /// hostname mode, name, pid, and structured-fields visibility.
@@ -3477,19 +3505,26 @@ mod tests {
     }
 
     #[test]
-    fn esc_opens_quit_confirmation() {
+    fn esc_does_not_open_quit_confirmation() {
+        // Esc is reserved for cancelling whatever's in front of the
+        // user (a dialog, an exclude/include selection); pressing it
+        // at the main view should be a no-op rather than an
+        // accidental quit prompt.
         let mut a = app(10, 5);
         a.handle_key(key(KeyCode::Esc));
         assert!(!a.quit);
-        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
+        assert!(a.dialog.is_none());
     }
 
     #[test]
-    fn ctrl_c_opens_quit_confirmation() {
+    fn ctrl_c_does_not_open_quit_confirmation() {
+        // Ctrl-C is muscle-memory for "interrupt" in a terminal;
+        // letting it tear down the TUI's in-flight state would be a
+        // common foot-gun.  `q` is the only quit-prompt key.
         let mut a = app(10, 5);
         a.handle_key(ctrl('c'));
         assert!(!a.quit);
-        assert!(matches!(a.dialog, Some(Dialog::ConfirmQuit)));
+        assert!(a.dialog.is_none());
     }
 
     #[test]
@@ -5581,6 +5616,94 @@ mod tests {
         );
         // No filter mismatch, so no notice.
         assert!(a.notice.is_none());
+    }
+
+    /// Returns the `msg` of the event currently at the top of the
+    /// active tab's viewport, or `None` if the viewport is empty.
+    /// Used by the apply-filter tests to verify which record landed
+    /// at the top after a filter change.
+    fn viewport_top_msg(a: &App) -> Option<String> {
+        let tab = a.active_tab();
+        let event_idx = *tab.event_for_line.get(tab.viewport_top)?;
+        tab.events.get(event_idx)?.as_ref().map(|ee| ee.event.msg.clone())
+    }
+
+    /// Builds a 5-record multi-line app with a viewport short enough
+    /// (2 lines) that `j`/`k` actually move the anchor instead of
+    /// being clamped because everything already fits on screen.
+    fn five_record_app() -> (App, camino_tempfile::Utf8TempDir) {
+        let (mut a, dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+            (30, "third", &[]),
+            (40, "fourth", &[]),
+            (50, "fifth", &[]),
+        ]);
+        a.viewport_height = 2;
+        (a, dir)
+    }
+
+    #[test]
+    fn apply_filter_preserves_viewport_when_anchor_survives() {
+        // Scroll down to the third record, then apply a filter that
+        // matches every record (effectively a no-op filter).  The
+        // viewport should remain on the third record rather than
+        // snapping back to the first.
+        let (mut a, _dir) = five_record_app();
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
+        let filter: Filter = "level>=trace".parse().unwrap();
+        a.apply_filter(filter);
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn apply_filter_falls_forward_when_anchor_is_excluded() {
+        // Scroll to the third record, then apply a filter that hides
+        // exactly that record.  The viewport should slide to the next
+        // visible record (the fourth) rather than snap to the top.
+        let (mut a, _dir) = five_record_app();
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
+        let filter: Filter = "msg!=third".parse().unwrap();
+        a.apply_filter(filter);
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("fourth"));
+    }
+
+    #[test]
+    fn apply_filter_falls_back_when_no_later_record_visible() {
+        // Scroll the viewport down as far as it can go (with a
+        // 2-line viewport on 5 records, that's the fourth), then
+        // apply a filter that hides the fourth and fifth records.
+        // With no visible record at or after the captured anchor,
+        // the streamview should rewind to the most recent visible
+        // record before it (the third).
+        let (mut a, _dir) = five_record_app();
+        for _ in 0..3 {
+            a.handle_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("fourth"));
+        let filter: Filter = "msg!=fourth msg!=fifth".parse().unwrap();
+        a.apply_filter(filter);
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn x_exclude_keeps_view_near_excluded_record() {
+        // The exclude-mode commit also flows through `apply_filter`,
+        // so it should preserve the viewport in the same way: the
+        // `x`/`Enter` flow on the third record should leave the user
+        // looking at the fourth, not at the first.
+        let (mut a, _dir) = five_record_app();
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('x')));
+        // In exclude mode the selection cursor starts at viewport top
+        // (the third record); Enter commits.
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(viewport_top_msg(&a).as_deref(), Some("fourth"));
     }
 
     #[test]

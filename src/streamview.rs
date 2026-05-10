@@ -327,6 +327,25 @@ impl StreamView {
         }
     }
 
+    /// Returns a [`Cursor`] that, when fed back into
+    /// [`Self::seek_to_cursor`], lands the viewport on the same record
+    /// the anchor is currently on.  Used by the TUI on filter changes:
+    /// it captures the anchor before refresh so the new view can
+    /// resume on (or near) the same record under the new filter,
+    /// instead of snapping back to the top.
+    ///
+    /// Returns `None` when the window is empty or the anchor isn't
+    /// pinned to a specific record.
+    pub fn cursor_at_anchor(&self) -> Option<Cursor> {
+        match &self.anchor {
+            Anchor::On { key, .. } => {
+                let idx = self.find_record_idx(key)?;
+                self.cursor_before_record(idx)
+            }
+            _ => None,
+        }
+    }
+
     fn find_record(&self, key: &RecordKey) -> Option<&MergeRecord> {
         self.records
             .iter()
@@ -476,9 +495,15 @@ impl StreamView {
     }
 
     /// Rebuilds the view at `cursor`, fetching enough records to fill
-    /// the viewport.  The viewport anchors on the first record returned
-    /// by a forward step from `cursor` (or, if forward is empty, the
-    /// last record returned by a backward step).
+    /// the viewport.  The viewport anchors on the first record
+    /// returned by a forward step from `cursor` under the active
+    /// filter; if no record at or after `cursor` survives the filter,
+    /// falls back to the last record before `cursor` that does.  This
+    /// matches the TUI's filter-change and bookmark-navigation
+    /// semantics: a saved cursor keeps working as a marker even when
+    /// the bookmarked event is hidden, by sliding to the nearest
+    /// visible neighbor on either side rather than yielding an empty
+    /// view.
     pub fn seek_to_cursor(
         &mut self,
         engine: &Engine,
@@ -492,6 +517,15 @@ impl StreamView {
         self.backward_eof = false;
         self.anchor = Anchor::PinFront;
         self.ensure_window(engine, viewport_height);
+        // No record at or after the cursor passes the filter — try
+        // backward.  We swap to PinBack semantics here rather than
+        // calling `seek_to_end`, which would walk the whole stream
+        // backwards from EOF; here we want the *closest* visible
+        // record before `cursor`, which is at most a batch away.
+        if self.records.is_empty() && !self.backward_eof {
+            self.anchor = Anchor::PinBack;
+            self.ensure_window(engine, viewport_height);
+        }
     }
 
     /// Ensures the window has enough records to render the viewport
@@ -1876,6 +1910,41 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.seek_to_cursor(&engine, mid_cursor, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn seek_to_cursor_falls_back_backward_when_forward_excluded() {
+        // Build a 4-record stream and walk to a cursor just past the
+        // second record.  Then seek under a filter that excludes
+        // every record at or after that cursor; the seek should
+        // rewind to the most recent visible record before the cursor
+        // (m20) rather than yielding an empty view.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10, 20, 30, 40])], &dir);
+        let mut stepper = engine.stepper(Filter::default(), &Cursor::new());
+        let _ = stepper.step_forward(); // past m10
+        let _ = stepper.step_forward(); // past m20
+        let mid_cursor = stepper.cursor();
+        // Filter hides everything at or after the cursor (m30, m40).
+        let filter: Filter = "msg!=m30 msg!=m40".parse().unwrap();
+        let mut view = StreamView::new(filter, RenderOpts::default());
+        view.seek_to_cursor(&engine, mid_cursor, 20);
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn seek_to_cursor_yields_empty_when_no_record_passes_filter() {
+        // With nothing visible in either direction, seek_to_cursor
+        // ends in an empty view rather than looping or panicking.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
+        let cursor = Cursor::new();
+        let filter: Filter = "msg!=m10 msg!=m20 msg!=m30".parse().unwrap();
+        let mut view = StreamView::new(filter, RenderOpts::default());
+        view.seek_to_cursor(&engine, cursor, 20);
+        assert!(view.is_empty());
         dir.cleanup();
     }
 
