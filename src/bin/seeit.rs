@@ -11,7 +11,7 @@
 
 use camino::Utf8PathBuf;
 use clap::Parser;
-use seer::{Engine, Filter, HostnameDisplay, format_event};
+use seer::{Engine, Filter, HostnameDisplay, RenderOpts, format_event};
 
 #[derive(Parser)]
 #[command(about = "non-interactive log explorer; companion to `seer`")]
@@ -39,14 +39,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match result {
             Ok(ee) => {
                 // `seeit` is non-interactive and has no toggles, so
-                // it prints the most informative form: extras on,
-                // date prefix on, hostnames in their full form.
-                for line in format_event(
-                    &ee.event,
-                    /* show_extras = */ true,
-                    /* show_date = */ true,
-                    HostnameDisplay::Full,
-                ) {
+                // it prints the most informative form: every column
+                // present, full hostname, date prefix on, extras
+                // shown.
+                let opts = RenderOpts {
+                    show_extras: true,
+                    show_date: true,
+                    hostname: HostnameDisplay::Full,
+                    show_pid: true,
+                    show_name: true,
+                };
+                for line in format_event(&ee.event, &opts) {
                     println!("{line}");
                 }
             }

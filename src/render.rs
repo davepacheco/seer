@@ -32,9 +32,9 @@ use std::sync::LazyLock;
 
 /// How [`format_event`] should render the bunyan `hostname` field.
 ///
-/// Cycled with `H` in the TUI (Short → Full → None → Short …) and
-/// persisted on the host [`crate::stream::LogStream`] so the choice
-/// outlives a session.
+/// Selected via the `h` field-display dialog in the TUI and persisted
+/// on the host [`crate::stream::LogStream`] so the choice outlives a
+/// session.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
 )]
@@ -109,33 +109,63 @@ pub fn format_time(time: &DateTime<Utc>, show_date: bool) -> String {
     time.format(pattern).to_string()
 }
 
+/// Bundle of per-stream display knobs threaded through [`format_event`].
+///
+/// Lives in `render` rather than `stream` because it's the function
+/// signature that needs the shape; [`crate::stream::LogStream`] holds
+/// the same fields as its persisted state and hands a [`RenderOpts`]
+/// over via [`crate::stream::LogStream::render_opts`].
+///
+/// Defaults match what a fresh stream renders: extras hidden, date
+/// prefix shown, short hostname, name shown, pid hidden.  Pid is off by
+/// default because Oxide processes typically restart often enough that
+/// the number is noise; users opt in via the field-display dialog when
+/// they need it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderOpts {
+    pub show_extras: bool,
+    pub show_date: bool,
+    pub hostname: HostnameDisplay,
+    pub show_pid: bool,
+    pub show_name: bool,
+}
+
+impl Default for RenderOpts {
+    fn default() -> Self {
+        Self {
+            show_extras: false,
+            show_date: true,
+            hostname: HostnameDisplay::Short,
+            show_pid: false,
+            show_name: true,
+        }
+    }
+}
+
 /// Formats `event` into one or more display lines.
 ///
 /// The first line is the bunyan header
-/// (`<time> [<hostname>] <name>/<pid> <LEVEL> <msg>`); when `show_extras`
-/// is true, subsequent lines are `    <key> = <json-value>`, one per
-/// entry in `event.extra`, ordered by key.  `show_date` controls
-/// whether the leading timestamp includes its `YYYY-MM-DD` prefix;
-/// `hostname` decides whether the hostname column is short, full, or
-/// elided.  The returned vec is non-empty.
-pub fn format_event(
-    event: &Event,
-    show_extras: bool,
-    show_date: bool,
-    hostname: HostnameDisplay,
-) -> Vec<String> {
-    let cap = if show_extras { 1 + event.extra.len() } else { 1 };
+/// (`<time> [<hostname>] [<name>[/<pid>]] <LEVEL> <msg>`); when
+/// `opts.show_extras` is true, subsequent lines are
+/// `    <key> = <json-value>`, one per entry in `event.extra`, ordered
+/// by key.  Each of `show_date`, `hostname`, `show_pid`, and `show_name`
+/// controls whether its column is rendered; the column (and any
+/// adjacent separator) is omitted entirely when the field is hidden, so
+/// no stray double-space artifacts appear.  The returned vec is
+/// non-empty.
+pub fn format_event(event: &Event, opts: &RenderOpts) -> Vec<String> {
+    let cap = if opts.show_extras { 1 + event.extra.len() } else { 1 };
     let mut lines = Vec::with_capacity(cap);
-    // Header column order: time, [hostname], name/pid, level, msg.
-    // Hostname moves ahead of name/pid so the eye lands on the
-    // machine before the process; level sits adjacent to msg so the
-    // severity reads next to its text.  Level is padded to 5 columns
-    // (the width of `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the msg column
-    // lines up across rows of mixed severity.  The hostname column is
-    // dropped entirely (along with its trailing space) under
-    // [`HostnameDisplay::None`] — printing an empty string would leave
-    // a stray double space and misalign the rest of the line.
-    let host_field = match hostname {
+    // Header column order: time, [hostname], [name[/pid]], level, msg.
+    // Hostname moves ahead of name/pid so the eye lands on the machine
+    // before the process; level sits adjacent to msg so the severity
+    // reads next to its text.  Level is padded to 5 columns (the width
+    // of `TRACE`/`DEBUG`/`ERROR`/`FATAL`) so the msg column lines up
+    // across rows of mixed severity.  Each optional column is built
+    // with a trailing space when it's present; absent columns
+    // contribute the empty string so nothing collapses to a stray
+    // double-space.
+    let host_field = match opts.hostname {
         HostnameDisplay::Short => {
             // `as_ref::<str>` to pin which AsRef impl resolves —
             // Hostname forwards AsRef from its inner String, but a
@@ -147,16 +177,21 @@ pub fn format_event(
         HostnameDisplay::Full => format!("{} ", event.hostname),
         HostnameDisplay::None => String::new(),
     };
+    let proc_field = match (opts.show_name, opts.show_pid) {
+        (true, true) => format!("{}/{} ", event.name, event.pid),
+        (true, false) => format!("{} ", event.name),
+        (false, true) => format!("{} ", event.pid),
+        (false, false) => String::new(),
+    };
     lines.push(format!(
-        "{} {}{}/{} {:<5} {}",
-        format_time(&event.time, show_date),
+        "{} {}{}{:<5} {}",
+        format_time(&event.time, opts.show_date),
         host_field,
-        event.name,
-        event.pid,
+        proc_field,
         event.level,
         event.msg,
     ));
-    if show_extras {
+    if opts.show_extras {
         for (k, v) in &event.extra {
             lines.push(format!("    {k} = {v}"));
         }
@@ -172,6 +207,24 @@ mod tests {
         serde_json::from_str(json).expect("test fixture parses as Event")
     }
 
+    /// Test-only helper: pins pid and name *on* so the existing
+    /// rendering tests keep exercising the fully-populated header
+    /// they predate the pid/name toggles.  Dedicated tests below
+    /// cover the toggle behavior itself.
+    fn opts(
+        show_extras: bool,
+        show_date: bool,
+        hostname: HostnameDisplay,
+    ) -> RenderOpts {
+        RenderOpts {
+            show_extras,
+            show_date,
+            hostname,
+            show_pid: true,
+            show_name: true,
+        }
+    }
+
     #[test]
     fn header_only_when_no_extras() {
         let e = parse(
@@ -185,12 +238,7 @@ mod tests {
                 "msg": "Nexus starting up"
             }"#,
         );
-        let lines = format_event(
-            &e,
-            /* show_extras = */ true,
-            /* show_date = */ true,
-            HostnameDisplay::Short,
-        );
+        let lines = format_event(&e, &opts(true, true, HostnameDisplay::Short));
         assert_eq!(lines.len(), 1);
         // Timestamp is truncated to milliseconds and printed with a `Z`
         // suffix, regardless of the source's nanosecond precision.
@@ -220,12 +268,7 @@ mod tests {
                 "build": "0.1.0"
             }"#,
         );
-        let lines = format_event(
-            &e,
-            /* show_extras = */ true,
-            /* show_date = */ true,
-            HostnameDisplay::Short,
-        );
+        let lines = format_event(&e, &opts(true, true, HostnameDisplay::Short));
         assert_eq!(lines.len(), 3);
         assert!(lines[0].ends_with(" Nexus starting up"));
         assert_eq!(lines[1], r#"    build = "0.1.0""#);
@@ -249,12 +292,8 @@ mod tests {
                 "build": "0.1.0"
             }"#,
         );
-        let lines = format_event(
-            &e,
-            /* show_extras = */ false,
-            /* show_date = */ true,
-            HostnameDisplay::Short,
-        );
+        let lines =
+            format_event(&e, &opts(false, true, HostnameDisplay::Short));
         assert_eq!(lines.len(), 1);
         assert!(lines[0].ends_with(" Nexus starting up"));
     }
@@ -276,12 +315,8 @@ mod tests {
                 "msg": "kaboom"
             }"#,
         );
-        let header = &format_event(
-            &e,
-            /* show_extras = */ true,
-            /* show_date = */ true,
-            HostnameDisplay::Short,
-        )[0];
+        let header =
+            &format_event(&e, &opts(true, true, HostnameDisplay::Short))[0];
         assert_eq!(
             header,
             "2026-05-07T00:00:00.000Z host-a Nexus/100 ERROR kaboom",
@@ -303,12 +338,8 @@ mod tests {
                 "msg": "m"
             }"#,
         );
-        let header = &format_event(
-            &e,
-            /* show_extras = */ false,
-            /* show_date = */ false,
-            HostnameDisplay::Short,
-        )[0];
+        let header =
+            &format_event(&e, &opts(false, false, HostnameDisplay::Short))[0];
         assert!(
             header.starts_with("15:30:00.743Z "),
             "expected leading time-only prefix, got {header:?}",
@@ -331,7 +362,8 @@ mod tests {
                 "msg": "m"
             }"#,
         );
-        let header = &format_event(&e, false, true, HostnameDisplay::Full)[0];
+        let header =
+            &format_event(&e, &opts(false, true, HostnameDisplay::Full))[0];
         assert!(
             header.contains(
                 " oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test \
@@ -354,7 +386,8 @@ mod tests {
                 "msg": "m"
             }"#,
         );
-        let header = &format_event(&e, false, true, HostnameDisplay::Short)[0];
+        let header =
+            &format_event(&e, &opts(false, true, HostnameDisplay::Short))[0];
         assert!(
             header.contains(" oxz_nexus_c53300fc n/1 "),
             "expected dot-trimmed and UUID-collapsed hostname, got \
@@ -378,11 +411,86 @@ mod tests {
                 "msg": "kaboom"
             }"#,
         );
-        let header = &format_event(&e, false, true, HostnameDisplay::None)[0];
+        let header =
+            &format_event(&e, &opts(false, true, HostnameDisplay::None))[0];
         assert_eq!(
             header,
             "2026-05-07T00:00:00.000Z Nexus/100 ERROR kaboom",
         );
+    }
+
+    #[test]
+    fn show_pid_false_drops_pid_and_slash() {
+        // Default has pid hidden: the header should read just `<name>`
+        // followed by a single space — no `/`, no pid digits.
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 50,
+                "name": "Nexus",
+                "hostname": "host-a",
+                "pid": 100,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "kaboom"
+            }"#,
+        );
+        let header = &format_event(&e, &RenderOpts::default())[0];
+        assert_eq!(
+            header,
+            "2026-05-07T00:00:00.000Z host-a Nexus ERROR kaboom",
+        );
+    }
+
+    #[test]
+    fn show_name_false_keeps_pid_alone() {
+        // Hide name but show pid: the header should carry the pid as
+        // its own column with no preceding `/`.
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "Nexus",
+                "hostname": "host-a",
+                "pid": 42,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "m"
+            }"#,
+        );
+        let opts = RenderOpts {
+            show_pid: true,
+            show_name: false,
+            ..RenderOpts::default()
+        };
+        let header = &format_event(&e, &opts)[0];
+        assert_eq!(
+            header,
+            "2026-05-07T00:00:00.000Z host-a 42 INFO  m",
+        );
+    }
+
+    #[test]
+    fn show_name_and_pid_both_false_drops_the_column() {
+        // With both off, no name/pid column appears: hostname is
+        // followed directly by the level column with exactly one
+        // space between them (no double-space artifact).
+        let e = parse(
+            r#"{
+                "v": 0,
+                "level": 30,
+                "name": "Nexus",
+                "hostname": "host-a",
+                "pid": 42,
+                "time": "2026-05-07T00:00:00Z",
+                "msg": "m"
+            }"#,
+        );
+        let opts = RenderOpts {
+            show_pid: false,
+            show_name: false,
+            ..RenderOpts::default()
+        };
+        let header = &format_event(&e, &opts)[0];
+        assert_eq!(header, "2026-05-07T00:00:00.000Z host-a INFO  m");
     }
 
     #[test]
@@ -403,11 +511,11 @@ mod tests {
                 "time":"2026-05-07T00:00:00Z","msg":"m"}"#,
         );
         let info_line =
-            &format_event(&info, false, true, HostnameDisplay::Short)[0];
+            &format_event(&info, &opts(false, true, HostnameDisplay::Short))[0];
         let warn_line =
-            &format_event(&warn, false, true, HostnameDisplay::Short)[0];
+            &format_event(&warn, &opts(false, true, HostnameDisplay::Short))[0];
         let error_line =
-            &format_event(&error, false, true, HostnameDisplay::Short)[0];
+            &format_event(&error, &opts(false, true, HostnameDisplay::Short))[0];
         // The two characters following the level are always "  m" for
         // 4-char levels (padded plus space plus msg) and " m" for the
         // 5-char ones.
@@ -435,12 +543,7 @@ mod tests {
                 "absent": null
             }"#,
         );
-        let lines = format_event(
-            &e,
-            /* show_extras = */ true,
-            /* show_date = */ true,
-            HostnameDisplay::Short,
-        );
+        let lines = format_event(&e, &opts(true, true, HostnameDisplay::Short));
         // Header + 6 extras, sorted: absent, count, enabled, meta, ratio, tags.
         assert_eq!(lines.len(), 7);
         assert_eq!(lines[1], "    absent = null");

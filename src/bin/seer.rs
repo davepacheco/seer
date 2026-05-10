@@ -28,8 +28,8 @@ use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
     HostnameDisplay, LogStream, LogStreamId, LogStreamPosition, Predicate,
-    SEARCH_BUDGET, SearchDir, SearchOutcome, Session, SourceId, StreamView,
-    SummaryBuilder, format_summary,
+    RenderOpts, SEARCH_BUDGET, SearchDir, SearchOutcome, Session, SourceId,
+    StreamView, SummaryBuilder, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -135,17 +135,10 @@ const INITIAL_VIEWPORT_HEIGHT: u16 = 80;
 fn render_rows(
     engine: &Engine,
     filter: &Filter,
-    show_extras: bool,
-    show_date: bool,
-    hostname_display: HostnameDisplay,
+    opts: RenderOpts,
     viewport_height: u16,
 ) -> (StreamView, RenderedRows) {
-    let mut view = StreamView::new(
-        filter.clone(),
-        show_extras,
-        show_date,
-        hostname_display,
-    );
+    let mut view = StreamView::new(filter.clone(), opts);
     view.ensure_window(engine, viewport_height);
     let rows = materialize_streamview(&view);
     (view, rows)
@@ -525,18 +518,14 @@ impl Tab {
         engine: &Engine,
         stream: LogStreamId,
         filter: &Filter,
-        show_extras: bool,
-        show_date: bool,
-        hostname_display: HostnameDisplay,
+        opts: RenderOpts,
     ) -> Self {
         let (streamview, rendered) = match kind {
             TabKind::Stream => {
                 let (view, rows) = render_rows(
                     engine,
                     filter,
-                    show_extras,
-                    show_date,
-                    hostname_display,
+                    opts,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 (Some(view), rows)
@@ -567,18 +556,14 @@ impl Tab {
         &mut self,
         engine: &Engine,
         filter: &Filter,
-        show_extras: bool,
-        show_date: bool,
-        hostname_display: HostnameDisplay,
+        opts: RenderOpts,
     ) {
         let rendered = match self.kind {
             TabKind::Stream => {
                 let (view, rows) = render_rows(
                     engine,
                     filter,
-                    show_extras,
-                    show_date,
-                    hostname_display,
+                    opts,
                     INITIAL_VIEWPORT_HEIGHT,
                 );
                 self.streamview = Some(view);
@@ -608,25 +593,19 @@ impl Tab {
         &mut self,
         engine: &Engine,
         filter: &Filter,
-        show_extras: bool,
-        show_date: bool,
-        hostname_display: HostnameDisplay,
+        opts: RenderOpts,
     ) {
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
         let rendered = match self.kind {
             TabKind::Stream => {
                 if let Some(view) = self.streamview.as_mut() {
-                    view.set_show_extras(show_extras);
-                    view.set_show_date(show_date);
-                    view.set_hostname_display(hostname_display);
+                    view.set_render_opts(opts);
                     materialize_streamview(view)
                 } else {
                     let (view, rows) = render_rows(
                         engine,
                         filter,
-                        show_extras,
-                        show_date,
-                        hostname_display,
+                        opts,
                         INITIAL_VIEWPORT_HEIGHT,
                     );
                     self.streamview = Some(view);
@@ -1040,9 +1019,7 @@ impl App {
             &self.engine,
             stream_id,
             &stream.filter,
-            stream.show_extras,
-            stream.show_date,
-            stream.hostname_display,
+            stream.render_opts(),
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1067,9 +1044,7 @@ impl App {
             &self.engine,
             stream_id,
             &stream.filter,
-            stream.show_extras,
-            stream.show_date,
-            stream.hostname_display,
+            stream.render_opts(),
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -1128,22 +1103,14 @@ impl App {
         };
         stream.filter = filter;
         let new_filter = stream.filter.clone();
-        let show_extras = stream.show_extras;
-        let show_date = stream.show_date;
-        let hostname_display = stream.hostname_display;
+        let opts = stream.render_opts();
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.refresh(
-                    &self.engine,
-                    &new_filter,
-                    show_extras,
-                    show_date,
-                    hostname_display,
-                );
+                tab.refresh(&self.engine, &new_filter, opts);
             }
         }
     }
@@ -1177,50 +1144,52 @@ impl App {
         self.rerender_after_stream_mutation(stream_id, stream);
     }
 
-    /// Cycles the active stream's hostname-rendering mode through
-    /// Short → Full → None → Short.  Persisted on the [`LogStream`]
-    /// like the other render toggles.
-    fn cycle_hostname_display(&mut self) {
+    /// Replaces the active stream's [`RenderOpts`] with `opts`,
+    /// persists it, and re-renders every tab targeting that stream.
+    /// Used by the `h` field-display dialog, which mutates several
+    /// knobs at once.
+    fn apply_render_opts(&mut self, opts: RenderOpts) {
         let stream_id = self.tabs[self.active].stream;
         let Some(mut stream) = self.session.streams.remove(&stream_id) else {
             return;
         };
-        stream.hostname_display = match stream.hostname_display {
-            HostnameDisplay::Short => HostnameDisplay::Full,
-            HostnameDisplay::Full => HostnameDisplay::None,
-            HostnameDisplay::None => HostnameDisplay::Short,
-        };
+        stream.set_render_opts(opts);
         self.rerender_after_stream_mutation(stream_id, stream);
     }
 
     /// Re-inserts `stream` into the session and triggers a `rerender`
-    /// on every tab targeting it.  Shared by the F/D/H toggles, all of
-    /// which mutate one rendering knob and want every tab to repaint
-    /// with the new value.
+    /// on every tab targeting it.  Shared by the `F`/`D` toggles and
+    /// the `h` field-display dialog: each mutates one or more
+    /// rendering knobs and wants every tab to repaint with the new
+    /// values.
     fn rerender_after_stream_mutation(
         &mut self,
         stream_id: LogStreamId,
         stream: LogStream,
     ) {
         let new_filter = stream.filter.clone();
-        let show_extras = stream.show_extras;
-        let show_date = stream.show_date;
-        let hostname_display = stream.hostname_display;
+        let opts = stream.render_opts();
         self.session
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
         for tab in self.tabs.iter_mut() {
             if tab.stream == stream_id {
-                tab.rerender(
-                    &self.engine,
-                    &new_filter,
-                    show_extras,
-                    show_date,
-                    hostname_display,
-                );
+                tab.rerender(&self.engine, &new_filter, opts);
             }
         }
+    }
+
+    /// Returns the active stream's [`RenderOpts`] snapshot.  Convenience
+    /// for the field-display dialog, which pre-fills with the current
+    /// settings so the user can edit relative to what's on screen.
+    fn active_render_opts(&self) -> RenderOpts {
+        let stream_id = self.tabs[self.active].stream;
+        self.session
+            .streams
+            .get(&stream_id)
+            .expect("stream exists")
+            .render_opts()
     }
 
     /// Returns the active stream's filter.  Convenience for the few
@@ -1958,6 +1927,10 @@ impl App {
                     self.dialog = None;
                     self.quit = true;
                 }
+                DialogResult::ApplyDisplayFields(opts) => {
+                    self.dialog = None;
+                    self.apply_render_opts(opts);
+                }
             }
             return;
         }
@@ -2097,13 +2070,18 @@ impl App {
             {
                 self.toggle_show_date();
             }
-            // `H`: cycle the hostname-rendering mode through
-            // Short → Full → None → Short.
-            KeyEvent { code: KeyCode::Char('H'), modifiers, .. }
-                if modifiers == KeyModifiers::NONE
-                    || modifiers == KeyModifiers::SHIFT =>
-            {
-                self.cycle_hostname_display();
+            // `h`: open the field-display dialog (timestamp format,
+            // hostname mode, name/pid/extras visibility).  Replaces the
+            // single-purpose `H` cycle and folds the `F` extras toggle
+            // alongside the other knobs in one place — `F` keeps its
+            // shortcut for muscle memory.
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.dialog =
+                    Some(Dialog::display_fields(self.active_render_opts()));
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -2500,6 +2478,110 @@ enum Dialog {
     /// confirms.  Guards against accidental exits losing the user's
     /// in-flight filter, search, and viewport state.
     ConfirmQuit,
+    /// Choosing which header columns to render: timestamp format,
+    /// hostname mode, name, pid, and structured-fields visibility.
+    /// Carries a draft [`RenderOpts`] that the user mutates with
+    /// spacebar; Enter applies the draft to the active stream, Esc
+    /// discards it.
+    DisplayFields { draft: RenderOpts, cursor: usize },
+}
+
+/// One row in the [`Dialog::DisplayFields`] list.  Items are either
+/// radio members of a group (timestamp format, hostname mode) or
+/// independent checkboxes (pid, name, extras).  The flat ordering is
+/// what `j`/`k` walk through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayFieldItem {
+    /// short timestamp (no date) — radio with [`TimestampLong`].
+    TimestampShort,
+    /// date + ms timestamp — radio with [`TimestampShort`].
+    TimestampLong,
+    HostnameShort,
+    HostnameFull,
+    HostnameNone,
+    Pid,
+    Name,
+    Extras,
+}
+
+const DISPLAY_FIELD_ITEMS: [DisplayFieldItem; 8] = [
+    DisplayFieldItem::TimestampShort,
+    DisplayFieldItem::TimestampLong,
+    DisplayFieldItem::HostnameShort,
+    DisplayFieldItem::HostnameFull,
+    DisplayFieldItem::HostnameNone,
+    DisplayFieldItem::Pid,
+    DisplayFieldItem::Name,
+    DisplayFieldItem::Extras,
+];
+
+impl DisplayFieldItem {
+    /// Display label rendered next to the radio/checkbox glyph.
+    fn label(self) -> &'static str {
+        match self {
+            Self::TimestampShort => "short timestamp (no date)",
+            Self::TimestampLong => "full date and time",
+            Self::HostnameShort => "short hostname",
+            Self::HostnameFull => "full hostname",
+            Self::HostnameNone => "no hostname",
+            Self::Pid => "pid",
+            Self::Name => "name",
+            Self::Extras => "show all other fields",
+        }
+    }
+
+    /// Returns true when this item terminates a logical group and a
+    /// blank row should follow it in the rendered list, so the
+    /// timestamp and hostname radio groups don't read as one
+    /// five-option group.
+    fn ends_group(self) -> bool {
+        matches!(self, Self::TimestampLong | Self::HostnameNone)
+    }
+
+    /// Returns true iff this item represents a radio group member.
+    /// Used by the renderer to choose between `(•)`/`( )` and
+    /// `[x]`/`[ ]` glyphs.
+    fn is_radio(self) -> bool {
+        matches!(
+            self,
+            Self::TimestampShort
+                | Self::TimestampLong
+                | Self::HostnameShort
+                | Self::HostnameFull
+                | Self::HostnameNone
+        )
+    }
+
+    /// Returns true iff this item is "selected" (radio) or "checked"
+    /// (checkbox) under `opts`.
+    fn is_active(self, opts: &RenderOpts) -> bool {
+        match self {
+            Self::TimestampShort => !opts.show_date,
+            Self::TimestampLong => opts.show_date,
+            Self::HostnameShort => opts.hostname == HostnameDisplay::Short,
+            Self::HostnameFull => opts.hostname == HostnameDisplay::Full,
+            Self::HostnameNone => opts.hostname == HostnameDisplay::None,
+            Self::Pid => opts.show_pid,
+            Self::Name => opts.show_name,
+            Self::Extras => opts.show_extras,
+        }
+    }
+
+    /// Applies this item's effect to `opts` when spacebar is pressed.
+    /// Radio members set the group to their value (no-op when already
+    /// selected); checkboxes flip in place.
+    fn apply(self, opts: &mut RenderOpts) {
+        match self {
+            Self::TimestampShort => opts.show_date = false,
+            Self::TimestampLong => opts.show_date = true,
+            Self::HostnameShort => opts.hostname = HostnameDisplay::Short,
+            Self::HostnameFull => opts.hostname = HostnameDisplay::Full,
+            Self::HostnameNone => opts.hostname = HostnameDisplay::None,
+            Self::Pid => opts.show_pid = !opts.show_pid,
+            Self::Name => opts.show_name = !opts.show_name,
+            Self::Extras => opts.show_extras = !opts.show_extras,
+        }
+    }
 }
 
 /// Outcome of one keystroke routed to the dialog.
@@ -2532,6 +2614,9 @@ enum DialogResult {
     /// Close the dialog and tear down the TUI: the user confirmed the
     /// quit prompt.
     ApplyQuit,
+    /// Close the dialog and install these [`RenderOpts`] on the active
+    /// stream, repainting every tab targeting it.
+    ApplyDisplayFields(RenderOpts),
 }
 
 impl Dialog {
@@ -2569,13 +2654,23 @@ impl Dialog {
         Self::ConfirmQuit
     }
 
+    /// Builds the field-display dialog initialized with the active
+    /// stream's current [`RenderOpts`].  Cursor starts at item 0
+    /// (timestamp's "short" radio) — j/k navigate, spacebar mutates
+    /// the draft, Enter applies, Esc cancels.
+    fn display_fields(opts: RenderOpts) -> Self {
+        Self::DisplayFields { draft: opts, cursor: 0 }
+    }
+
     fn editor(&self) -> Option<&LineEditor> {
         match self {
             Self::Filter { editor, .. }
             | Self::Rename { editor }
             | Self::Search { editor, .. }
             | Self::BookmarkName { editor, .. } => Some(editor),
-            Self::ConfirmDeleteBookmark { .. } | Self::ConfirmQuit => None,
+            Self::ConfirmDeleteBookmark { .. }
+            | Self::ConfirmQuit
+            | Self::DisplayFields { .. } => None,
         }
     }
 
@@ -2586,7 +2681,8 @@ impl Dialog {
             Self::Rename { .. }
             | Self::BookmarkName { .. }
             | Self::ConfirmDeleteBookmark { .. }
-            | Self::ConfirmQuit => None,
+            | Self::ConfirmQuit
+            | Self::DisplayFields { .. } => None,
         }
     }
 
@@ -2614,6 +2710,10 @@ impl Dialog {
             }
             Self::ConfirmQuit => {
                 "Quit? (Esc cancel · Enter confirm)".to_string()
+            }
+            Self::DisplayFields { .. } => {
+                "Display fields (Esc cancel · Enter apply · space toggle)"
+                    .to_string()
             }
         }
     }
@@ -2656,6 +2756,13 @@ impl Dialog {
             } => return self.try_apply(),
             _ => {}
         }
+        // The field-display dialog has its own keymap (j/k/Tab to move,
+        // space to toggle, anything else dropped).  Handle it ahead of
+        // the editor variants since it doesn't share their text-input
+        // bindings.
+        if let Self::DisplayFields { draft, cursor } = self {
+            return handle_display_fields_key(draft, cursor, key);
+        }
         // Backspacing past the leading `/` (or `?`) of an empty search
         // prompt is treated as "I changed my mind" — the same as Esc.
         // The Filter, Rename, and BookmarkName dialogs deliberately
@@ -2673,12 +2780,14 @@ impl Dialog {
             | Self::Rename { editor }
             | Self::Search { editor, .. }
             | Self::BookmarkName { editor, .. } => editor.handle_edit(key),
-            // Confirmation dialogs have no editor; non-Esc/Enter keys
-            // are dropped on the floor so a stray `j`/`q` doesn't fall
-            // through to the underlying tab.
+            // Confirmation and selection dialogs have no editor;
+            // non-Esc/Enter keys are dropped on the floor so a stray
+            // `j`/`q` doesn't fall through to the underlying tab.
             Self::ConfirmDeleteBookmark { .. } | Self::ConfirmQuit => {
                 return DialogResult::Stay;
             }
+            // Already handled above.
+            Self::DisplayFields { .. } => return DialogResult::Stay,
         };
         if let EditAction::Handled = editor_result {
             self.reparse_filter();
@@ -2739,8 +2848,49 @@ impl Dialog {
                 DialogResult::ApplyDeleteBookmark(*id)
             }
             Self::ConfirmQuit => DialogResult::ApplyQuit,
+            Self::DisplayFields { draft, .. } => {
+                DialogResult::ApplyDisplayFields(*draft)
+            }
         }
     }
+}
+
+/// Routes a keystroke inside the field-display dialog.  Cursor moves
+/// with `j`/`k`/Down/Up/Tab/BackTab and wraps; spacebar applies the
+/// item under the cursor's effect on `draft`.  Anything else is
+/// dropped (Esc/Enter are handled by [`Dialog::handle_key`] before
+/// reaching here).
+fn handle_display_fields_key(
+    draft: &mut RenderOpts,
+    cursor: &mut usize,
+    key: KeyEvent,
+) -> DialogResult {
+    let n = DISPLAY_FIELD_ITEMS.len();
+    match key {
+        KeyEvent {
+            code: KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            *cursor = (*cursor + 1) % n;
+        }
+        KeyEvent {
+            code: KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            *cursor = (*cursor + n - 1) % n;
+        }
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            DISPLAY_FIELD_ITEMS[*cursor].apply(draft);
+        }
+        _ => {}
+    }
+    DialogResult::Stay
 }
 
 /// First slice of a log message, suitable for the Bookmarks-tab row
@@ -2976,7 +3126,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             } else if total == 0 {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     H host={} · / search · </> step={} · \
+                     h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · 0/0",
                     if app.active_show_extras() { "on" } else { "off" },
@@ -2987,7 +3137,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             } else {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     H host={} · / search · </> step={} · \
+                     h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · {}-{} of {}",
                     if app.active_show_extras() { "on" } else { "off" },
@@ -3004,14 +3154,16 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Centered popups (Filter, Rename, BookmarkName,
-    // ConfirmDeleteBookmark, ConfirmQuit) draw on top of the rest.
-    // The Search prompt is laid out inline above and is skipped here.
+    // ConfirmDeleteBookmark, ConfirmQuit, DisplayFields) draw on top
+    // of the rest.  The Search prompt is laid out inline above and is
+    // skipped here.
     if let Some(
         dialog @ (Dialog::Filter { .. }
         | Dialog::Rename { .. }
         | Dialog::BookmarkName { .. }
         | Dialog::ConfirmDeleteBookmark { .. }
-        | Dialog::ConfirmQuit),
+        | Dialog::ConfirmQuit
+        | Dialog::DisplayFields { .. }),
     ) = app.dialog.as_ref()
     {
         render_dialog(frame, dialog, area);
@@ -3159,14 +3311,21 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
-/// Carves a centered popup over `area` and draws either dialog variant.
+/// Carves a centered popup over `area` and draws the appropriate
+/// dialog body.
 ///
 /// Variants with an editor (Filter/Rename/Search/BookmarkName) render
 /// their text and cursor on the first row; Filter/Search additionally
 /// render any parse error in red below.  ConfirmDeleteBookmark and
 /// ConfirmQuit have no editor and show only the question encoded in
-/// their title.
+/// their title.  DisplayFields is rendered separately
+/// ([`render_display_fields_dialog`]) since its body is a list of
+/// rows, not an editor + error.
 fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
+    if let Dialog::DisplayFields { draft, cursor } = dialog {
+        render_display_fields_dialog(frame, dialog, draft, *cursor, area);
+        return;
+    }
     let popup = popup_area(area, 70, 5);
     // Clear the underlying rows so the editor isn't drawn on top of
     // them.
@@ -3205,6 +3364,52 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             error_area,
         );
     }
+}
+
+/// Draws the field-display dialog: one row per item in
+/// [`DISPLAY_FIELD_ITEMS`], with a `(•)`/`( )` glyph for radio members
+/// and `[x]`/`[ ]` for checkboxes.  A blank row separates the
+/// timestamp, hostname, and checkbox groups so the radio groups don't
+/// read as one combined five-option list.  The row under the cursor
+/// is highlighted with `Modifier::REVERSED`.
+fn render_display_fields_dialog(
+    frame: &mut Frame,
+    dialog: &Dialog,
+    draft: &RenderOpts,
+    cursor: usize,
+    area: Rect,
+) {
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(
+        DISPLAY_FIELD_ITEMS.len() + 2, // 2 separators between 3 groups
+    );
+    for (i, item) in DISPLAY_FIELD_ITEMS.iter().enumerate() {
+        let glyph = match (item.is_radio(), item.is_active(draft)) {
+            (true, true) => "(•)",
+            (true, false) => "( )",
+            (false, true) => "[x]",
+            (false, false) => "[ ]",
+        };
+        let text = format!("{glyph} {}", item.label());
+        let line = Line::raw(text);
+        let line = if i == cursor {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        };
+        lines.push(line);
+        if item.ends_group() {
+            lines.push(Line::raw(""));
+        }
+    }
+    // Outer border adds 2 rows of frame; the 50-column width
+    // comfortably fits the longest label ("short timestamp (no date)").
+    let body_height = u16::try_from(lines.len()).expect("fits in u16") + 2;
+    let popup = popup_area(area, 50, body_height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(dialog.title());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn popup_area(area: Rect, percent_width: u16, height: u16) -> Rect {
@@ -3784,6 +3989,52 @@ mod tests {
         assert!(
             dump.contains("operator") || dump.contains("token"),
             "expected a parse error in dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn render_draws_display_fields_dialog() {
+        // Open the dialog and confirm the rendered popup carries the
+        // title, every item label, and the right glyphs for the
+        // default state (timestamp = date+ms, hostname = short, name
+        // checked, pid + extras unchecked).
+        let backend = TestBackend::new(80, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("Display fields"), "dump:\n{dump}");
+        for label in [
+            "short timestamp (no date)",
+            "full date and time",
+            "short hostname",
+            "full hostname",
+            "no hostname",
+            "pid",
+            "name",
+            "show all other fields",
+        ] {
+            assert!(dump.contains(label), "missing {label:?} in:\n{dump}");
+        }
+        // Default radios: timestamp long is on, hostname short is on.
+        assert!(
+            dump.contains("(•) full date and time"),
+            "expected full-date radio selected:\n{dump}",
+        );
+        assert!(
+            dump.contains("(•) short hostname"),
+            "expected short hostname radio selected:\n{dump}",
+        );
+        // pid and extras default off; name defaults on.
+        assert!(dump.contains("[ ] pid"), "expected pid unchecked:\n{dump}");
+        assert!(
+            dump.contains("[x] name"),
+            "expected name checked:\n{dump}",
+        );
+        assert!(
+            dump.contains("[ ] show all other fields"),
+            "expected extras unchecked:\n{dump}",
         );
     }
 
@@ -5766,7 +6017,22 @@ mod tests {
         assert!(streams[0].show_date);
     }
 
-    // ---------- hostname display cycle (H) ----------
+    // ---------- field-display dialog (h) ----------
+
+    /// Walks the open field-display dialog's cursor to `target` via
+    /// repeated `j`.  Panics if the cursor doesn't reach the target —
+    /// useful for diagnosing a missed navigation key in tests.
+    fn focus_display_field(a: &mut App, target: DisplayFieldItem) {
+        for _ in 0..DISPLAY_FIELD_ITEMS.len() * 2 {
+            if let Some(Dialog::DisplayFields { cursor, .. }) = &a.dialog
+                && DISPLAY_FIELD_ITEMS[*cursor] == target
+            {
+                return;
+            }
+            a.handle_key(key(KeyCode::Char('j')));
+        }
+        panic!("never landed on {target:?} after walking the dialog twice");
+    }
 
     #[test]
     fn streams_default_to_short_hostname() {
@@ -5775,69 +6041,184 @@ mod tests {
     }
 
     #[test]
-    fn shift_h_cycles_short_full_none_short() {
+    fn h_opens_display_fields_dialog_with_active_opts() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(key(KeyCode::Char('h')));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { draft, cursor }) => {
+                assert_eq!(*cursor, 0);
+                assert_eq!(*draft, a.active_render_opts());
+            }
+            _ => panic!("expected DisplayFields dialog"),
+        }
+    }
+
+    #[test]
+    fn display_fields_dialog_jk_navigates_with_wrap() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(key(KeyCode::Char('h')));
+        // j once → cursor 1.
+        a.handle_key(key(KeyCode::Char('j')));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { cursor, .. }) => {
+                assert_eq!(*cursor, 1);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+        // k once → cursor 0.
+        a.handle_key(key(KeyCode::Char('k')));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { cursor, .. }) => {
+                assert_eq!(*cursor, 0);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+        // k from 0 wraps to last.
+        a.handle_key(key(KeyCode::Char('k')));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { cursor, .. }) => {
+                assert_eq!(*cursor, DISPLAY_FIELD_ITEMS.len() - 1);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+    }
+
+    #[test]
+    fn display_fields_dialog_tab_navigates_like_j() {
+        // Tab should advance the cursor the same way `j` does, and
+        // BackTab should retreat it like `k` — for users who'd rather
+        // use Tab/Shift-Tab than vim keys.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Tab));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { cursor, .. }) => {
+                assert_eq!(*cursor, 1);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+        a.handle_key(back_tab());
+        match &a.dialog {
+            Some(Dialog::DisplayFields { cursor, .. }) => {
+                assert_eq!(*cursor, 0);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+    }
+
+    #[test]
+    fn display_fields_dialog_space_selects_hostname_radio() {
+        // Walk the cursor to `HostnameFull`, hit space — the draft
+        // should reflect Full, but the active stream is unchanged
+        // until Enter.  Then Enter applies and the stream picks up
+        // Full.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
+        a.handle_key(key(KeyCode::Char(' ')));
+        match &a.dialog {
+            Some(Dialog::DisplayFields { draft, .. }) => {
+                assert_eq!(draft.hostname, HostnameDisplay::Full);
+            }
+            _ => panic!("dialog closed unexpectedly"),
+        }
+        // Active stream still on Short — draft hasn't been applied.
         assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
-        a.handle_key(shift('H'));
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
-        a.handle_key(shift('H'));
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::None);
-        a.handle_key(shift('H'));
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
-        // Bare `H` (no SHIFT) advances too.
-        a.handle_key(key(KeyCode::Char('H')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
         assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
     }
 
     #[test]
-    fn shift_h_repaints_with_new_hostname_form() {
+    fn display_fields_dialog_space_toggles_pid_checkbox() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let before = a.active_render_opts();
+        assert!(!before.show_pid, "default is pid hidden");
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::Pid);
+        a.handle_key(key(KeyCode::Char(' ')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.active_render_opts().show_pid);
+    }
+
+    #[test]
+    fn display_fields_dialog_esc_discards_draft() {
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let before = a.active_render_opts();
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::HostnameNone);
+        a.handle_key(key(KeyCode::Char(' ')));
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.dialog.is_none());
+        assert_eq!(a.active_render_opts(), before);
+    }
+
+    #[test]
+    fn display_fields_dialog_repaints_on_apply() {
         // Use a hostname that exercises both the dot-trim and the
-        // UUID-collapse, so each cycle step produces a visibly
-        // different rendered line.
+        // UUID-collapse, so the two hostname modes produce visibly
+        // different rendered lines.
         let (mut a, _dir) = host_app(
             "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
             &[(10, "first")],
         );
         let short_line = a.active_tab().formatted[0].clone();
         assert!(
-            short_line.contains(" oxz_nexus_c53300fc Nexus/"),
-            "expected short hostname, got {short_line:?}",
+            short_line.contains(" oxz_nexus_c53300fc Nexus "),
+            "expected short hostname (and no pid by default), got \
+             {short_line:?}",
         );
-
-        a.handle_key(shift('H')); // → Full
+        // h → focus HostnameFull → space → Enter.
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
+        a.handle_key(key(KeyCode::Char(' ')));
+        a.handle_key(key(KeyCode::Enter));
         let full_line = a.active_tab().formatted[0].clone();
         assert!(
             full_line.contains(
                 " oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test \
-                 Nexus/",
+                 Nexus ",
             ),
-            "expected full hostname, got {full_line:?}",
-        );
-
-        a.handle_key(shift('H')); // → None
-        let no_host_line = a.active_tab().formatted[0].clone();
-        assert!(
-            !no_host_line.contains("oxz_nexus_"),
-            "expected no hostname, got {no_host_line:?}",
-        );
-        assert!(
-            no_host_line.contains(" Nexus/"),
-            "expected name/pid still present, got {no_host_line:?}",
+            "expected full hostname after apply, got {full_line:?}",
         );
     }
 
     #[test]
-    fn hostname_display_persists_into_session_round_trip() {
+    fn display_fields_persists_into_session_round_trip() {
+        // Open the dialog, switch to full hostname, apply, then
+        // confirm the new value rides through serde.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
         assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
-        // Cycle once: Short → Full.
-        a.handle_key(shift('H'));
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
+        a.handle_key(key(KeyCode::Char(' ')));
+        a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream_id = a.tabs[a.active].stream;
         let stream = restored.streams.get(&stream_id).unwrap();
         assert_eq!(stream.hostname_display, HostnameDisplay::Full);
+    }
+
+    #[test]
+    fn show_pid_persists_into_session_round_trip() {
+        // pid defaults off; flip via the dialog and verify the new
+        // value rides through serde, including legacy session JSON
+        // that omits the field defaulting to off on load.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let stream_id = a.tabs[a.active].stream;
+        let initial = a.session.streams.get(&stream_id).unwrap();
+        assert!(!initial.show_pid);
+        assert!(initial.show_name);
+        a.handle_key(key(KeyCode::Char('h')));
+        focus_display_field(&mut a, DisplayFieldItem::Pid);
+        a.handle_key(key(KeyCode::Char(' ')));
+        a.handle_key(key(KeyCode::Enter));
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        let stream = restored.streams.get(&stream_id).unwrap();
+        assert!(stream.show_pid);
     }
 
     #[test]

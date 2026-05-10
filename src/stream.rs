@@ -11,7 +11,7 @@
 //! Filters and source-set restrictions land here next.
 
 use crate::filter::Filter;
-use crate::render::HostnameDisplay;
+use crate::render::{HostnameDisplay, RenderOpts};
 use crate::source::SourceId;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
@@ -124,34 +124,76 @@ pub struct LogStream {
     /// only the wall-clock part is shown.  Defaults to true: most
     /// triage spans more than a single day, and you want the date in
     /// view by default.  Toggled with `D` in the TUI.
-    #[serde(default = "default_show_date")]
+    #[serde(default = "default_true")]
     pub show_date: bool,
     /// how the bunyan `hostname` field is rendered: short (the
-    /// default), full, or omitted.  Cycled with `H` in the TUI.
+    /// default), full, or omitted.  Set via the `h` field-display
+    /// dialog in the TUI.
     #[serde(default)]
     pub hostname_display: HostnameDisplay,
+    /// when true, the bunyan `pid` field renders alongside `name` in
+    /// the header.  Defaults to false: real Oxide processes restart
+    /// often enough that the literal pid number is rarely useful for
+    /// triage; users opt in via the `h` field-display dialog when they
+    /// do want it.
+    #[serde(default)]
+    pub show_pid: bool,
+    /// when true, the bunyan `name` field renders in the header.
+    /// Defaults to true: across merged sources the logger name is the
+    /// quickest way to tell which component a given event came from.
+    #[serde(default = "default_true")]
+    pub show_name: bool,
 }
 
-fn default_show_date() -> bool {
+fn default_true() -> bool {
     true
 }
 
 impl LogStream {
     /// Returns a new log stream with a freshly-generated id, the given
-    /// display name, an empty filter, extras hidden, the date prefix
-    /// shown, and the hostname rendered in short form.
+    /// display name, an empty filter, and the same field-visibility
+    /// defaults as [`RenderOpts::default`].
     // No `Default` impl: each call mints a distinct id, so a default
     // value would silently produce non-equal objects.
     #[allow(clippy::new_without_default)]
     pub fn new(name: String) -> Self {
+        let opts = RenderOpts::default();
         Self {
             id: LogStreamId::new_v4(),
             name,
             filter: Filter::default(),
-            show_extras: false,
-            show_date: true,
-            hostname_display: HostnameDisplay::default(),
+            show_extras: opts.show_extras,
+            show_date: opts.show_date,
+            hostname_display: opts.hostname,
+            show_pid: opts.show_pid,
+            show_name: opts.show_name,
         }
+    }
+
+    /// Returns a [`RenderOpts`] snapshot of the stream's current
+    /// field-visibility settings.  Callers in the TUI use this to
+    /// install rendering options on a [`crate::streamview::StreamView`]
+    /// when (re)building it.
+    pub fn render_opts(&self) -> RenderOpts {
+        RenderOpts {
+            show_extras: self.show_extras,
+            show_date: self.show_date,
+            hostname: self.hostname_display,
+            show_pid: self.show_pid,
+            show_name: self.show_name,
+        }
+    }
+
+    /// Replaces the stream's field-visibility settings with the values
+    /// in `opts`.  The persisted-on-disk fields stay individual (so the
+    /// session schema can evolve one knob at a time without breaking
+    /// older saves), but the TUI dialog mutates them as a bundle.
+    pub fn set_render_opts(&mut self, opts: RenderOpts) {
+        self.show_extras = opts.show_extras;
+        self.show_date = opts.show_date;
+        self.hostname_display = opts.hostname;
+        self.show_pid = opts.show_pid;
+        self.show_name = opts.show_name;
     }
 }
 
