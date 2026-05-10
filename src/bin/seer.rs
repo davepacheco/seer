@@ -28,7 +28,7 @@ use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
     HostnameDisplay, LogStream, LogStreamId, LogStreamPosition, Predicate,
-    RenderOpts, SEARCH_BUDGET, SearchDir, SearchOutcome, Session, SourceId,
+    RenderOpts, SearchDir, SearchOutcome, Session, SourceId,
     StreamView, SummaryBuilder, format_summary,
 };
 use std::collections::HashMap;
@@ -61,7 +61,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new_with_session(engine, Session::new());
     while !app.quit {
         terminal.draw(|frame| render(frame, &mut app))?;
-        if event::poll(Duration::from_millis(100))?
+        if app.long_op.is_some() {
+            // Long-op mode: advance one chunk per loop iteration and
+            // poll briefly for input.  The chunk size is tuned so a
+            // single advance returns in well under a frame; the
+            // zero-duration poll lets a Ctrl-C land between chunks
+            // without slowing the steady state.  Other keys are
+            // intentionally ignored — the user is waiting on the
+            // active op and surprise key reactions would race the op
+            // anyway.
+            app.advance_long_op();
+            if event::poll(Duration::ZERO)?
+                && let Event::Key(key) = event::read()?
+                && key.kind != KeyEventKind::Release
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+            {
+                app.cancel_long_op();
+            }
+        } else if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
         {
             app.handle_key(key);
@@ -208,41 +226,19 @@ fn materialize_streamview(view: &StreamView) -> RenderedRows {
     }
 }
 
-/// Drives a single pass over `engine` and returns the formatted
-/// histogram lines for a Summary tab.
-///
-/// Shape mirrors [`render_rows`] (the regular log-view query) so a
-/// Summary tab's display path can reuse the [`Tab`] struct's
-/// `formatted`/`viewport_top`/search machinery: from the renderer's
-/// point of view, a Summary tab is just a tab whose `formatted` lines
-/// happen to be histogram rows instead of bunyan headers.  The
-/// `events`/`event_for_line`/`first_line_for_event` vectors are left
-/// empty since there are no underlying records — selection-mode and
-/// bookmark actions naturally no-op on an empty events vec.
-fn render_summary_rows(engine: &Engine, filter: &Filter) -> RenderedRows {
-    let started = Instant::now();
-    let mut stream = engine.query_events(filter);
-    let mut builder = SummaryBuilder::default();
-    // `by_ref` so we can read `records_parsed`/`bytes_read` after the
-    // loop without consuming the iterator.  `flatten` skips the
-    // per-line `Err` items (parse errors and out-of-order warnings):
-    // the summary describes only what was successfully parsed.
-    for ee in stream.by_ref().flatten() {
-        builder.observe(ee.position.source(), &ee.event);
-    }
-    let summary = builder.finish();
-    let formatted = format_summary(&summary);
-    let parse_stats = ParseStats {
-        records: stream.records_parsed(),
-        bytes: stream.bytes_read(),
-        elapsed: started.elapsed(),
-    };
+/// Placeholder rows for a Summary tab whose build hasn't run yet.
+/// Surfaced by [`Tab::new`] when constructing a Summary tab and by
+/// [`App::start_summary_build`] when an existing tab is being
+/// rebuilt.  Rendered as a single "Computing summary..." line so the
+/// pane isn't visually empty while the [`LongOp`] populates the real
+/// histogram; the progress bar lives below in the parse-stats row.
+fn summary_placeholder_rows() -> RenderedRows {
     RenderedRows {
         events: Vec::new(),
-        formatted,
-        event_for_line: Vec::new(),
-        first_line_for_event: Vec::new(),
-        parse_stats,
+        formatted: vec!["Computing summary...".to_string()],
+        event_for_line: vec![0],
+        first_line_for_event: vec![0],
+        parse_stats: ParseStats::default(),
     }
 }
 
@@ -309,6 +305,305 @@ fn format_parse_stats(stats: &ParseStats) -> String {
     )
 }
 
+/// Records processed per [`LongOp::advance`] chunk.  Sized so that even
+/// on slow machines a chunk completes in well under the 16 ms it would
+/// take to drop a frame at 60 Hz, while still being large enough that
+/// the per-chunk overhead (rebuilding a [`Stepper`] from the saved
+/// [`Cursor`] for summary builds, handing back to the event loop for
+/// search) doesn't dominate the parse cost.  Tuned by hand; not a
+/// load-bearing constant.
+const LONG_OP_CHUNK_RECORDS: usize = 4_000;
+
+/// A multi-chunk operation driven by the main event loop in between
+/// frame draws.  Two flavors today — building a Summary tab's
+/// histogram, and stepping a search across the merged stream — both of
+/// which can scan a large fraction of the underlying log files and
+/// would otherwise block the UI for seconds at a time.
+///
+/// While a [`LongOp`] is active, the parse-stats line is replaced with
+/// a progress bar; Ctrl-C cancels and unwinds (no partial summary, no
+/// anchor change for search).
+enum LongOp {
+    // [`SummaryOp`] is several hundred bytes (SummaryBuilder owns
+    // multiple HashMaps); boxed to keep the enum compact since
+    // [`SearchOp`] is only ~88 bytes.
+    BuildSummary(Box<SummaryOp>),
+    Search(SearchOp),
+}
+
+impl LongOp {
+    /// Bytes processed so far across all sources.  Drives the numerator
+    /// of the progress bar.
+    fn bytes_done(&self) -> u64 {
+        match self {
+            LongOp::BuildSummary(op) => op.bytes_read,
+            LongOp::Search(op) => op.bytes_done(),
+        }
+    }
+
+    /// Total bytes the operation would process if it ran to completion.
+    /// Drives the denominator of the progress bar.
+    fn total_bytes(&self) -> u64 {
+        match self {
+            LongOp::BuildSummary(op) => op.total_bytes,
+            LongOp::Search(op) => op.total_bytes,
+        }
+    }
+
+    /// Records observed so far.  For Summary, filter-passing records
+    /// folded into the builder; for Search, records walked.
+    fn records(&self) -> u64 {
+        match self {
+            LongOp::BuildSummary(op) => op.records,
+            LongOp::Search(op) => op.records,
+        }
+    }
+
+    /// Verb shown in the progress bar — "Computing summary" or
+    /// "Searching" — so the user knows what they're waiting on.
+    fn label(&self) -> &'static str {
+        match self {
+            LongOp::BuildSummary(_) => "Computing summary",
+            LongOp::Search(_) => "Searching",
+        }
+    }
+
+    /// True iff this op writes its result back to the tab at
+    /// `tab_idx`.  Used by the renderer to decide whether to swap the
+    /// progress bar in for the active tab's parse-stats line.
+    fn targets_tab(&self, tab_idx: usize) -> bool {
+        match self {
+            LongOp::BuildSummary(op) => op.tab_idx == tab_idx,
+            LongOp::Search(op) => op.tab_idx == tab_idx,
+        }
+    }
+}
+
+/// In-progress Summary build.  Holds the partial [`SummaryBuilder`]
+/// across chunks plus a [`Cursor`] from which the next [`Stepper`] is
+/// built.  Drained by repeated calls to [`Self::advance`]; on
+/// completion, [`Self::finalize`] turns it into the histogram lines
+/// the destination tab will display.
+struct SummaryOp {
+    /// Index in `App.tabs` of the Summary tab being built.  Captured at
+    /// creation; the tab itself is left with empty `formatted` until
+    /// `finalize` runs.
+    tab_idx: usize,
+    filter: Filter,
+    builder: SummaryBuilder,
+    cursor: Cursor,
+    bytes_read: u64,
+    records: u64,
+    total_bytes: u64,
+    started: Instant,
+    eof: bool,
+}
+
+impl SummaryOp {
+    fn new(tab_idx: usize, filter: Filter, total_bytes: u64) -> Self {
+        Self {
+            tab_idx,
+            filter,
+            builder: SummaryBuilder::default(),
+            cursor: Cursor::new(),
+            bytes_read: 0,
+            records: 0,
+            total_bytes,
+            started: Instant::now(),
+            eof: false,
+        }
+    }
+
+    /// Folds up to [`LONG_OP_CHUNK_RECORDS`] more records (parsed
+    /// successfully and accepted by the filter) into the builder.
+    /// Returns `true` once the merge is exhausted and the caller should
+    /// finalize.
+    fn advance(&mut self, engine: &Engine) -> bool {
+        if self.eof {
+            return true;
+        }
+        let mut stepper = engine.stepper(self.filter.clone(), &self.cursor);
+        let mut count = 0;
+        while count < LONG_OP_CHUNK_RECORDS {
+            let Some(rec) = stepper.step_forward() else {
+                self.eof = true;
+                break;
+            };
+            self.bytes_read += rec.length;
+            if let Ok(event) = rec.event {
+                self.builder.observe(&rec.source_id, &event);
+                self.records += 1;
+            }
+            count += 1;
+        }
+        self.cursor = stepper.cursor();
+        self.eof
+    }
+
+    /// Consumes the in-progress build and returns the histogram rows
+    /// plus a final [`ParseStats`] snapshot.  Caller installs both into
+    /// the destination tab.
+    fn finalize(self) -> (RenderedRows, ParseStats) {
+        let elapsed = self.started.elapsed();
+        let summary = self.builder.finish();
+        let formatted = format_summary(&summary);
+        let parse_stats = ParseStats {
+            records: self.records,
+            bytes: self.bytes_read,
+            elapsed,
+        };
+        let rows = RenderedRows {
+            events: Vec::new(),
+            formatted,
+            event_for_line: Vec::new(),
+            first_line_for_event: Vec::new(),
+            parse_stats: parse_stats.clone(),
+        };
+        (rows, parse_stats)
+    }
+}
+
+/// In-progress search.  Wraps repeated calls to
+/// [`StreamView::search_step_with_budget`]: each chunk consumes one
+/// budget's worth of records, and the op auto-resumes through
+/// [`SearchOutcome::BudgetExhausted`] until a match is found, the
+/// stream is exhausted, or the user cancels.  Records and bytes are
+/// taken from the streamview's own parse-stats counters by diffing
+/// against a snapshot captured at op start.
+struct SearchOp {
+    tab_idx: usize,
+    regex: Regex,
+    direction: SearchDir,
+    /// Skip the current anchor on the very first chunk so `n` after a
+    /// previous match advances rather than re-finding it.  Cleared
+    /// after the first chunk runs.
+    exclusive: bool,
+    /// `parse_stats.bytes` from the streamview at op start.  Subtract
+    /// from the current value to get bytes processed by *this* op.
+    bytes_at_start: u64,
+    /// `parse_stats.records` at op start; same idea as `bytes_at_start`.
+    records_at_start: u64,
+    total_bytes: u64,
+    /// Result of the last advance.  `None` while still searching;
+    /// `Some(outcome)` once the op has finished and is awaiting
+    /// finalize.  Note that `BudgetExhausted` is *not* terminal here —
+    /// the op consumes it internally and re-issues the call.
+    outcome: Option<SearchOutcome>,
+    /// Live snapshot of the streamview's running parse stats, copied
+    /// out at the end of every `advance`.  The streamview itself is
+    /// borrowed only during the chunk; the progress bar reads from
+    /// here in between.
+    bytes_done: u64,
+    records: u64,
+}
+
+impl SearchOp {
+    fn new(
+        tab_idx: usize,
+        regex: Regex,
+        direction: SearchDir,
+        exclusive: bool,
+        bytes_at_start: u64,
+        records_at_start: u64,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            tab_idx,
+            regex,
+            direction,
+            exclusive,
+            bytes_at_start,
+            records_at_start,
+            total_bytes,
+            outcome: None,
+            bytes_done: 0,
+            records: 0,
+        }
+    }
+
+    fn bytes_done(&self) -> u64 {
+        self.bytes_done
+    }
+}
+
+/// Formats a [`LongOp`]'s running progress as a single-line status
+/// string sized to fit `width` columns.  Replaces [`format_parse_stats`]
+/// in the stats row while the op is in flight; on completion the
+/// parse-stats line takes over again on the next frame.
+///
+/// Layout, from left to right:
+///
+/// 1. The verb ("Computing summary"/"Searching") followed by a colon.
+/// 2. A bracketed bar showing percentage.
+/// 3. The percentage as a number.
+/// 4. Bytes-done / total-bytes.
+/// 5. Records-so-far.
+///
+/// The bar shrinks (and at very narrow widths is dropped entirely) so
+/// the numeric components are never truncated — losing the percent
+/// number is more confusing than losing bar resolution.
+fn format_long_op_progress(op: &LongOp, width: usize) -> String {
+    let bytes_done = op.bytes_done();
+    let total_bytes = op.total_bytes();
+    let pct = if total_bytes == 0 {
+        100.0
+    } else {
+        // Cap at 100 — search ops that walk back-fetch buffers (or
+        // hypothetical accounting drift) can otherwise overshoot.
+        ((bytes_done as f64 / total_bytes as f64) * 100.0).min(100.0)
+    };
+    let label = op.label();
+    let numbers = format!(
+        "{:>5.1}%   {} / {}   {} records",
+        pct,
+        format_bytes(bytes_done),
+        format_bytes(total_bytes),
+        op.records(),
+    );
+    let prefix = format!("{label}: ");
+    // Compute remaining width for the bar.  Reserve two extra cells
+    // for the brackets `[ ... ]` and one for the trailing space
+    // between bar and numbers.  When the terminal is too narrow to
+    // fit a useful bar, drop it and print just the prefix + numbers.
+    let fixed = prefix.chars().count() + numbers.chars().count();
+    const MIN_BAR_INNER: usize = 8;
+    let bar = if width >= fixed + MIN_BAR_INNER + 3 {
+        let bar_inner = width - fixed - 3;
+        format!("[{}] ", progress_bar_inner(pct, bar_inner))
+    } else {
+        String::new()
+    };
+    format!("{prefix}{bar}{numbers}")
+}
+
+/// Renders the inner portion of the progress bar (no brackets) into a
+/// `width`-cell string.  Filled cells use the block character `█`;
+/// the unfilled tail is space-padded so the bar's right edge is
+/// stable as the percentage climbs.  A non-zero percentage always
+/// fills at least one cell — otherwise a long-running op spends its
+/// first chunks looking like it's making no progress.
+fn progress_bar_inner(pct: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let filled_f = (pct / 100.0) * width as f64;
+    let mut filled = filled_f as usize;
+    if pct > 0.0 && filled == 0 {
+        filled = 1;
+    }
+    if filled > width {
+        filled = width;
+    }
+    let mut s = String::with_capacity(width);
+    for _ in 0..filled {
+        s.push('\u{2588}'); // FULL BLOCK
+    }
+    for _ in filled..width {
+        s.push(' ');
+    }
+    s
+}
+
 /// Indices of every row in `rows` containing at least one match for
 /// `regex`.  Output is naturally sorted ascending.
 fn compute_matches(rows: &[String], regex: &Regex) -> Vec<usize> {
@@ -326,30 +621,6 @@ fn hostname_display_label(mode: HostnameDisplay) -> &'static str {
         HostnameDisplay::Full => "full",
         HostnameDisplay::None => "off",
     }
-}
-
-/// Cancellation hook for [`StreamView::search_step`]: drains the
-/// terminal's pending event queue and returns `true` if any of those
-/// events is Ctrl-C.  Other events seen along the way are discarded —
-/// during a synchronous search the user is waiting on the search to
-/// complete, and unrelated keystrokes are best ignored rather than
-/// applied against a half-stale view.
-///
-/// `event::poll(Duration::ZERO)` is non-blocking; running it once per
-/// scanned record keeps the cancel latency a single record's worth of
-/// work even on tight regex loops.
-fn ctrl_c_cancel() -> bool {
-    let mut cancelled = false;
-    while event::poll(Duration::ZERO).unwrap_or(false) {
-        if let Ok(Event::Key(k)) = event::read()
-            && k.kind != KeyEventKind::Release
-            && k.code == KeyCode::Char('c')
-            && k.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            cancelled = true;
-        }
-    }
-    cancelled
 }
 
 /// Direction of a `less`-style search.
@@ -530,7 +801,12 @@ impl Tab {
                 );
                 (Some(view), rows)
             }
-            TabKind::Summary => (None, render_summary_rows(engine, filter)),
+            // Summary tabs defer their build to a [`LongOp`] driven
+            // by the main loop.  Construction returns the placeholder
+            // shape (empty rows, default stats); the App spins up a
+            // [`SummaryOp`] right after pushing the tab so the
+            // progress bar shows up on the next frame.
+            TabKind::Summary => (None, summary_placeholder_rows()),
         };
         Self {
             name,
@@ -584,7 +860,9 @@ impl Tab {
                 self.streamview = Some(view);
                 rows
             }
-            TabKind::Summary => render_summary_rows(engine, filter),
+            // Summary refresh installs the placeholder; the App
+            // enqueues a [`LongOp`] to fill it in.
+            TabKind::Summary => summary_placeholder_rows(),
         };
         self.events = rendered.events;
         self.formatted = rendered.formatted;
@@ -619,24 +897,23 @@ impl Tab {
         filter: &Filter,
         opts: RenderOpts,
     ) {
+        // Summary tabs don't honor RenderOpts — their histogram is
+        // built from raw event counts, not from the per-record render
+        // path — so a `rerender` triggered by `F`/`D`/field-display
+        // toggles is a no-op here, preserving the already-built
+        // histogram instead of throwing it away and rebuilding.
+        if self.kind == TabKind::Summary {
+            return;
+        }
         let anchor_event = self.event_for_line.get(self.viewport_top).copied();
-        let rendered = match self.kind {
-            TabKind::Stream => {
-                if let Some(view) = self.streamview.as_mut() {
-                    view.set_render_opts(opts);
-                    materialize_streamview(view)
-                } else {
-                    let (view, rows) = render_rows(
-                        engine,
-                        filter,
-                        opts,
-                        INITIAL_VIEWPORT_HEIGHT,
-                    );
-                    self.streamview = Some(view);
-                    rows
-                }
-            }
-            TabKind::Summary => render_summary_rows(engine, filter),
+        let rendered = if let Some(view) = self.streamview.as_mut() {
+            view.set_render_opts(opts);
+            materialize_streamview(view)
+        } else {
+            let (view, rows) =
+                render_rows(engine, filter, opts, INITIAL_VIEWPORT_HEIGHT);
+            self.streamview = Some(view);
+            rows
         };
         self.events = rendered.events;
         self.formatted = rendered.formatted;
@@ -979,6 +1256,16 @@ struct App {
     /// filter" or "the bookmarked entry is gone" after a navigation.
     /// Cleared by the next user keystroke.
     notice: Option<String>,
+    /// Active long-running operation, if any.  When set, the main loop
+    /// drives [`Self::advance_long_op`] in tight rotation with frame
+    /// draws, the progress bar replaces the parse-stats line, and most
+    /// other key events are deferred (Ctrl-C is honored as a cancel).
+    long_op: Option<LongOp>,
+    /// Summary builds requested while another [`LongOp`] was already
+    /// in flight.  Drained FIFO as the active op finalizes — only one
+    /// build runs at a time, so a filter change that would dirty
+    /// several Summary tabs queues each tab's rebuild here.
+    pending_summary_builds: std::collections::VecDeque<(usize, Filter)>,
 }
 
 impl App {
@@ -1013,6 +1300,8 @@ impl App {
             time_step_idx: DEFAULT_TIME_STEP_IDX,
             bookmark_cursor: None,
             notice: None,
+            long_op: None,
+            pending_summary_builds: std::collections::VecDeque::new(),
         };
         a.push_tab(TabKind::Stream, Filter::default());
         a
@@ -1032,6 +1321,7 @@ impl App {
         let mut stream = LogStream::new(name.clone());
         stream.filter = filter;
         let stream_id = stream.id;
+        let pushed_filter = stream.filter.clone();
         self.session
             .streams
             .insert_unique(stream)
@@ -1047,6 +1337,240 @@ impl App {
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        // Summary tabs are placeholder-only at construction; the
+        // build runs as a [`LongOp`] so the user sees a progress bar
+        // while the histogram is computed.
+        if kind == TabKind::Summary {
+            self.enqueue_summary_build(self.tabs.len() - 1, pushed_filter);
+        }
+    }
+
+    /// Queues a Summary rebuild for the tab at `tab_idx`.  Starts the
+    /// build immediately when no [`LongOp`] is in flight; otherwise
+    /// the request waits in [`Self::pending_summary_builds`] and is
+    /// dispatched when the active op finalizes.  Replacing an
+    /// already-pending build for the same tab keeps the queue
+    /// monotonic — only the most recent filter for a given tab is
+    /// honored, since older requests would compute against stale data.
+    fn enqueue_summary_build(&mut self, tab_idx: usize, filter: Filter) {
+        // Drop any earlier pending request for the same tab — a fresh
+        // request supersedes it.
+        self.pending_summary_builds.retain(|(idx, _)| *idx != tab_idx);
+        if self.long_op.is_none() {
+            self.start_summary_build(tab_idx, filter);
+        } else {
+            self.pending_summary_builds.push_back((tab_idx, filter));
+        }
+    }
+
+    /// Resets the destination tab to the placeholder shape and
+    /// installs a fresh [`SummaryOp`] in [`Self::long_op`].  Caller is
+    /// responsible for ensuring no other [`LongOp`] is in flight.
+    fn start_summary_build(&mut self, tab_idx: usize, filter: Filter) {
+        debug_assert!(self.long_op.is_none());
+        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+            let placeholder = summary_placeholder_rows();
+            tab.events = placeholder.events;
+            tab.formatted = placeholder.formatted;
+            tab.event_for_line = placeholder.event_for_line;
+            tab.first_line_for_event = placeholder.first_line_for_event;
+            tab.parse_stats = placeholder.parse_stats;
+            tab.viewport_top = 0;
+            tab.search = None;
+        }
+        let total_bytes = self.engine.filtered_total_bytes(&filter);
+        self.long_op = Some(LongOp::BuildSummary(Box::new(SummaryOp::new(
+            tab_idx,
+            filter,
+            total_bytes,
+        ))));
+    }
+
+    /// Drives the active [`LongOp`] forward by one chunk.  No-op when
+    /// no op is in flight.  The op owns its own borrowing rules: a
+    /// summary build talks only to the engine, while a search step
+    /// also needs the destination tab's [`StreamView`].
+    ///
+    /// Returns `true` if the op finished (or was already finished) on
+    /// this call — the caller can use that as a signal to schedule a
+    /// final repaint, but it is not required: `long_op` is also
+    /// cleared as a side effect.
+    fn advance_long_op(&mut self) -> bool {
+        let Some(mut op) = self.long_op.take() else { return false };
+        let h = self.viewport_height;
+        let done = match &mut op {
+            LongOp::BuildSummary(s) => s.advance(&self.engine),
+            LongOp::Search(s) => self.advance_search_op(s, h),
+        };
+        if done {
+            self.finalize_long_op(op);
+            true
+        } else {
+            self.long_op = Some(op);
+            false
+        }
+    }
+
+    /// Drives one chunk of an in-progress search.  Borrows the
+    /// destination tab's [`StreamView`] mutably to call
+    /// [`StreamView::search_step_with_budget`], then snapshots the
+    /// streamview's running parse stats into the op so the progress
+    /// bar can read them later without re-borrowing.  Returns `true`
+    /// when the search is terminal (Found / NotFound / Cancelled),
+    /// `false` when the streamview wants to be called again (budget
+    /// exhausted).
+    fn advance_search_op(
+        &mut self,
+        s: &mut SearchOp,
+        viewport_height: u16,
+    ) -> bool {
+        let tab_idx = s.tab_idx;
+        // Split-borrow `self` so the streamview (in `tabs[tab_idx]`)
+        // can be borrowed mutably while `engine` is borrowed shared
+        // for the same call.  Field-level destructure makes the two
+        // borrows independent in the borrow checker's eyes.
+        let App { tabs, engine, .. } = self;
+        let Some(view) =
+            tabs.get_mut(tab_idx).and_then(|t| t.streamview.as_mut())
+        else {
+            // The tab disappeared (closed under us) or never had a
+            // streamview to begin with.  Treat as terminal — nothing
+            // to scan.
+            s.outcome = Some(SearchOutcome::NotFound);
+            return true;
+        };
+        let outcome = view.search_step_with_budget(
+            engine,
+            &s.regex,
+            s.direction,
+            s.exclusive,
+            viewport_height,
+            LONG_OP_CHUNK_RECORDS,
+            &mut || false,
+        );
+        // After the first chunk subsequent chunks must not skip the
+        // anchor again — the streamview's saved resume point handles
+        // "where did we leave off."
+        s.exclusive = false;
+        let stats = view.parse_stats();
+        s.bytes_done = stats.bytes.saturating_sub(s.bytes_at_start);
+        s.records = stats.records.saturating_sub(s.records_at_start);
+        match outcome {
+            SearchOutcome::Found
+            | SearchOutcome::NotFound
+            | SearchOutcome::Cancelled => {
+                s.outcome = Some(outcome);
+                true
+            }
+            // Auto-resume.  The streamview saved a resume point
+            // internally; the next chunk picks up where this one
+            // stopped.
+            SearchOutcome::BudgetExhausted => false,
+        }
+    }
+
+    /// Installs the result of a finished [`LongOp`] into the
+    /// destination tab.  For Summary, swaps in the histogram lines and
+    /// the final parse stats.  For Search, resyncs the tab's viewport
+    /// from the streamview's new anchor (when found) and posts a
+    /// "no match" notice when the scan ran out without one.
+    fn finalize_long_op(&mut self, op: LongOp) {
+        match op {
+            LongOp::BuildSummary(s) => {
+                let tab_idx = s.tab_idx;
+                let (rendered, stats) = s.finalize();
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.events = rendered.events;
+                    tab.formatted = rendered.formatted;
+                    tab.event_for_line = rendered.event_for_line;
+                    tab.first_line_for_event = rendered.first_line_for_event;
+                    tab.parse_stats = stats;
+                    tab.viewport_top = 0;
+                }
+                // Drain a queued Summary build so a filter change
+                // that dirtied multiple Summary tabs progresses
+                // through them one after another.
+                if let Some((next_idx, next_filter)) =
+                    self.pending_summary_builds.pop_front()
+                {
+                    self.start_summary_build(next_idx, next_filter);
+                }
+            }
+            LongOp::Search(s) => {
+                let tab_idx = s.tab_idx;
+                let outcome = s.outcome.unwrap_or(SearchOutcome::NotFound);
+                let h = self.viewport_height;
+                match outcome {
+                    SearchOutcome::Found => {
+                        if tab_idx < self.tabs.len() {
+                            self.tabs[tab_idx].resync_from_streamview(h);
+                        }
+                    }
+                    SearchOutcome::NotFound => {
+                        // Match `less`: silently leave the cursor
+                        // alone.  A notice would be noise on every
+                        // search-to-end of a large file.
+                    }
+                    SearchOutcome::Cancelled => {
+                        self.notice =
+                            Some("search cancelled".to_string());
+                    }
+                    SearchOutcome::BudgetExhausted => {
+                        // Budget exhaustion isn't a terminal outcome
+                        // for this driver — `advance_long_op` consumes
+                        // it and re-issues the call.  If we somehow
+                        // see it here, leave a breadcrumb rather than
+                        // panicking.
+                        self.notice = Some(
+                            "search stopped at budget; press n to resume"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancels the active [`LongOp`], discarding any partial work.
+    /// Summary builds drop their accumulator (the destination tab is
+    /// left with its placeholder rows); searches leave the streamview
+    /// anchor untouched (matching [`SearchOutcome::Cancelled`]
+    /// semantics).
+    fn cancel_long_op(&mut self) {
+        let Some(op) = self.long_op.take() else { return };
+        match op {
+            LongOp::BuildSummary(s) => {
+                let tab_idx = s.tab_idx;
+                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                    tab.formatted = vec![
+                        "summary cancelled — rerun with `f<enter>`"
+                            .to_string(),
+                    ];
+                    tab.parse_stats = ParseStats::default();
+                }
+                // Cancel any queued Summary builds too — the user
+                // pressed Ctrl-C to stop, not to skip ahead.
+                self.pending_summary_builds.clear();
+            }
+            LongOp::Search(_) => {
+                self.notice = Some("search cancelled".to_string());
+            }
+        }
+    }
+
+    /// Convenience for tests (and code that wants to wait for an op to
+    /// finish): drives [`Self::advance_long_op`] in a loop until no
+    /// long op is in flight.  Caps iterations to avoid an infinite
+    /// loop if some advance ever stops making progress.
+    #[cfg(test)]
+    fn drain_long_op(&mut self) {
+        for _ in 0..1_000_000 {
+            if self.long_op.is_none() {
+                return;
+            }
+            self.advance_long_op();
+        }
+        panic!("drain_long_op did not converge");
     }
 
     /// Pushes a new tab targeting an existing [`LogStream`] (looked up
@@ -1140,13 +1664,32 @@ impl App {
             .streams
             .insert_unique(stream)
             .expect("removed-then-reinserted id is unique");
-        for tab in self.tabs.iter_mut() {
-            if tab.stream == stream_id {
-                let anchor = tab
-                    .streamview
-                    .as_ref()
-                    .and_then(|v| v.cursor_at_anchor());
-                tab.refresh(&self.engine, &new_filter, opts, anchor);
+        // Collect indices first so we can call App-level helpers
+        // (which need `&mut self`) for Summary rebuilds without
+        // holding a `tabs.iter_mut()` borrow alive.
+        let affected: Vec<(usize, TabKind)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (t.stream == stream_id).then_some((i, t.kind)))
+            .collect();
+        for (i, kind) in affected {
+            match kind {
+                TabKind::Stream => {
+                    let anchor = self.tabs[i]
+                        .streamview
+                        .as_ref()
+                        .and_then(|v| v.cursor_at_anchor());
+                    self.tabs[i].refresh(
+                        &self.engine,
+                        &new_filter,
+                        opts,
+                        anchor,
+                    );
+                }
+                TabKind::Summary => {
+                    self.enqueue_summary_build(i, new_filter.clone());
+                }
             }
         }
     }
@@ -1503,43 +2046,38 @@ impl App {
         else {
             return;
         };
-        let h = self.viewport_height;
         let dir = match direction {
             SearchDirection::Forward => SearchDir::Forward,
             SearchDirection::Backward => SearchDir::Backward,
         };
-        let outcome = self.tabs[active]
+        // Snapshot the streamview's running parse stats so the search
+        // op can diff against them and report bytes/records consumed
+        // *just for this search* (as opposed to the streamview's
+        // lifetime totals, which include every scroll and back-fetch
+        // since the filter was last set).
+        let view = self.tabs[active]
             .streamview
-            .as_mut()
-            .unwrap()
-            .search_step(
-                &self.engine,
-                &regex,
-                dir,
-                exclusive,
-                h,
-                &mut ctrl_c_cancel,
-            );
-        match outcome {
-            SearchOutcome::Found => {
-                self.tabs[active].resync_from_streamview(h);
-            }
-            SearchOutcome::NotFound => {}
-            SearchOutcome::BudgetExhausted => {
-                // The streamview saved a resume point so a follow-up
-                // `n` (without intervening navigation) picks up where
-                // this scan stopped.
-                self.notice = Some(format!(
-                    "search hit the {SEARCH_BUDGET}-record budget \
-                     without a match; press n to keep searching",
-                ));
-            }
-            SearchOutcome::Cancelled => {
-                // The user hit Ctrl-C during the scan.  Anchor and
-                // resume point are untouched, so the pane looks
-                // exactly as it did before they pressed `/` (or `n`).
-            }
+            .as_ref()
+            .expect("caller checked streamview is_some");
+        let stats = view.parse_stats();
+        let bytes_at_start = stats.bytes;
+        let records_at_start = stats.records;
+        let total_bytes = self.engine.filtered_total_bytes(view.filter());
+        // Hand the search off to the long-op driver.  Cancel any
+        // in-flight op first — the user pressed `/`/`n`/`N`, which
+        // supersedes whatever was running.
+        if self.long_op.is_some() {
+            self.cancel_long_op();
         }
+        self.long_op = Some(LongOp::Search(SearchOp::new(
+            active,
+            regex,
+            dir,
+            exclusive,
+            bytes_at_start,
+            records_at_start,
+            total_bytes,
+        )));
     }
 
     fn jump_to_match_via_matches(
@@ -1630,11 +2168,48 @@ impl App {
         if self.bookmarks_active() {
             return;
         }
-        self.tabs.remove(self.active);
+        let closed = self.active;
+        // Detach any long-op state that referred to the closed tab,
+        // and renumber state that referred to a later tab now that
+        // its index has dropped by one.
+        self.adjust_long_op_state_for_closed_tab(closed);
+        self.tabs.remove(closed);
         if self.tabs.is_empty() {
             self.push_tab(TabKind::Stream, Filter::default());
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// Patches up [`Self::long_op`] and [`Self::pending_summary_builds`]
+    /// for a tab being removed at `closed`.  Long ops bound to the
+    /// closed tab are cancelled (no destination to write back to);
+    /// long ops bound to a later tab have their tab index decremented
+    /// to follow the shift in `self.tabs`.  Same renumbering applies
+    /// to queued Summary builds.
+    fn adjust_long_op_state_for_closed_tab(&mut self, closed: usize) {
+        match self.long_op.as_mut() {
+            Some(LongOp::BuildSummary(s)) => {
+                if s.tab_idx == closed {
+                    self.long_op = None;
+                } else if s.tab_idx > closed {
+                    s.tab_idx -= 1;
+                }
+            }
+            Some(LongOp::Search(s)) => {
+                if s.tab_idx == closed {
+                    self.long_op = None;
+                } else if s.tab_idx > closed {
+                    s.tab_idx -= 1;
+                }
+            }
+            None => {}
+        }
+        self.pending_summary_builds.retain(|(idx, _)| *idx != closed);
+        for (idx, _) in self.pending_summary_builds.iter_mut() {
+            if *idx > closed {
+                *idx -= 1;
+            }
         }
     }
 
@@ -1870,6 +2445,8 @@ impl App {
             time_step_idx: DEFAULT_TIME_STEP_IDX,
             bookmark_cursor: None,
             notice: None,
+            long_op: None,
+            pending_summary_builds: std::collections::VecDeque::new(),
         };
         // Manually push so we can override the row data (the engine has
         // no sources, so a real push_tab would yield empty vecs).
@@ -3044,7 +3621,15 @@ fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    let stats_text = format_parse_stats(&app.active_tab().parse_stats);
+    // While a long op targeting the active tab is in flight, the
+    // progress bar replaces the parse-stats line.  After completion,
+    // `format_parse_stats` is restored on the next frame.
+    let stats_text = match app.long_op.as_ref() {
+        Some(op) if op.targets_tab(app.active) => {
+            format_long_op_progress(op, stats_area.width.into())
+        }
+        _ => format_parse_stats(&app.active_tab().parse_stats),
+    };
     frame.render_widget(Paragraph::new(stats_text), stats_area);
 
     // Re-clamp in case the viewport just shrank past the previous top.
@@ -5083,6 +5668,208 @@ mod tests {
         assert!(dump.contains("0.100s"), "dump:\n{dump}");
     }
 
+    // ---------- progress bar ----------
+
+    #[test]
+    fn progress_bar_inner_one_cell_when_pct_positive_but_low() {
+        // A 1% progress bar over 100 cells would round down to zero
+        // filled cells; in that case we still show one filled cell so
+        // the user can see *something* moved.
+        let s = progress_bar_inner(0.5, 100);
+        assert!(s.starts_with('\u{2588}'), "got: {s:?}");
+        assert_eq!(s.chars().count(), 100);
+    }
+
+    #[test]
+    fn progress_bar_inner_full_at_100() {
+        let s = progress_bar_inner(100.0, 10);
+        assert_eq!(s, "\u{2588}".repeat(10));
+    }
+
+    #[test]
+    fn progress_bar_inner_empty_at_zero() {
+        // 0% progress paints an all-blank bar (no minimum-cell bump,
+        // since there really is no progress yet).
+        let s = progress_bar_inner(0.0, 10);
+        assert_eq!(s, " ".repeat(10));
+    }
+
+    #[test]
+    fn format_long_op_progress_includes_label_pct_bytes_records() {
+        // Build a SummaryOp whose state is set up by hand so the
+        // formatted output is deterministic — we don't drive a real
+        // engine here.
+        let mut s = SummaryOp::new(0, Filter::default(), 1024);
+        s.bytes_read = 256;
+        s.records = 42;
+        let op = LongOp::BuildSummary(Box::new(s));
+        let out = format_long_op_progress(&op, 80);
+        assert!(out.contains("Computing summary"), "{out}");
+        assert!(out.contains("25.0%"), "{out}");
+        assert!(out.contains("256 B"), "{out}");
+        assert!(out.contains("1.0 KiB"), "{out}");
+        assert!(out.contains("42 records"), "{out}");
+        // The bar should fit alongside the numeric components on an
+        // 80-column terminal.
+        assert!(out.contains('['), "{out}");
+        assert!(out.contains(']'), "{out}");
+    }
+
+    #[test]
+    fn format_long_op_progress_drops_bar_at_narrow_widths() {
+        // At 30 cells there isn't room for a useful bar plus the
+        // numbers; the bar is dropped rather than truncating the
+        // numbers.
+        let mut s = SummaryOp::new(0, Filter::default(), 1024);
+        s.bytes_read = 256;
+        s.records = 42;
+        let op = LongOp::BuildSummary(Box::new(s));
+        let out = format_long_op_progress(&op, 30);
+        assert!(out.contains("25.0%"), "{out}");
+        assert!(out.contains("42 records"), "{out}");
+        assert!(!out.contains('['), "expected no bar; got: {out}");
+    }
+
+    #[test]
+    fn format_long_op_progress_caps_at_100() {
+        // Search ops can overshoot total_bytes when the streamview
+        // had already pulled bytes for back-fetch that we count
+        // against the same denominator; the bar should clamp to 100%.
+        let mut s = SummaryOp::new(0, Filter::default(), 100);
+        s.bytes_read = 200;
+        s.records = 1;
+        let op = LongOp::BuildSummary(Box::new(s));
+        let out = format_long_op_progress(&op, 80);
+        assert!(out.contains("100.0%"), "{out}");
+    }
+
+    #[test]
+    fn long_op_drives_summary_to_completion() {
+        // End-to-end: pressing `S` installs a placeholder, then the
+        // long op chunks through the merged stream until the summary
+        // is fully built.  After draining, the rendered rows should
+        // match what the synchronous build produced previously.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "first", &[]),
+            (30, "second", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        // Before draining: placeholder lives in the tab, long op is
+        // active, progress is reported on the active tab's stats row.
+        assert_eq!(
+            a.active_tab().formatted,
+            vec!["Computing summary...".to_string()],
+        );
+        assert!(a.long_op.is_some());
+        a.drain_long_op();
+        assert!(a.long_op.is_none());
+        let lines = &a.active_tab().formatted;
+        assert!(
+            lines.iter().any(|l| l.starts_with("Summary: 3 events")),
+            "got:\n{}",
+            lines.join("\n"),
+        );
+    }
+
+    #[test]
+    fn long_op_summary_cancel_leaves_placeholder_and_clears_queue() {
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        assert!(matches!(a.long_op, Some(LongOp::BuildSummary(_))));
+        a.cancel_long_op();
+        assert!(a.long_op.is_none());
+        assert!(a.pending_summary_builds.is_empty());
+        let lines = &a.active_tab().formatted;
+        assert!(
+            lines.iter().any(|l| l.contains("cancelled")),
+            "expected cancel notice, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn long_op_summary_filter_change_supersedes_pending() {
+        // A second build for the same tab while the first is still
+        // pending should drop the older request — only the newest
+        // filter is honored.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "alpha", &[]),
+            (20, "beta", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        // Force a pending state by stalling the active op without
+        // finishing it: spin a no-op LongOp::Search would be wrong;
+        // just enqueue another build for the same tab while the
+        // current one is still in flight.  enqueue_summary_build
+        // de-dupes pending entries for the same tab.
+        let active_tab = a.active;
+        a.pending_summary_builds.push_back((
+            active_tab,
+            "msg=alpha".parse().unwrap(),
+        ));
+        a.enqueue_summary_build(active_tab, "msg=beta".parse().unwrap());
+        assert_eq!(a.pending_summary_builds.len(), 1);
+        let (_, last) = a.pending_summary_builds.front().unwrap();
+        assert_eq!(last.to_string(), "msg=beta");
+    }
+
+    #[test]
+    fn render_shows_progress_bar_while_long_op_active() {
+        // Pressing `S` installs a placeholder + long op; the very
+        // next frame should show the progress bar in place of the
+        // parse-stats row.
+        let (mut a, _dir) = multi_line_app(&[
+            (10, "first", &[]),
+            (20, "second", &[]),
+        ]);
+        a.handle_key(shift('S'));
+        let backend = TestBackend::new(120, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("Computing summary"),
+            "expected progress bar; dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn long_op_search_drives_through_streamview() {
+        // A `/` search on a real engine-backed tab spins up a Search
+        // long op that the main loop drives.  After draining, the
+        // viewport should land on the matching record.  A 30-row
+        // fixture with a small viewport guarantees the post-search
+        // `viewport_top` actually has somewhere to scroll to (a
+        // 4-row fixture would clamp to 0 regardless of the match
+        // location).
+        let mut records: Vec<RecordSpec<'_>> =
+            (0..30).map(|i| (10 + i as i64 * 10, "filler", &[][..])).collect();
+        records[25] = (260, "match-here", &[]);
+        let (mut a, _dir) = multi_line_app(&records);
+        a.viewport_height = 5;
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "match-here");
+        a.handle_key(key(KeyCode::Enter));
+        // Search now in flight via long_op.
+        assert!(matches!(a.long_op, Some(LongOp::Search(_))));
+        a.drain_long_op();
+        assert!(a.long_op.is_none());
+        // Viewport should sit on the matching record.
+        let top = a.active_tab().viewport_top;
+        let line = &a.active_tab().formatted[top];
+        assert!(
+            line.contains("match-here"),
+            "expected viewport on the match; got line {line:?} \
+             (top={top}, formatted.len()={})",
+            a.active_tab().formatted.len(),
+        );
+    }
+
+    // ---------- end progress bar ----------
+
     #[test]
     fn render_omits_parse_stats_row_on_bookmarks_pane() {
         // The bookmarks pane has no parse activity; the stats row
@@ -6399,6 +7186,7 @@ mod tests {
         let f: Filter = "msg=alpha".parse().unwrap();
         a.apply_filter(f.clone());
         a.handle_key(shift('S'));
+        a.drain_long_op();
         assert_eq!(a.active_tab().kind, TabKind::Summary);
         // Inherited filter should leave only the one matching event;
         // the summary's first line records the count.
@@ -6444,6 +7232,7 @@ mod tests {
             (30, "second", &[]),
         ]);
         a.handle_key(shift('S'));
+        a.drain_long_op();
         assert!(a.dialog.is_none());
         assert_eq!(a.active_tab().kind, TabKind::Summary);
         let lines = &a.active_tab().formatted;
@@ -6463,12 +7252,14 @@ mod tests {
             (20, "second", &[]),
         ]);
         a.handle_key(shift('S'));
+        a.drain_long_op();
         // Open the filter dialog with `f`, type a narrowing filter,
         // and apply.
         a.handle_key(key(KeyCode::Char('f')));
         let d = a.dialog.as_mut().unwrap();
         type_into(d, "msg=second");
         a.handle_key(key(KeyCode::Enter));
+        a.drain_long_op();
         assert!(a.dialog.is_none());
         let lines = &a.active_tab().formatted;
         assert!(

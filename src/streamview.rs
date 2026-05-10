@@ -1031,11 +1031,13 @@ impl StreamView {
     }
 
     /// Same as [`Self::search_step`] but with a caller-supplied
-    /// budget.  Available to `pub(crate)` so streamview's own tests can
-    /// drive [`SearchOutcome::BudgetExhausted`] without having to build
-    /// 50,000-record fixtures.
+    /// budget.  Used by streamview's own tests to drive
+    /// [`SearchOutcome::BudgetExhausted`] without having to build
+    /// 50,000-record fixtures, and by the TUI's progress-bar driver to
+    /// run the scan in chunks small enough to interleave with frame
+    /// draws and Ctrl-C polls.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn search_step_with_budget(
+    pub fn search_step_with_budget(
         &mut self,
         engine: &Engine,
         regex: &Regex,

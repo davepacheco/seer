@@ -82,6 +82,22 @@ impl Engine {
         Stepper::new(sources, filter, cursor)
     }
 
+    /// Sum of `byte_len()` over every source whose id is accepted by
+    /// `filter`'s source-id predicates.  Used as the denominator for a
+    /// progress bar over a full-file pass: a long-running operation
+    /// (Summary build, search across an unmatched file) can divide its
+    /// running [`EventStream::bytes_read`] by this to drive a percentage.
+    /// Sources whose `byte_len()` syscall fails contribute zero — the
+    /// progress will overshoot rather than fail outright, which is the
+    /// less surprising behavior here.
+    pub fn filtered_total_bytes(&self, filter: &Filter) -> u64 {
+        self.sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| s.byte_len().unwrap_or(0))
+            .sum()
+    }
+
     /// Returns a [`Cursor`] positioned at end-of-file for every source
     /// the engine knows about (regardless of whether `filter` accepts
     /// the source — the cursor includes all sources so it survives
@@ -592,6 +608,40 @@ mod tests {
         TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
     use slog::{debug, error, info};
+
+    #[test]
+    fn filtered_total_bytes_sums_byte_lens_of_matching_sources() {
+        let dir = TestDir::new();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        append_bunyan_at(&a, "Nexus", t(10), "a1");
+        append_bunyan_at(&b, "SledAgent", t(20), "b1");
+
+        let mut engine = Engine::new();
+        engine.add_file_source(&a).unwrap();
+        engine.add_file_source(&b).unwrap();
+
+        let total = engine.filtered_total_bytes(&Filter::default());
+        let a_size = std::fs::metadata(&a).unwrap().len();
+        let b_size = std::fs::metadata(&b).unwrap().len();
+        assert_eq!(total, a_size + b_size);
+
+        // A source-id predicate that excludes `b` drops `b`'s bytes
+        // from the denominator; a real progress bar driven by this
+        // value would track only the sources that will actually be
+        // scanned.
+        let path_filter: Filter =
+            "source_id!~b\\.log".parse().unwrap();
+        assert_eq!(engine.filtered_total_bytes(&path_filter), a_size);
+
+        dir.cleanup();
+    }
+
+    #[test]
+    fn filtered_total_bytes_empty_engine_is_zero() {
+        let engine = Engine::new();
+        assert_eq!(engine.filtered_total_bytes(&Filter::default()), 0);
+    }
 
     #[test]
     fn query_merges_sources_in_time_order() {
