@@ -221,15 +221,21 @@ fn field_matches(event: &Event, name: &str, value: &str) -> bool {
         // Bunyan version isn't usually filtered, but it's a core field
         // so handle it consistently.
         "v" => event.v.to_string() == value,
-        // Anything else is in `extra`.  We compare against string-typed
-        // values directly via serde_json's PartialEq<&str> for Value;
-        // null gets a literal `"null"` shorthand.  Bool/Number values
-        // in `extra` won't match yet — extending the predicate language
-        // to reach them is a separate item.
+        // Anything else is in `extra`.  Strings compare directly; bools
+        // and numbers compare against the obvious lexical form the user
+        // would type after seeing the JSON (`true`/`false`, `1`,
+        // `1.5`); null gets a literal `"null"` shorthand.  Arrays and
+        // objects don't have a useful lexical equality and never match.
         other => match event.extra.get(other) {
             Some(serde_json::Value::Null) => value == "null",
-            Some(v) => *v == value,
-            None => false,
+            Some(serde_json::Value::String(s)) => s == value,
+            Some(serde_json::Value::Bool(b)) => {
+                value == if *b { "true" } else { "false" }
+            }
+            Some(serde_json::Value::Number(n)) => n.to_string() == value,
+            Some(serde_json::Value::Array(_))
+            | Some(serde_json::Value::Object(_))
+            | None => false,
         },
     }
 }
@@ -612,6 +618,92 @@ mod tests {
             }
             .matches(&e)
         );
+    }
+
+    /// Reproduces a real-world bug where adding `iteration=1` to a filter
+    /// rejected log entries that obviously contained `"iteration":1`.
+    /// The value in `extra` is `serde_json::Value::Number`, and
+    /// `Value::PartialEq<&str>` only matches `Value::String`, so numeric
+    /// (and boolean) extras must be compared against their lexical form.
+    #[test]
+    fn field_equals_numeric_and_boolean_extras() {
+        let e = ev(r#"{
+            "v": 0,
+            "level": 30,
+            "name": "Nexus",
+            "hostname": "sled-01",
+            "pid": 1234,
+            "time": "2025-04-01T00:00:00Z",
+            "msg": "activating",
+            "iteration": 1,
+            "ratio": 1.5,
+            "enabled": true,
+            "disabled": false
+        }"#);
+
+        let m = |name: &str, value: &str| Predicate::FieldEquals {
+            name: name.into(),
+            value: value.into(),
+            negated: false,
+        }
+        .matches(&e);
+
+        // Integer extras compare against the obvious decimal form.
+        assert!(m("iteration", "1"));
+        assert!(!m("iteration", "2"));
+        assert!(!m("iteration", "1.0"));
+
+        // Floating-point extras use serde_json's canonical repr.
+        assert!(m("ratio", "1.5"));
+        assert!(!m("ratio", "1.50"));
+
+        // Booleans compare against the JSON literal spelling.
+        assert!(m("enabled", "true"));
+        assert!(!m("enabled", "false"));
+        assert!(m("disabled", "false"));
+        assert!(!m("disabled", "true"));
+    }
+
+    /// Arrays and objects have no obvious lexical equality form, so they
+    /// must never match a string-valued predicate — including the empty
+    /// string, `[]`, or `{}`.  Pinned down here so a future change that
+    /// adds e.g. JSON-stringified comparison has to update this test.
+    #[test]
+    fn field_equals_array_and_object_extras_never_match() {
+        let e = ev(r#"{
+            "v": 0,
+            "level": 30,
+            "name": "Nexus",
+            "hostname": "sled-01",
+            "pid": 1234,
+            "time": "2025-04-01T00:00:00Z",
+            "msg": "m",
+            "tags": ["a", "b"],
+            "context": { "k": "v" }
+        }"#);
+
+        for value in ["", "[]", "[\"a\",\"b\"]", "a"] {
+            assert!(
+                !Predicate::FieldEquals {
+                    name: "tags".into(),
+                    value: value.into(),
+                    negated: false,
+                }
+                .matches(&e),
+                "tags should not match {value:?}",
+            );
+        }
+        for value in ["", "{}", "{\"k\":\"v\"}"] {
+            assert!(
+                !Predicate::FieldEquals {
+                    name: "context".into(),
+                    value: value.into(),
+                    negated: false,
+                }
+                .matches(&e),
+                "context should not match {value:?}",
+            );
+        }
     }
 
     #[test]

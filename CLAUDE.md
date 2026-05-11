@@ -285,9 +285,6 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- filtering doesn't always seem correct:
-  `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
-  - that works, but adding iteration=1 filters out messages that it shouldn't
 - parse SMF entries
 - parse CockroachDB log
 - persistent session state
@@ -299,7 +296,6 @@ New tabs should still open with this dialog.
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
-- `R` binding to show raw JSON instead
 - `?` binding to pop up summary of key bindings
 - there should be an indication when you're at EOF
 - second search (e.g., by time):
@@ -308,3 +304,7 @@ New tabs should still open with this dialog.
     - even showing all fields with F is super slow
   - setting a bookmark, closing the tap, and going to that bookmark is fast
 - search history
+- long-op coverage gaps left after the `G`/`g`/filter rebuild work:
+  - `scroll_lines` at the window edge still uses unbounded `extend_*_batch`, so the first `k` after `G` on a selective filter can still freeze briefly.  Same long-op pattern as `LongOp::Seek` would address it.
+  - `<` / `>` (`advance_time`) wasn't long-op'd; large time jumps under selective filters will freeze the UI.
+  - `SeekFinalize::FrontOrBackFallback` runs `view.ensure_window` synchronously when the forward-from-cursor fetch came up empty.  Fine for typical bookmark navigation; a pathological filter with no matches anywhere could still freeze during finalize.
