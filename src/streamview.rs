@@ -441,6 +441,15 @@ impl StreamView {
         self.records.iter().map(|e| e.lines.len()).sum()
     }
 
+    /// Returns true iff a forward scan from the back of the window has
+    /// already exhausted every source under the active filter — no more
+    /// records can appear past `records.back()`.  The TUI uses this to
+    /// surface an "at end of stream" indicator when the viewport's
+    /// bottom coincides with the last cached line.
+    pub fn is_forward_eof(&self) -> bool {
+        self.forward_eof
+    }
+
     /// Replaces the active filter, dropping cached records (since they
     /// were filtered against the old filter) and reseting both cursors
     /// to the start.  Equivalent to "filter changed, restart from the

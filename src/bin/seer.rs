@@ -4109,17 +4109,6 @@ fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
-    // While a long op targeting the active tab is in flight, the
-    // progress bar replaces the parse-stats line.  After completion,
-    // `format_parse_stats` is restored on the next frame.
-    let stats_text = match app.long_op.as_ref() {
-        Some(op) if op.targets_tab(app.active) => {
-            format_long_op_progress(op, stats_area.width.into())
-        }
-        _ => format_parse_stats(&app.active_tab().parse_stats),
-    };
-    frame.render_widget(Paragraph::new(stats_text), stats_area);
-
     // Re-clamp in case the viewport just shrank past the previous top.
     let max_top = app
         .active_tab()
@@ -4145,6 +4134,40 @@ fn render(frame: &mut Frame, app: &mut App) {
         visual_used = visual_used.saturating_add(rows);
         bottom += 1;
     }
+
+    // "At end of stream" surfaces when the viewport's last visible
+    // line is the last line we have AND no more records can appear
+    // past it.  A streamview-backed tab (the live case) checks
+    // `is_forward_eof`; test fixtures without a streamview have all
+    // their data already materialized, so reaching the bottom is
+    // sufficient.  Scrolling up makes `bottom < total` and the
+    // indicator disappears.  Shown on the parse-stats line (rather
+    // than the keybinding footer, which is too long to keep visible
+    // on narrow terminals) so users actually see it.
+    let at_eof = total > 0
+        && bottom == total
+        && tab.streamview.as_ref().is_none_or(|v| v.is_forward_eof());
+
+    // While a long op targeting the active tab is in flight, the
+    // progress bar replaces the parse-stats line.  After completion,
+    // `format_parse_stats` is restored on the next frame.  The EOF
+    // marker is only appended outside the long-op branch — a running
+    // op is by definition not "done", so the marker would be
+    // misleading there.
+    let stats_text = match app.long_op.as_ref() {
+        Some(op) if op.targets_tab(app.active) => {
+            format_long_op_progress(op, stats_area.width.into())
+        }
+        _ => {
+            let base = format_parse_stats(&tab.parse_stats);
+            if at_eof {
+                format!("{base}  ·  (at end of stream)")
+            } else {
+                base
+            }
+        }
+    };
+    frame.render_widget(Paragraph::new(stats_text), stats_area);
 
     let selected_event = tab.select.map(|s| s.event_idx);
     // In raw mode, pre-wrap each logical line at the column boundary
@@ -4927,6 +4950,86 @@ mod tests {
         assert!(dump.contains("alpha line"), "dump:\n{dump}");
         assert!(dump.contains("gamma line"), "dump:\n{dump}");
         assert!(dump.contains("1-3 of 3"), "dump:\n{dump}");
+    }
+
+    /// When the viewport reaches the last row and no more records can
+    /// arrive past it, the parse-stats line gains an "at end of
+    /// stream" marker.  Test fixtures have no streamview, so reaching
+    /// `bottom == total` is sufficient — same behavior as a live tab
+    /// whose streamview has hit forward EOF.  Scrolling up by one
+    /// line must hide the indicator again.
+    #[test]
+    fn render_shows_at_end_of_stream_when_viewport_reaches_last_row() {
+        // 7 rows is enough to show all 4 logical rows plus tab bar +
+        // stats + footer; the bottom of the viewport touches the last
+        // row.  Keep the surface wide so the parse-stats line plus
+        // the EOF suffix fits without clipping.
+        let backend = TestBackend::new(300, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+        ]);
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("(at end of stream)"),
+            "expected EOF indicator when viewport reaches last row:\n{dump}",
+        );
+        assert!(dump.contains("1-4 of 4"), "dump:\n{dump}");
+    }
+
+    /// Symmetric to the above: when the viewport doesn't reach the last
+    /// row (the user scrolled up, or the content is taller than the
+    /// viewport at first paint), the stats line omits the indicator.
+    #[test]
+    fn render_hides_at_end_of_stream_when_more_rows_below() {
+        // Tiny viewport (2 content rows) over 6 logical rows: the
+        // bottom of the viewport is far from the last row.
+        let backend = TestBackend::new(200, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let rows: Vec<String> =
+            (0..6).map(|i| format!("row {i}")).collect();
+        let mut a = App::with_rows(rows);
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            !dump.contains("(at end of stream)"),
+            "did not expect EOF indicator with rows below:\n{dump}",
+        );
+    }
+
+    /// The user-facing contract for the indicator: it appears when
+    /// scrolled to the bottom and disappears as soon as the user
+    /// scrolls back up.  Drives the same render path as the live TUI.
+    #[test]
+    fn render_eof_indicator_toggles_with_scroll() {
+        let backend = TestBackend::new(300, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let rows: Vec<String> =
+            (0..6).map(|i| format!("row {i}")).collect();
+        let mut a = App::with_rows(rows);
+        a.viewport_height = 2;
+
+        // Scroll to the very bottom: indicator on.
+        a.handle_key(shift('G'));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("(at end of stream)"),
+            "expected EOF indicator after `G`:\n{dump}",
+        );
+
+        // One `k` moves us off the bottom: indicator gone.
+        a.handle_key(key(KeyCode::Char('k')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            !dump.contains("(at end of stream)"),
+            "did not expect EOF indicator after scrolling up:\n{dump}",
+        );
     }
 
     fn buffer_text(buf: &Buffer) -> String {
