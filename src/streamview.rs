@@ -191,6 +191,16 @@ enum TimeDir {
     Backward,
 }
 
+/// Whether [`StreamView::ensure_window_step`] needs more batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowFillStatus {
+    /// More batches needed.  Caller should call again after rendering.
+    NotDone,
+    /// Window is fully populated and the anchor is resolved to a
+    /// concrete record (or [`Anchor::Empty`] for filter-rejects-all).
+    Done,
+}
+
 /// Snapshot of where a budget-exhausted search stopped, so a follow-up
 /// call can resume scanning instead of restarting from the anchor.
 ///
@@ -486,13 +496,22 @@ impl StreamView {
         engine: &Engine,
         viewport_height: u16,
     ) {
+        self.prepare_seek_to_start();
+        self.ensure_window(engine, viewport_height);
+    }
+
+    /// Sets up the view for a forward fetch from the merged stream's
+    /// beginning, but does not fetch anything.  Paired with
+    /// [`Self::ensure_window_step`] when the caller wants to drive
+    /// the population in chunks (e.g. behind a long-op progress bar).
+    pub fn prepare_seek_to_start(&mut self) {
         self.records.clear();
         self.front_cursor = Cursor::new();
         self.back_cursor = Cursor::new();
         self.forward_eof = false;
-        self.backward_eof = false;
+        self.backward_eof = true;
         self.anchor = Anchor::PinFront;
-        self.ensure_window(engine, viewport_height);
+        self.search_resume = None;
     }
 
     /// Resets the view to the end of the merged stream and ensures
@@ -502,6 +521,18 @@ impl StreamView {
         engine: &Engine,
         viewport_height: u16,
     ) -> std::io::Result<()> {
+        self.prepare_seek_to_end(engine)?;
+        self.ensure_window(engine, viewport_height);
+        Ok(())
+    }
+
+    /// Sets up the view for a backward fetch from EOF, but does not
+    /// fetch anything.  Paired with [`Self::ensure_window_step`] for
+    /// the long-op-driven path.
+    pub fn prepare_seek_to_end(
+        &mut self,
+        engine: &Engine,
+    ) -> std::io::Result<()> {
         let end = engine.cursor_at_end()?;
         self.records.clear();
         self.front_cursor = end.clone();
@@ -509,7 +540,7 @@ impl StreamView {
         self.forward_eof = true;
         self.backward_eof = false;
         self.anchor = Anchor::PinBack;
-        self.ensure_window(engine, viewport_height);
+        self.search_resume = None;
         Ok(())
     }
 
@@ -529,12 +560,7 @@ impl StreamView {
         cursor: Cursor,
         viewport_height: u16,
     ) {
-        self.records.clear();
-        self.front_cursor = cursor.clone();
-        self.back_cursor = cursor;
-        self.forward_eof = false;
-        self.backward_eof = false;
-        self.anchor = Anchor::PinFront;
+        self.prepare_seek_to_cursor(cursor);
         self.ensure_window(engine, viewport_height);
         // No record at or after the cursor passes the filter — try
         // backward.  We swap to PinBack semantics here rather than
@@ -545,6 +571,111 @@ impl StreamView {
             self.anchor = Anchor::PinBack;
             self.ensure_window(engine, viewport_height);
         }
+    }
+
+    /// Sets up the view for a forward fetch from `cursor`, but does
+    /// not fetch anything.  Paired with [`Self::ensure_window_step`]
+    /// for the long-op-driven path.  The caller is responsible for
+    /// implementing the PinFront → PinBack fallback that
+    /// [`Self::seek_to_cursor`] does inline, since the long-op driver
+    /// has to interleave it with cancellation/progress reporting.
+    pub fn prepare_seek_to_cursor(&mut self, cursor: Cursor) {
+        self.records.clear();
+        self.front_cursor = cursor.clone();
+        self.back_cursor = cursor;
+        self.forward_eof = false;
+        self.backward_eof = false;
+        self.anchor = Anchor::PinFront;
+        self.search_resume = None;
+    }
+
+    /// Sets the anchor to [`Anchor::PinBack`] without touching the
+    /// cursors or records — used by the long-op driver to switch
+    /// directions on the `seek_to_cursor` fallback when a forward
+    /// fetch came up empty.
+    pub fn set_anchor_pin_back(&mut self) {
+        self.anchor = Anchor::PinBack;
+    }
+
+    /// Drives one batch of the work `ensure_window` would do
+    /// synchronously, then returns control so the caller can render
+    /// (and check for cancellation) before the next batch.  Used by
+    /// the long-op driver behind `g`/`G`/filter rebuild — each tick of
+    /// `advance_long_op` calls this once, lets the frame render with a
+    /// progress bar, and repeats until [`WindowFillStatus::Done`].
+    ///
+    /// Equivalent to calling [`Self::ensure_window`] in a loop, but
+    /// without holding the UI hostage on selective filters that have
+    /// to walk many on-disk records to find one match.
+    pub fn ensure_window_step(
+        &mut self,
+        engine: &Engine,
+        viewport_height: u16,
+    ) -> WindowFillStatus {
+        let target_lines = viewport_height as usize + OVER_FETCH_LINES;
+        // Phase 1: initial population.  When the deque's empty or
+        // under target, fetch one batch in the anchor's preferred
+        // direction.  We only do one batch per call so the caller can
+        // render in between.  Phase 2 below resolves PinFront/PinBack
+        // to On once we're done filling.
+        let need_more = self.records.is_empty()
+            || total_lines(&self.records) < target_lines;
+        if need_more {
+            let dir_eof = match self.anchor {
+                Anchor::PinBack => {
+                    self.extend_backward_batch(engine);
+                    self.backward_eof
+                }
+                Anchor::PinFront | Anchor::On { .. } => {
+                    self.extend_forward_batch(engine);
+                    self.forward_eof
+                }
+                Anchor::Empty => true,
+            };
+            let target_met = total_lines(&self.records) >= target_lines;
+            if !target_met && !dir_eof {
+                return WindowFillStatus::NotDone;
+            }
+        }
+        // Phase 2: resolve a pinned anchor to a concrete record.
+        match self.anchor {
+            Anchor::PinBack => {
+                self.anchor = match self.records.back() {
+                    Some(entry) => Anchor::On {
+                        key: entry.key(),
+                        line: entry.lines.len().saturating_sub(1),
+                    },
+                    None => Anchor::Empty,
+                };
+            }
+            Anchor::PinFront => {
+                self.anchor = match self.records.front() {
+                    Some(entry) => {
+                        Anchor::On { key: entry.key(), line: 0 }
+                    }
+                    None => Anchor::Empty,
+                };
+            }
+            Anchor::On { .. } | Anchor::Empty => {}
+        }
+        // Phase 3: forward look-ahead from the anchor.  This is the
+        // tail of `ensure_window` and is typically a no-op for the
+        // initial seek paths (anchor at front means lines past anchor
+        // == target_lines already; anchor at back means forward_eof
+        // and nothing to fetch).  Run it synchronously: when it does
+        // do work, it's the same look-ahead `ensure_window` does and
+        // is bounded by `target_lines`.
+        let anchor = self.anchor.clone();
+        self.extend_forward_until(engine, |records, _| {
+            let anchor_idx = anchor_idx_in(records, &anchor).unwrap_or(0);
+            records
+                .iter()
+                .skip(anchor_idx)
+                .map(|e| e.lines.len())
+                .sum::<usize>()
+                >= target_lines
+        });
+        WindowFillStatus::Done
     }
 
     /// Ensures the window has enough records to render the viewport

@@ -285,7 +285,6 @@ New tabs should still open with this dialog.
 
 ### TODO
 
-- filter dialog: needs to wrap
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
   - that works, but adding iteration=1 filters out messages that it shouldn't
@@ -303,4 +302,3 @@ New tabs should still open with this dialog.
 - `R` binding to show raw JSON instead
 - `?` binding to pop up summary of key bindings
 - there should be an indication when you're at EOF
-- show progress bar any time we're scanning (apply new filter, 'g'/'G')
