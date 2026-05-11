@@ -302,3 +302,5 @@ New tabs should still open with this dialog.
 - confirmation dialog boxes need work
 - `R` binding to show raw JSON instead
 - `?` binding to pop up summary of key bindings
+- there should be an indication when you're at EOF
+- show progress bar any time we're scanning (apply new filter, 'g'/'G')

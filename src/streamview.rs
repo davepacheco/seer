@@ -550,9 +550,18 @@ impl StreamView {
     /// Ensures the window has enough records to render the viewport
     /// plus an over-fetch buffer in each direction.  Cheap when the
     /// window is already populated.
+    ///
+    /// Two passes: an initial-population pass that fetches in the
+    /// anchor's preferred direction when the window is empty, followed
+    /// by look-ahead/look-behind extensions that fetch around the
+    /// anchor so the viewport can fill *from* the anchor's record.
+    /// The look-ahead pass matters most after a forward search lands
+    /// the anchor on a match near the cached window's tail: without
+    /// it, [`Self::anchor_flat_line`] would exceed the TUI's
+    /// `max_top`, and the TUI's clamp would pin `viewport_top` instead
+    /// of tracking the anchor as the user scrolls forward.
     pub fn ensure_window(&mut self, engine: &Engine, viewport_height: u16) {
-        let target_lines =
-            viewport_height as usize + OVER_FETCH_LINES;
+        let target_lines = viewport_height as usize + OVER_FETCH_LINES;
         // Initial population: fetch forward (or backward when pinned
         // to the back) until we have either enough lines or hit EOF.
         if self.records.is_empty() {
@@ -587,6 +596,31 @@ impl StreamView {
                 }
             }
         }
+        if self.records.is_empty() {
+            return;
+        }
+        // Look-ahead: fetch forward batches until at least
+        // `target_lines` of content sits at or past the anchor.  Stops
+        // at forward EOF or when the buffer hits the soft cap.  Clone
+        // the anchor up front so the closure doesn't borrow `self`.
+        //
+        // No matching backward pass: bookmark navigation and similar
+        // cursor-anchored seeks should land precisely at the requested
+        // record, not silently widen to include earlier ones.
+        // `scroll_lines` fetches backward on demand when the user
+        // actually scrolls back, so the absence of a pre-fetched
+        // backward buffer only costs one extra batch fetch on the
+        // first `k`.
+        let anchor = self.anchor.clone();
+        self.extend_forward_until(engine, |records, _| {
+            let anchor_idx = anchor_idx_in(records, &anchor).unwrap_or(0);
+            records
+                .iter()
+                .skip(anchor_idx)
+                .map(|e| e.lines.len())
+                .sum::<usize>()
+                >= target_lines
+        });
     }
 
     /// Fetches up to `BATCH_SIZE` records forward and appends them.
@@ -1361,6 +1395,23 @@ fn total_lines(records: &VecDeque<WindowEntry>) -> usize {
     records.iter().map(|e| e.lines.len()).sum()
 }
 
+/// Returns the index of the entry in `records` whose record matches
+/// `anchor`'s key, or `None` if the anchor isn't `Anchor::On` or the
+/// record isn't present.  Used by [`StreamView::ensure_window`]'s
+/// look-ahead/look-behind closures, which run inside a `&mut self`
+/// borrow and can't reach `self.find_record_idx`.
+fn anchor_idx_in(
+    records: &VecDeque<WindowEntry>,
+    anchor: &Anchor,
+) -> Option<usize> {
+    let Anchor::On { key, .. } = anchor else {
+        return None;
+    };
+    records.iter().position(|e| {
+        e.record.source_id == key.source_id && e.record.offset == key.offset
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1626,6 +1677,56 @@ mod tests {
     /// it would have reached.
     fn never_cancel() -> impl FnMut() -> bool {
         || false
+    }
+
+    #[test]
+    fn search_forward_extends_window_past_match() {
+        // After a forward search Found, the cached window must have
+        // at least viewport_height + OVER_FETCH_LINES of content at
+        // or past the anchor.  Without that look-ahead, the TUI's
+        // `resync_from_streamview` clamps `viewport_top` to `max_top`
+        // and subsequent `j` keystrokes don't visibly advance the
+        // view — the user-visible symptom of the
+        // navigation-stops-after-search bug.
+        //
+        // Use a 300-record file (well past the initial 138-line pop)
+        // and search to the record at index 130 of the initial pop —
+        // which is 8 records past the back of the initial pop, so
+        // without the extend-after-Found logic there would be 0
+        // records past the anchor.
+        let dir = TestDir::new();
+        let secs: Vec<i64> = (10..310).collect();
+        let engine = build_engine(&[("a", &secs)], &dir);
+        let mut view =
+            StreamView::new(Filter::default(), RenderOpts::default());
+        view.ensure_window(&engine, 10);
+        // `m140 ` (trailing space) so the regex matches only the
+        // exact message — `m140` alone would also match `m1400`,
+        // `m1401`, … if the test fixture extended further; the
+        // trailing space pins it to the rendered "<header>  m140" line.
+        let regex = Regex::new(r"m140\b").unwrap();
+        let outcome = view.search_step(
+            &engine,
+            &regex,
+            SearchDir::Forward,
+            false,
+            10,
+            &mut never_cancel(),
+        );
+        assert_eq!(outcome, SearchOutcome::Found);
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m140"));
+
+        let anchor_flat = view.anchor_flat_line();
+        let total_flat: usize = view.records().map(|(_, l)| l.len()).sum();
+        let lines_at_or_past_anchor = total_flat - anchor_flat;
+        let want = 10 + OVER_FETCH_LINES;
+        assert!(
+            lines_at_or_past_anchor >= want,
+            "expected >= {want} lines at/past anchor, got \
+             {lines_at_or_past_anchor} (anchor_flat={anchor_flat}, \
+             total_flat={total_flat})",
+        );
+        dir.cleanup();
     }
 
     #[test]

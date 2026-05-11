@@ -1047,6 +1047,20 @@ impl Tab {
         self.parse_stats = rendered.parse_stats;
         let max = self.max_top(viewport_height, viewport_width);
         self.viewport_top = anchor.min(max);
+        // When the streamview's anchor sat past `max_top` (e.g. after
+        // `seek_to_end` leaves it on the very last line, or after a
+        // search lands near the buffer's tail), sync the anchor back
+        // to `max_top` so the next backward scroll moves the visible
+        // viewport on the first keystroke.  Without this sync the
+        // anchor and `viewport_top` would drift apart and `k`
+        // keystrokes would shuffle the anchor through the (clamped)
+        // viewport until it dropped below `max_top`, looking to the
+        // user like navigation had stopped.
+        if anchor > max
+            && let Some(view) = self.streamview.as_mut()
+        {
+            view.set_anchor_to_flat_line(max);
+        }
     }
 
     /// Last *display line* index belonging to record `event_idx`,
@@ -5491,6 +5505,76 @@ mod tests {
         // going forward (back to row 4).
         a.handle_key(key(KeyCode::Char('n')));
         assert_eq!(a.active_tab().viewport_top, 4);
+    }
+
+    #[test]
+    fn k_after_seek_to_end_advances_viewport_top() {
+        // User-reported regression: `G` to scroll to EOF, then `k`
+        // appeared to do nothing.  Root cause: `seek_to_end` sets the
+        // streamview's anchor to the last line, the TUI's `resync`
+        // clamps `viewport_top` to `max_top`, and the anchor and
+        // `viewport_top` drift apart.  Subsequent `k` keystrokes move
+        // the anchor backward but the clamp pins `viewport_top` to
+        // `max_top` until the anchor crosses below it (which takes
+        // ~viewport_height presses).  Fix: when the anchor lands past
+        // `max_top`, sync it back so the next `k` moves the visible
+        // viewport on the first keystroke.
+        let msgs: Vec<String> = (0..300).map(|i| format!("payload-m{i}")).collect();
+        let records: Vec<(i64, &str)> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (10 + i as i64, m.as_str()))
+            .collect();
+        let (mut a, _dir) = host_app("test", &records);
+        a.handle_key(shift('G'));
+        a.drain_long_op();
+        let after_g = a.active_tab().viewport_top;
+        a.handle_key(key(KeyCode::Char('k')));
+        assert!(
+            a.active_tab().viewport_top < after_g,
+            "viewport_top should retreat after k; was {after_g}, \
+             now {} after one k press",
+            a.active_tab().viewport_top,
+        );
+    }
+
+    #[test]
+    fn j_after_search_advances_viewport_top() {
+        // User-reported regression: after `/<pattern><enter>` lands on
+        // a match, subsequent `j` keystrokes appeared to do nothing.
+        // Root cause: `search_step_forward` extends the streamview's
+        // window only as far as needed to find the match.  Without
+        // [`StreamView::ensure_window`]'s look-ahead pass, the anchor
+        // lands at or near the cached window's back; the TUI's
+        // `resync_from_streamview` clamps `viewport_top` to `max_top`
+        // and `j` advances the anchor but the clamp pins
+        // `viewport_top` so the visible content doesn't move.  Verify
+        // by searching to a record near the back of the initial fetch
+        // and confirming j-keystrokes actually shift `viewport_top`.
+        let msgs: Vec<String> = (0..300).map(|i| format!("payload-m{i}")).collect();
+        let records: Vec<(i64, &str)> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (10 + i as i64, m.as_str()))
+            .collect();
+        let (mut a, _dir) = host_app("test", &records);
+        // Search for record 129 — close to but inside the streamview's
+        // initial 138-line fetch.
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), r"payload-m129\b");
+        a.handle_key(key(KeyCode::Enter));
+        a.drain_long_op();
+
+        let after_search = a.active_tab().viewport_top;
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        assert!(
+            a.active_tab().viewport_top > after_search,
+            "viewport_top should advance after j-keystrokes; \
+             was {after_search}, is now {} after 3 j presses",
+            a.active_tab().viewport_top,
+        );
     }
 
     #[test]
