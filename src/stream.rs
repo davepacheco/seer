@@ -16,6 +16,7 @@ use crate::source::SourceId;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
 use iddqd::{IdOrdItem, id_upcast};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -33,6 +34,7 @@ use uuid::Uuid;
     Deserialize,
     Display,
     From,
+    JsonSchema,
 )]
 #[serde(transparent)]
 pub struct LogStreamId(Uuid);
@@ -59,7 +61,16 @@ impl LogStreamId {
 /// fingerprint to survive file rewrites) can be added without breaking
 /// callers.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
 pub struct LogStreamPosition {
     source: SourceId,
@@ -107,7 +118,7 @@ impl LogStreamPosition {
 /// when a bookmark targets a stream that has no tab open, opening a
 /// fresh tab for that stream restores the user's filter alongside the
 /// position.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogStream {
     pub id: LogStreamId,
     pub name: String,

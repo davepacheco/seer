@@ -21,6 +21,7 @@ use crate::filter::{Filter, Predicate};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
+use schemars::JsonSchema;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::iter;
@@ -46,6 +47,7 @@ use std::iter;
     AsRef,
     serde::Serialize,
     serde::Deserialize,
+    JsonSchema,
 )]
 #[as_ref(forward)]
 #[serde(transparent)]
@@ -77,6 +79,7 @@ pub struct SourceId(String);
     From,
     serde::Serialize,
     serde::Deserialize,
+    JsonSchema,
 )]
 #[serde(transparent)]
 pub struct ByteOffset(u64);

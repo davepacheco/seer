@@ -27,7 +27,8 @@ pub use render::{
     HostnameDisplay, RenderOpts, format_event, format_time, short_hostname,
 };
 pub use session::{
-    Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
+    Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,
+    SessionSource, Tab,
 };
 pub use session_store::{
     STATE_DIR_ENV, SessionId, SessionIdParseError, SessionStore, StoreError,

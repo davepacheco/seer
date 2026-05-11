@@ -27,6 +27,7 @@
 use crate::event::Event;
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
@@ -36,7 +37,15 @@ use std::sync::LazyLock;
 /// on the host [`crate::stream::LogStream`] so the choice outlives a
 /// session.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HostnameDisplay {

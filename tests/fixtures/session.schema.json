@@ -1,0 +1,509 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Session",
+  "description": "Top-level session state.\n\nDesigned to be the unit of persistence: serialize this and you've captured enough to put the user back where they left off.\n\nFields are not `#[serde(default)]`: there are no live session files on disk to be backwards-compatible with, and silently defaulting in fields would defeat the schema-tripwire test that guards `CURRENT_SESSION_VERSION`.",
+  "type": "object",
+  "required": [
+    "created_at",
+    "id",
+    "last_pid",
+    "last_saved_at",
+    "sources",
+    "streams",
+    "tabs",
+    "user_bookmarks",
+    "version"
+  ],
+  "properties": {
+    "created_at": {
+      "description": "When the session was first created.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "id": {
+      "description": "Short id; also the filename stem on disk.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SessionId"
+        }
+      ]
+    },
+    "last_pid": {
+      "description": "PID of the seer process that most recently saved this session.  Recorded for diagnostics (e.g. a future concurrent-access warning); not consulted for correctness.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "last_saved_at": {
+      "description": "When the saver last successfully wrote this session to disk.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "sources": {
+      "description": "Sources this session was opened against.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SessionSource"
+      }
+    },
+    "streams": {
+      "description": "Log streams owned by this session, keyed by id.  Serialized as a JSON array because [`IdOrdMap`] writes itself that way; the explicit `schemars(with = …)` is what surfaces that to the schema generator since `IdOrdMap` has no `JsonSchema` impl of its own.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/LogStream"
+      }
+    },
+    "tabs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Tab"
+      }
+    },
+    "user_bookmarks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/Bookmark"
+        }
+      }
+    },
+    "version": {
+      "description": "On-disk schema version.  Bumped on changes that aren't otherwise serde-compatible (renames, restructured fields).",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "Bookmark": {
+      "description": "A user-created bookmark: a deliberate landmark in a log stream.\n\nA bookmark refers to its target by a byte-offset [`Cursor`] — feeding the cursor to [`crate::StreamView::seek_to_cursor`] lands the viewport on the bookmarked record.  This makes navigation `O(1)` (no walk from byte 0) and is stable across filter changes: a filter can hide the bookmarked event from view, but the cursor still names the same byte position regardless of what the active filter is.\n\n`display_time` and `display_msg` are captured at creation time so the Bookmarks tab can render the row even when the source isn't currently loaded — and so the preview reflects what the user saw when they made the bookmark, not whatever the file looks like now.",
+      "type": "object",
+      "required": [
+        "created_at",
+        "cursor",
+        "display_msg",
+        "display_source",
+        "display_time",
+        "id"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cursor": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "display_msg": {
+          "description": "First slice of the bookmarked event's `msg`, cached so the Bookmarks tab can show it without re-querying the engine.",
+          "type": "string"
+        },
+        "display_source": {
+          "description": "Source the bookmarked event came from, captured at creation time so the Bookmarks tab can show its filename without re-resolving the cursor against the engine.",
+          "type": "string"
+        },
+        "display_time": {
+          "description": "Timestamp of the bookmarked event, cached so the Bookmarks tab can show it without re-querying the engine.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Filter": {
+      "description": "A conjunction of predicates over an [`Event`].\n\nThe default value has no predicates and matches every event.",
+      "type": "object",
+      "required": [
+        "predicates"
+      ],
+      "properties": {
+        "predicates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Predicate"
+          }
+        }
+      }
+    },
+    "HostnameDisplay": {
+      "description": "How [`format_event`] should render the bunyan `hostname` field.\n\nSelected via the `h` field-display dialog in the TUI and persisted on the host [`crate::stream::LogStream`] so the choice outlives a session.",
+      "oneOf": [
+        {
+          "description": "Trim to the first dot-component, then collapse a trailing UUID to its first 8-character group — see [`short_hostname`].  This is the default because real Oxide hostnames carry a domain suffix and a service-instance UUID that crowd the header without informing the user.",
+          "type": "string",
+          "enum": [
+            "short"
+          ]
+        },
+        {
+          "description": "Render the hostname exactly as it appears in the event.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        },
+        {
+          "description": "Don't render the hostname column at all (no field, no surrounding spaces).",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "Level": {
+      "type": "integer",
+      "enum": [
+        10,
+        20,
+        30,
+        40,
+        50,
+        60
+      ]
+    },
+    "LogStream": {
+      "description": "A log stream.\n\nOwns its identity, display name, and active filter.  The set of sources a stream draws from will join the struct once per-stream source restrictions land; for now every stream sees every source the engine knows about.\n\nFilter ownership lives here (rather than on the display tab) so that when a bookmark targets a stream that has no tab open, opening a fresh tab for that stream restores the user's filter alongside the position.",
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "filter": {
+          "default": {
+            "predicates": []
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/Filter"
+            }
+          ]
+        },
+        "hostname_display": {
+          "description": "how the bunyan `hostname` field is rendered: short (the default), full, or omitted.  Set via the `h` field-display dialog in the TUI.",
+          "default": "short",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HostnameDisplay"
+            }
+          ]
+        },
+        "id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "show_date": {
+          "description": "when true, the leading timestamp on each rendered line carries its `YYYY-MM-DD` prefix; when false, the date is dropped and only the wall-clock part is shown.  Defaults to true: most triage spans more than a single day, and you want the date in view by default.  Toggled with `D` in the TUI.",
+          "default": true,
+          "type": "boolean"
+        },
+        "show_extras": {
+          "description": "when true, render the structured fields beyond the bunyan header below each event; defaults to false because most triage starts from the header line and the user opts in (`F` in the TUI) when they need the details",
+          "default": false,
+          "type": "boolean"
+        },
+        "show_name": {
+          "description": "when true, the bunyan `name` field renders in the header. Defaults to true: across merged sources the logger name is the quickest way to tell which component a given event came from.",
+          "default": true,
+          "type": "boolean"
+        },
+        "show_pid": {
+          "description": "when true, the bunyan `pid` field renders alongside `name` in the header.  Defaults to false: real Oxide processes restart often enough that the literal pid number is rarely useful for triage; users opt in via the `h` field-display dialog when they do want it.",
+          "default": false,
+          "type": "boolean"
+        },
+        "show_raw": {
+          "description": "when true, records render as the raw line bytes from the source rather than the formatted header/extras layout.  Useful for inspecting fields the parser dropped or normalized. Defaults to false; toggled with `R` in the TUI.",
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "LogStreamPosition": {
+      "description": "Position within a log stream — a stable anchor that survives filter changes.\n\nA position pins down a specific event by `(source, time, ordinal_within_time)`.  Same-time tiebreaking happens via `ordinal_within_time`: the first event with a given `(source, time)` has ordinal 0, the next has 1, and so on.  This shape was chosen so that adding/removing predicates from the active filter never moves what a saved position refers to: only the row index that position resolves to in a filtered view changes.\n\nThe fields are private so future representations (e.g. a content fingerprint to survive file rewrites) can be added without breaking callers.",
+      "type": "object",
+      "required": [
+        "ordinal_within_time",
+        "source",
+        "time"
+      ],
+      "properties": {
+        "ordinal_within_time": {
+          "description": "0-based count of events from the same `source` with this exact `time`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "source": {
+          "type": "string"
+        },
+        "time": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "Predicate": {
+      "description": "A single predicate over an [`Event`].\n\nThe equality and regex variants carry a `negated` flag so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in polarity.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
+      "oneOf": [
+        {
+          "description": "`event.level >= threshold`",
+          "type": "object",
+          "required": [
+            "LevelAtLeast"
+          ],
+          "properties": {
+            "LevelAtLeast": {
+              "$ref": "#/definitions/Level"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.level == level` (or `!=` when `negated`)",
+          "type": "object",
+          "required": [
+            "LevelEquals"
+          ],
+          "properties": {
+            "LevelEquals": {
+              "type": "object",
+              "required": [
+                "level"
+              ],
+              "properties": {
+                "level": {
+                  "$ref": "#/definitions/Level"
+                },
+                "negated": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Named field has (or, when `negated`, does not have) the given exact-string value.\n\nMatches the bunyan core fields (`name`, `hostname`, `pid`, `msg`) or any key in `event.extra`.",
+          "type": "object",
+          "required": [
+            "FieldEquals"
+          ],
+          "properties": {
+            "FieldEquals": {
+              "type": "object",
+              "required": [
+                "name",
+                "value"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "negated": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.msg` matches (or, when `negated`, does not match) the regex.",
+          "type": "object",
+          "required": [
+            "MsgMatches"
+          ],
+          "properties": {
+            "MsgMatches": {
+              "type": "object",
+              "required": [
+                "regex"
+              ],
+              "properties": {
+                "negated": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "regex": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The source the event came from has an id that matches (or, when `negated`, does not match) the regex.  Evaluated against [`crate::source::SourceId`] at source-selection time, not against the event itself; the engine skips entire sources whose ids fail rather than iterating their contents.",
+          "type": "object",
+          "required": [
+            "SourceIdMatches"
+          ],
+          "properties": {
+            "SourceIdMatches": {
+              "type": "object",
+              "required": [
+                "regex"
+              ],
+              "properties": {
+                "negated": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "regex": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.time` compared against `value` using `op`.  Negation is expressed by flipping the operator (e.g. `!(time >= X)` is `time < X`), so there is no separate `negated` flag.",
+          "type": "object",
+          "required": [
+            "TimeBound"
+          ],
+          "properties": {
+            "TimeBound": {
+              "type": "object",
+              "required": [
+                "op",
+                "value"
+              ],
+              "properties": {
+                "op": {
+                  "$ref": "#/definitions/TimeOp"
+                },
+                "value": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SessionId": {
+      "type": "string",
+      "maxLength": 8,
+      "minLength": 8,
+      "pattern": "^[0-9a-f]{8}$"
+    },
+    "SessionSource": {
+      "description": "A source the session was opened against.\n\nCaptures the canonical path the user supplied plus a lightweight fingerprint (mtime + size) taken at open time.  At resume time, a mismatching fingerprint signals that the underlying file has changed and any cached parse state for it should be invalidated. The fingerprint is also the seed for any future path-independent matching (e.g. a re-extracted support tarball whose paths differ).",
+      "type": "object",
+      "required": [
+        "id",
+        "mtime",
+        "path",
+        "size"
+      ],
+      "properties": {
+        "id": {
+          "description": "id used to refer to this source from elsewhere in the session (cursors, bookmarks, log streams)",
+          "type": "string"
+        },
+        "mtime": {
+          "description": "file modification time captured at open time",
+          "type": "string",
+          "format": "date-time"
+        },
+        "path": {
+          "description": "canonical path captured at open time",
+          "type": "string"
+        },
+        "size": {
+          "description": "file size in bytes captured at open time",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Tab": {
+      "description": "A tab in the TUI.\n\nA tab is a view onto exactly one [`LogStream`] (referenced by id; the stream lives in [`Session::streams`]).  `cursor` is the position the tab is currently scrolled to.  `cursor` is `None` for an empty-or-unrendered tab.",
+      "type": "object",
+      "required": [
+        "stream"
+      ],
+      "properties": {
+        "cursor": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LogStreamPosition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stream": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "TimeOp": {
+      "description": "Comparison operator for a [`Predicate::TimeBound`].",
+      "oneOf": [
+        {
+          "description": "`event.time >= value`",
+          "type": "string",
+          "enum": [
+            "AtLeast"
+          ]
+        },
+        {
+          "description": "`event.time > value`",
+          "type": "string",
+          "enum": [
+            "After"
+          ]
+        },
+        {
+          "description": "`event.time <= value`",
+          "type": "string",
+          "enum": [
+            "AtMost"
+          ]
+        },
+        {
+          "description": "`event.time < value`",
+          "type": "string",
+          "enum": [
+            "Before"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -118,6 +118,37 @@ impl<'de> Deserialize<'de> for SessionId {
     }
 }
 
+// Manual JsonSchema impl: SessionId serializes as the 8-char hex
+// string from `Display`, not as its underlying 4-byte array, so the
+// schema must describe a string with the right shape rather than
+// inheriting the byte-array shape a derive would produce.
+impl schemars::JsonSchema for SessionId {
+    fn schema_name() -> String {
+        "SessionId".to_owned()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("seer::session_store::SessionId")
+    }
+
+    fn json_schema(
+        _: &mut schemars::r#gen::SchemaGenerator,
+    ) -> schemars::schema::Schema {
+        schemars::schema::SchemaObject {
+            instance_type: Some(
+                schemars::schema::InstanceType::String.into(),
+            ),
+            string: Some(Box::new(schemars::schema::StringValidation {
+                pattern: Some(r"^[0-9a-f]{8}$".to_owned()),
+                min_length: Some(8),
+                max_length: Some(8),
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 /// Errors from the session store.
 #[derive(Debug, Error)]
 pub enum StoreError {

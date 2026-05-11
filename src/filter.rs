@@ -37,6 +37,7 @@ use crate::event::{Event, Level};
 use crate::source::SourceId;
 use chrono::{DateTime, SecondsFormat, Utc};
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
@@ -45,7 +46,7 @@ use std::str::FromStr;
 /// A conjunction of predicates over an [`Event`].
 ///
 /// The default value has no predicates and matches every event.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Filter {
     predicates: Vec<Predicate>,
 }
@@ -95,7 +96,7 @@ impl Filter {
 /// are the same variant differing only in polarity.  `LevelAtLeast` has
 /// no useful negation (the user can write `level>=` at the threshold
 /// they want), so it is left as a single variant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Predicate {
     /// `event.level >= threshold`
     LevelAtLeast(Level),
@@ -119,6 +120,7 @@ pub enum Predicate {
     /// `event.msg` matches (or, when `negated`, does not match) the regex.
     MsgMatches {
         #[serde(with = "regex_serde")]
+        #[schemars(with = "String")]
         regex: Regex,
         #[serde(default)]
         negated: bool,
@@ -130,6 +132,7 @@ pub enum Predicate {
     /// rather than iterating their contents.
     SourceIdMatches {
         #[serde(with = "regex_serde")]
+        #[schemars(with = "String")]
         regex: Regex,
         #[serde(default)]
         negated: bool,
@@ -141,7 +144,9 @@ pub enum Predicate {
 }
 
 /// Comparison operator for a [`Predicate::TimeBound`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
 pub enum TimeOp {
     /// `event.time >= value`
     AtLeast,

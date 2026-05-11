@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 1 complete.  Next phase: **2. Schema fields + fixture.**
+Phase 2 complete.  Next phase: **3. Discovery.**
 
 ## Goal
 
@@ -328,10 +328,35 @@ a note when a phase moves to in-progress or done.
     `list` filtering, the no-`.tmp`-leftovers atomicity contract,
     and the env-override fallback.
 
-- [ ] **2. Schema fields + fixture.**  Add `id`, `sources` (with
+- [x] **2. Schema fields + fixture.**  Add `id`, `sources` (with
   `mtime` and `size`), `created_at`, `last_saved_at`, `last_pid`
   to `Session`; derive `JsonSchema`; land the `expectorate`
   fixture and the test that checks it.
+  - `Session` in `src/session.rs` gained `id`, `sources`,
+    `created_at`, `last_saved_at`, `last_pid`.  `SessionSource`
+    added with `id`/`path`/`mtime`/`size`.  Removed
+    `#[serde(default)]` from all `Session` fields (no live files
+    to be compatible with) and dropped the `Default` impl;
+    `Session::new()` mints a fresh id, timestamps, and pid.
+    `CURRENT_SESSION_VERSION` bumped to 3.  `JsonSchema` derived
+    across the full reachable graph (`Session`, `Tab`, `Bookmark`,
+    `BookmarkName/Id`, `SessionSource`, `SourceId`, `ByteOffset`,
+    `LogStream`, `LogStreamId`, `LogStreamPosition`, `Filter`,
+    `Predicate`, `TimeOp`, `HostnameDisplay`, `Cursor`); manual
+    impls for `SessionId` (8-char hex string) and `Level` (bunyan
+    integer).  `Utf8PathBuf`/`Regex` use `#[schemars(with =
+    "String")]`; `IdOrdMap<LogStream>` uses `#[schemars(with =
+    "Vec<LogStream>")]`.  Schema fixture lives at
+    `tests/fixtures/session.schema.json` and is diffed by
+    `tests/session_schema.rs` via `expectorate` — refresh with
+    `EXPECTORATE=overwrite cargo nextest run -p seer
+    session_schema_matches_fixture`.  Added `schemars = "0.8.22"`
+    (chrono+uuid1 features), `expectorate = "1.2.0"` dev-dep, and
+    enabled `camino`'s `serde1` feature.  Retargeted two
+    `legacy_session_*` tests in `src/bin/seer.rs` at `LogStream`
+    deserialization directly, since the partial-Session JSON
+    pattern they relied on no longer round-trips after the
+    `#[serde(default)]` removal.  451 tests pass.
 
 - [ ] **3. Discovery.**  `find_matches(paths) -> Vec<Match>`,
   classified exact/superset/overlap.  Unit tests with a temp

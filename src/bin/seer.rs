@@ -8094,26 +8094,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_without_show_date_defaults_to_true() {
-        // Sessions saved before `show_date` existed won't have the
-        // field in their JSON.  Loading such a session must default to
-        // `true` (the new default), not `false` (bool::default).  This
-        // guards against quietly dropping the date prefix on every
+    fn legacy_stream_without_show_date_defaults_to_true() {
+        // Streams saved before `show_date` existed won't have the
+        // field in their JSON.  Loading must default to `true` (the
+        // new default), not `false` (bool::default).  This guards
+        // against quietly dropping the date prefix on every
         // pre-existing project.
         let json = serde_json::json!({
-            "version": seer::CURRENT_SESSION_VERSION,
-            "streams": [{
-                "id": "00000000-0000-0000-0000-000000000001",
-                "name": "Tab 1",
-                "show_extras": false,
-            }],
-            "bookmarks": [],
-            "next_bookmark_id": 1,
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "Tab 1",
+            "show_extras": false,
         });
-        let restored: Session = serde_json::from_value(json).unwrap();
-        let streams: Vec<_> = restored.streams.iter().collect();
-        assert_eq!(streams.len(), 1);
-        assert!(streams[0].show_date);
+        let stream: seer::LogStream = serde_json::from_value(json).unwrap();
+        assert!(stream.show_date);
     }
 
     // ---------- field-display dialog (h) ----------
@@ -8321,25 +8314,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_without_hostname_display_defaults_to_short() {
+    fn legacy_stream_without_hostname_display_defaults_to_short() {
         // `hostname_display` was added after `show_extras`/`show_date`;
-        // legacy session JSON won't carry it.  Loading must default to
+        // legacy stream JSON won't carry it.  Loading must default to
         // `Short` (the new default) rather than crashing or silently
         // falling back to a different variant.
         let json = serde_json::json!({
-            "version": seer::CURRENT_SESSION_VERSION,
-            "streams": [{
-                "id": "00000000-0000-0000-0000-000000000001",
-                "name": "Tab 1",
-                "show_extras": false,
-            }],
-            "bookmarks": [],
-            "next_bookmark_id": 1,
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "Tab 1",
+            "show_extras": false,
         });
-        let restored: Session = serde_json::from_value(json).unwrap();
-        let streams: Vec<_> = restored.streams.iter().collect();
-        assert_eq!(streams.len(), 1);
-        assert_eq!(streams[0].hostname_display, HostnameDisplay::Short);
+        let stream: seer::LogStream = serde_json::from_value(json).unwrap();
+        assert_eq!(stream.hostname_display, HostnameDisplay::Short);
     }
 
     // ---------- Summary tab ----------

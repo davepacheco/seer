@@ -22,6 +22,7 @@ use crate::source::{
     ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
 };
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -62,7 +63,9 @@ const BUFFER_LIMIT: usize = 256;
 /// to [`ByteOffset::ZERO`] when used as input to
 /// [`super::Engine::stepper`], so a default `Cursor` walks each source
 /// from its beginning.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Cursor {
     offsets: BTreeMap<SourceId, ByteOffset>,

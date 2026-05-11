@@ -20,22 +20,23 @@
 //! shim keyed on `version`.
 
 use crate::engine::Cursor;
+use crate::session_store::SessionId;
 use crate::source::SourceId;
 use crate::stream::{LogStream, LogStreamId, LogStreamPosition};
+use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
 use iddqd::IdOrdMap;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-/// Current on-disk schema version.  Bump only on changes that aren't
-/// serde-default-compatible (renames, restructured fields).
-pub const CURRENT_SESSION_VERSION: u32 = 2;
-
-fn current_session_version() -> u32 {
-    CURRENT_SESSION_VERSION
-}
+/// Current on-disk schema version.  Bump whenever the serialized
+/// shape of a [`Session`] changes — the `schemars`-derived schema
+/// fixture test will fail and prompt the author to refresh both
+/// this constant and the checked-in fixture.
+pub const CURRENT_SESSION_VERSION: u32 = 3;
 
 /// User-supplied name for a bookmark.
 #[derive(
@@ -50,6 +51,7 @@ fn current_session_version() -> u32 {
     Deserialize,
     Display,
     From,
+    JsonSchema,
 )]
 #[serde(transparent)]
 pub struct BookmarkName(String);
@@ -72,6 +74,7 @@ pub struct BookmarkName(String);
     Deserialize,
     Display,
     From,
+    JsonSchema,
 )]
 #[serde(transparent)]
 pub struct BookmarkId(Uuid);
@@ -96,7 +99,7 @@ impl BookmarkId {
 /// Bookmarks tab can render the row even when the source isn't currently
 /// loaded — and so the preview reflects what the user saw when they made
 /// the bookmark, not whatever the file looks like now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Bookmark {
     pub id: BookmarkId,
     pub created_at: DateTime<Utc>,
@@ -121,44 +124,94 @@ pub struct Bookmark {
 /// stream lives in [`Session::streams`]).  `cursor` is the position the
 /// tab is currently scrolled to.  `cursor` is `None` for an
 /// empty-or-unrendered tab.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Tab {
     pub stream: LogStreamId,
     #[serde(default)]
     pub cursor: Option<LogStreamPosition>,
 }
 
+/// A source the session was opened against.
+///
+/// Captures the canonical path the user supplied plus a lightweight
+/// fingerprint (mtime + size) taken at open time.  At resume time, a
+/// mismatching fingerprint signals that the underlying file has
+/// changed and any cached parse state for it should be invalidated.
+/// The fingerprint is also the seed for any future path-independent
+/// matching (e.g. a re-extracted support tarball whose paths
+/// differ).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionSource {
+    /// id used to refer to this source from elsewhere in the
+    /// session (cursors, bookmarks, log streams)
+    pub id: SourceId,
+    /// canonical path captured at open time
+    #[schemars(with = "String")]
+    pub path: Utf8PathBuf,
+    /// file modification time captured at open time
+    pub mtime: DateTime<Utc>,
+    /// file size in bytes captured at open time
+    pub size: u64,
+}
+
 /// Top-level session state.
 ///
 /// Designed to be the unit of persistence: serialize this and you've
 /// captured enough to put the user back where they left off.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Fields are not `#[serde(default)]`: there are no live session
+/// files on disk to be backwards-compatible with, and silently
+/// defaulting in fields would defeat the schema-tripwire test that
+/// guards `CURRENT_SESSION_VERSION`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Session {
-    #[serde(default = "current_session_version")]
+    /// On-disk schema version.  Bumped on changes that aren't
+    /// otherwise serde-compatible (renames, restructured fields).
     pub version: u32,
-    #[serde(default)]
+    /// Short id; also the filename stem on disk.
+    pub id: SessionId,
+    /// Sources this session was opened against.
+    pub sources: Vec<SessionSource>,
+    /// When the session was first created.
+    pub created_at: DateTime<Utc>,
+    /// When the saver last successfully wrote this session to disk.
+    pub last_saved_at: DateTime<Utc>,
+    /// PID of the seer process that most recently saved this
+    /// session.  Recorded for diagnostics (e.g. a future
+    /// concurrent-access warning); not consulted for correctness.
+    pub last_pid: u32,
     pub tabs: Vec<Tab>,
-    #[serde(default)]
+    /// Log streams owned by this session, keyed by id.  Serialized
+    /// as a JSON array because [`IdOrdMap`] writes itself that way;
+    /// the explicit `schemars(with = …)` is what surfaces that to
+    /// the schema generator since `IdOrdMap` has no `JsonSchema`
+    /// impl of its own.
+    #[schemars(with = "Vec<LogStream>")]
     pub streams: IdOrdMap<LogStream>,
-    #[serde(default)]
     pub user_bookmarks: BTreeMap<LogStreamId, Vec<Bookmark>>,
 }
 
-impl Default for Session {
-    fn default() -> Self {
+impl Session {
+    /// Returns a fresh session with a new random id, the current
+    /// time, and no sources/tabs/bookmarks.
+    ///
+    /// Mints a new id and timestamps on every call, so there is no
+    /// `Default` impl — that contract would conflict with "default
+    /// values are deterministic".
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let now = Utc::now();
         Self {
             version: CURRENT_SESSION_VERSION,
+            id: SessionId::random(),
+            sources: Vec::new(),
+            created_at: now,
+            last_saved_at: now,
+            last_pid: std::process::id(),
             tabs: Vec::new(),
             streams: IdOrdMap::new(),
             user_bookmarks: BTreeMap::new(),
         }
-    }
-}
-
-impl Session {
-    /// Returns an empty session — no streams, no tabs, no bookmarks.
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Inserts `bookmark` into `user_bookmarks` under `stream`.
@@ -277,16 +330,19 @@ mod tests {
     }
 
     #[test]
-    fn session_without_version_field_defaults_to_current() {
-        // A session file written before the version field existed would
-        // have no `version` key.  serde_default keeps the existing files
-        // readable.
-        let json = r#"{
-            "tabs": [],
-            "streams": [],
-            "user_bookmarks": {}
-        }"#;
-        let s: Session = serde_json::from_str(json).unwrap();
+    fn new_session_has_fresh_id_and_current_timestamps() {
+        let before = Utc::now();
+        let s = Session::new();
+        let after = Utc::now();
+
+        // Two consecutive calls produce different ids.
+        let other = Session::new();
+        assert_ne!(s.id, other.id);
+
+        // Timestamps land within the call window.
+        assert!(s.created_at >= before && s.created_at <= after);
+        assert_eq!(s.created_at, s.last_saved_at);
+        assert_eq!(s.last_pid, std::process::id());
         assert_eq!(s.version, CURRENT_SESSION_VERSION);
     }
 

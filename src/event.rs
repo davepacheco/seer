@@ -220,6 +220,40 @@ impl serde::Serialize for Level {
     }
 }
 
+// Manual JsonSchema impl: Level serializes as a bunyan-numeric u8
+// (10, 20, 30, 40, 50, 60), not as the enum variant names.  The
+// schema therefore advertises an integer with that enumerated set
+// of allowed values rather than a string.
+impl schemars::JsonSchema for Level {
+    fn schema_name() -> String {
+        "Level".to_owned()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("seer::event::Level")
+    }
+
+    fn json_schema(
+        _: &mut schemars::r#gen::SchemaGenerator,
+    ) -> schemars::schema::Schema {
+        schemars::schema::SchemaObject {
+            instance_type: Some(
+                schemars::schema::InstanceType::Integer.into(),
+            ),
+            enum_values: Some(vec![
+                serde_json::json!(10),
+                serde_json::json!(20),
+                serde_json::json!(30),
+                serde_json::json!(40),
+                serde_json::json!(50),
+                serde_json::json!(60),
+            ]),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 /// Logger name (the `name` field in a bunyan record).
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Deserialize, Display, From, AsRef,
