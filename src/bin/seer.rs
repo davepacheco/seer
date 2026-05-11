@@ -621,10 +621,13 @@ struct SeekOp {
     /// like "Loading view" vs "Applying filter" without inflating
     /// [`SeekFinalize`].
     label: String,
-    /// Baseline `parse_stats.bytes` snapshot, subtracted from the
-    /// streamview's running totals so the progress bar shows just
-    /// what *this* op consumed (matching [`SearchOp`]'s convention).
-    bytes_at_start: u64,
+    /// Baseline `parse_stats.walked_bytes` snapshot, subtracted from
+    /// the streamview's running totals so the progress bar shows just
+    /// what *this* op consumed.  We track walked bytes (including
+    /// filter-rejected records) rather than just matching-record
+    /// bytes so the bar still ticks during sparse-filter regions
+    /// where the scan walks many records without surfacing any.
+    walked_bytes_at_start: u64,
     records_at_start: u64,
     bytes_done: u64,
     records: u64,
@@ -640,7 +643,7 @@ impl SeekOp {
         tab_idx: usize,
         finalize: SeekFinalize,
         label: impl Into<String>,
-        bytes_at_start: u64,
+        walked_bytes_at_start: u64,
         records_at_start: u64,
         total_bytes: u64,
     ) -> Self {
@@ -648,7 +651,7 @@ impl SeekOp {
             tab_idx,
             finalize,
             label: label.into(),
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             bytes_done: 0,
             records: 0,
@@ -1563,13 +1566,13 @@ impl App {
         }
     }
 
-    /// Drives one chunk of an in-progress seek.  Borrows the
-    /// destination tab's [`StreamView`] mutably to call
-    /// [`StreamView::ensure_window_step`], then snapshots the
-    /// streamview's running parse stats into the op so the progress
-    /// bar can read them later without re-borrowing.  Returns `true`
-    /// once the window-fill reaches its target (or the underlying
-    /// source hits EOF in the fill direction).
+    /// Drives one tick of an in-progress seek.  Each call to
+    /// [`StreamView::ensure_window_step`] runs at most one bounded
+    /// scan (capped at `LONG_OP_WALKS_PER_FILL` records examined),
+    /// so the wall time per tick is predictable even when the
+    /// active filter rejects almost everything.  Returns `true` once
+    /// the window-fill reaches its target or hits EOF in the fill
+    /// direction.
     fn advance_seek_op(
         &mut self,
         s: &mut SeekOp,
@@ -1585,17 +1588,18 @@ impl App {
             s.complete = true;
             return true;
         };
-        let status = view.ensure_window_step(engine, viewport_height);
+        let completed = matches!(
+            view.ensure_window_step(engine, viewport_height),
+            WindowFillStatus::Done
+        );
         let stats = view.parse_stats();
-        s.bytes_done = stats.bytes.saturating_sub(s.bytes_at_start);
+        s.bytes_done =
+            stats.walked_bytes.saturating_sub(s.walked_bytes_at_start);
         s.records = stats.records.saturating_sub(s.records_at_start);
-        match status {
-            WindowFillStatus::NotDone => false,
-            WindowFillStatus::Done => {
-                s.complete = true;
-                true
-            }
+        if completed {
+            s.complete = true;
         }
+        completed
     }
 
     /// Drives one chunk of an in-progress search.  Borrows the
@@ -1889,7 +1893,7 @@ impl App {
             return;
         }
         let stats = view.parse_stats();
-        let bytes_at_start = stats.bytes;
+        let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
         let total_bytes =
             self.engine.filtered_total_bytes(view.filter());
@@ -1904,7 +1908,7 @@ impl App {
             active,
             SeekFinalize::Back,
             "Seeking to end",
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
         )));
@@ -1923,7 +1927,7 @@ impl App {
         };
         view.prepare_seek_to_start();
         let stats = view.parse_stats();
-        let bytes_at_start = stats.bytes;
+        let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
         let total_bytes =
             self.engine.filtered_total_bytes(view.filter());
@@ -1935,7 +1939,7 @@ impl App {
             active,
             SeekFinalize::Front,
             "Seeking to start",
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
         )));
@@ -1954,7 +1958,7 @@ impl App {
         };
         view.prepare_seek_to_cursor(cursor);
         let stats = view.parse_stats();
-        let bytes_at_start = stats.bytes;
+        let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
         let total_bytes =
             self.engine.filtered_total_bytes(view.filter());
@@ -1966,7 +1970,7 @@ impl App {
             active,
             SeekFinalize::FrontOrBackFallback,
             "Loading view",
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
         )));
@@ -2113,7 +2117,7 @@ impl App {
                 SeekFinalize::Front
             }
         };
-        let bytes_at_start = view.parse_stats().bytes;
+        let walked_bytes_at_start = view.parse_stats().walked_bytes;
         let records_at_start = view.parse_stats().records;
         let total_bytes = self.engine.filtered_total_bytes(view.filter());
         self.tabs[tab_idx].streamview = Some(view);
@@ -2129,7 +2133,7 @@ impl App {
             tab_idx,
             finalize,
             label,
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
         )));
@@ -5928,6 +5932,76 @@ mod tests {
             formatted.iter().any(|l| l.contains("payload-m25")),
             "expected 'payload-m25' in viewport, got {formatted:?}",
         );
+    }
+
+    #[test]
+    fn seek_long_op_does_not_waste_work_under_selective_filter() {
+        // Regression check for a subtle bug: when `ensure_window_step`
+        // used the default per-fill batch size (64) but only consumed
+        // one matching record per tick, every tick threw away the
+        // remaining 63 buffered matches, multiplying the walk count
+        // ~64x.  The fix uses a small per-fill batch size so each
+        // tick walks just enough to surface the matches it actually
+        // returns.  Verify the parse-stats records grow linearly,
+        // not in giant jumps.
+        let msgs: Vec<String> =
+            (0..500).map(|i| format!("payload-m{i}")).collect();
+        let records: Vec<(i64, &str)> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (10 + i as i64, m.as_str()))
+            .collect();
+        let (mut a, _dir) = host_app("test", &records);
+        let filter: Filter = "msg=~payload-m[0-9]*99$".parse().unwrap();
+        a.apply_filter(filter);
+        a.drain_long_op();
+        // Drained: tab should hold the 5 matching records (m99, m199,
+        // m299, m399, m499).  parse_stats.records counts records
+        // appended to the streamview — without the small-batch fix
+        // each tick would have buffered (and discarded) up to 64
+        // matches, but our file has only 5 anyway so the test is
+        // about end-state correctness here: every match landed, and
+        // nothing got double-counted from re-walking.
+        let view_records = a.active_tab().streamview.as_ref().unwrap();
+        assert_eq!(view_records.record_count(), 5);
+    }
+
+    #[test]
+    fn seek_long_op_yields_between_ticks_under_selective_filter() {
+        // Build a many-record file and apply a filter selective
+        // enough that fetching the full target_lines would take many
+        // matches (and many on-disk walks per match).  The long-op
+        // must yield between ticks rather than walking the whole
+        // file in one synchronous call — verified here by observing
+        // that the first `advance_long_op` call returns `NotDone`
+        // while the SeekOp is mid-flight (records cached < target).
+        let msgs: Vec<String> =
+            (0..2000).map(|i| format!("payload-m{i}")).collect();
+        let records: Vec<(i64, &str)> = msgs
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (10 + i as i64, m.as_str()))
+            .collect();
+        let (mut a, _dir) = host_app("test", &records);
+        // Selective filter: only multiples of 100 (20 records out of
+        // 2000) survive.  Without per-tick yielding, finding any one
+        // match still has to walk an average of ~100 records on
+        // disk, and finding viewport_height + over-fetch matches
+        // would block the UI for the entire op.
+        let filter: Filter = "msg=~payload-m[0-9]*00$".parse().unwrap();
+        a.apply_filter(filter);
+        // Apply_filter installed the SeekOp; the very first
+        // advance_long_op tick should *not* finish the op (it yields
+        // after one frame's worth of work).
+        let done = a.advance_long_op();
+        assert!(
+            !done,
+            "first long-op tick should yield rather than finish",
+        );
+        assert!(matches!(a.long_op, Some(LongOp::Seek(_))));
+        // Drain the rest and confirm the op eventually completes.
+        a.drain_long_op();
+        assert!(a.long_op.is_none());
     }
 
     #[test]

@@ -302,3 +302,9 @@ New tabs should still open with this dialog.
 - `R` binding to show raw JSON instead
 - `?` binding to pop up summary of key bindings
 - there should be an indication when you're at EOF
+- second search (e.g., by time):
+  - no feedback
+  - super slow navigation after that (not as slow as re-parsing everything)
+    - even showing all fields with F is super slow
+  - setting a bookmark, closing the tap, and going to that bookmark is fast
+- search history

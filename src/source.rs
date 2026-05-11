@@ -133,6 +133,30 @@ pub struct QueryRecord {
     pub raw: String,
 }
 
+/// One scan's worth of records plus accounting that lets the caller
+/// drive a progress bar and resume cleanly when a walks budget is in
+/// effect.
+///
+/// `walked_bytes` is the total bytes the scan consumed off disk —
+/// including records that were rejected by the filter and never made
+/// it into `records`.  Lets the TUI's long-op driver show meaningful
+/// percent-done feedback even during sparse filter regions, where
+/// many on-disk records get walked without any landing in the
+/// streamview.
+///
+/// `eof` is true when the scan ran out of records in the chosen
+/// direction (forward: hit EOF; backward: walked to byte 0).  When
+/// it's false but `records.len() < count`, the scan stopped because
+/// the caller's `max_walks` budget was reached; the caller can resume
+/// by issuing a fresh query from `offset + walked_bytes` (forward) or
+/// `offset - walked_bytes` (backward).
+#[derive(Debug)]
+pub struct QueryBatch {
+    pub records: Vec<QueryRecord>,
+    pub walked_bytes: u64,
+    pub eof: bool,
+}
+
 /// A non-event item surfaced by a source — either a true error
 /// encountered while reading (`Io`, `Parse`) or a non-fatal warning
 /// about the source's content (`OutOfOrder`).  All variants ride the
@@ -217,7 +241,33 @@ pub trait Source {
         direction: Direction,
         count: usize,
         filter: &Filter,
-    ) -> std::io::Result<Vec<QueryRecord>>;
+    ) -> std::io::Result<Vec<QueryRecord>> {
+        self.query_bounded(offset, direction, count, None, filter)
+            .map(|b| b.records)
+    }
+
+    /// Like [`Self::query`] but with a per-call records-walked budget
+    /// and an explicit "ran out of source" indicator.
+    ///
+    /// `max_walks` caps how many records (matching or not) the scan
+    /// will examine on disk before returning.  When the budget is hit
+    /// before either `count` matches or the source edge is reached,
+    /// the returned [`QueryBatch::eof`] is `false` and `records.len()`
+    /// may be under `count`; the caller can resume from
+    /// `offset ± walked_bytes` (forward / backward) to continue.
+    ///
+    /// Used by the TUI's long-op driver (g/G/filter rebuild) so each
+    /// tick walks only a bounded number of records and the UI gets a
+    /// chance to render the progress bar between ticks.  Passing
+    /// `None` for `max_walks` is equivalent to [`Self::query`].
+    fn query_bounded(
+        &self,
+        offset: ByteOffset,
+        direction: Direction,
+        count: usize,
+        max_walks: Option<usize>,
+        filter: &Filter,
+    ) -> std::io::Result<QueryBatch>;
 
     /// Returns this source's current size in bytes.
     ///
@@ -374,29 +424,42 @@ impl Source for FileSource {
         Ok(std::fs::metadata(&self.path)?.len())
     }
 
-    fn query(
+    fn query_bounded(
         &self,
         offset: ByteOffset,
         direction: Direction,
         count: usize,
+        max_walks: Option<usize>,
         filter: &Filter,
-    ) -> std::io::Result<Vec<QueryRecord>> {
+    ) -> std::io::Result<QueryBatch> {
         if count == 0 || self.metadata.excludes_all(filter) {
-            return Ok(Vec::new());
+            return Ok(QueryBatch {
+                records: Vec::new(),
+                walked_bytes: 0,
+                eof: true,
+            });
         }
         let mut file = File::open(&self.path)?;
         let len = file.seek(SeekFrom::End(0))?;
         let mut results = Vec::with_capacity(count);
+        let walked_bytes;
+        let eof;
         match direction {
             Direction::Forward => {
                 if offset.get() < len {
-                    scan_forward(
+                    let (walked, hit_end) = scan_forward(
                         &mut file,
                         offset.get(),
                         count,
+                        max_walks,
                         filter,
                         &mut results,
                     )?;
+                    walked_bytes = walked;
+                    eof = hit_end;
+                } else {
+                    walked_bytes = 0;
+                    eof = true;
                 }
             }
             Direction::Backward => {
@@ -404,40 +467,59 @@ impl Source for FileSource {
                 // gets the last `count` records as if they had asked
                 // from EOF in the first place.
                 let bounded = std::cmp::min(offset.get(), len);
-                scan_backward(
+                let (walked, hit_end) = scan_backward(
                     &mut file,
                     bounded,
                     count,
+                    max_walks,
                     filter,
                     &mut results,
                 )?;
+                walked_bytes = walked;
+                eof = hit_end;
             }
         }
-        Ok(results)
+        Ok(QueryBatch { records: results, walked_bytes, eof })
     }
 }
 
 /// Walks `file` forward from `start_offset`, parsing one line at a
 /// time and pushing accepted records (plus inline parse errors) into
-/// `results` until `count` records have been collected or EOF is
-/// reached.
+/// `results` until `count` records have been collected, `max_walks`
+/// records have been examined (when set), or EOF is reached.
+///
+/// Returns `(walked_bytes, eof)` so the caller can drive a progress
+/// bar (walked_bytes covers rejected records too) and distinguish a
+/// budget-exhausted partial scan from a true EOF: `eof` is `false`
+/// when the scan stopped because `max_walks` was hit but the source
+/// still has more records past `current_offset`.
 fn scan_forward(
     file: &mut File,
     start_offset: u64,
     count: usize,
+    max_walks: Option<usize>,
     filter: &Filter,
     results: &mut Vec<QueryRecord>,
-) -> std::io::Result<()> {
+) -> std::io::Result<(u64, bool)> {
     file.seek(SeekFrom::Start(start_offset))?;
     let mut reader = BufReader::new(file);
     let mut buf = String::new();
     let mut current_offset = start_offset;
+    let mut walks = 0usize;
+    let mut eof = false;
     while results.len() < count {
+        if let Some(max) = max_walks
+            && walks >= max
+        {
+            break;
+        }
         buf.clear();
         let n = reader.read_line(&mut buf)?;
         if n == 0 {
+            eof = true;
             break;
         }
+        walks += 1;
         let length = n as u64;
         let line = buf.trim_end_matches(['\r', '\n']);
         let parsed = serde_json::from_str::<Event>(line)
@@ -452,25 +534,40 @@ fn scan_forward(
         );
         current_offset += length;
     }
-    Ok(())
+    Ok((current_offset - start_offset, eof))
 }
 
 /// Walks `file` backward from `start_offset`, reading one record at
 /// a time (from its trailing `\n` back to the previous `\n` or BOF)
 /// and pushing accepted records (plus inline parse errors) into
-/// `results` until `count` records have been collected or BOF is
-/// reached.
+/// `results` until `count` records have been collected, `max_walks`
+/// records have been examined (when set), or BOF is reached.  Returns
+/// `(walked_bytes, eof)` — see [`scan_forward`] for the meaning of
+/// the `eof` flag.
 fn scan_backward(
     file: &mut File,
     start_offset: u64,
     count: usize,
+    max_walks: Option<usize>,
     filter: &Filter,
     results: &mut Vec<QueryRecord>,
-) -> std::io::Result<()> {
+) -> std::io::Result<(u64, bool)> {
     let mut cursor = start_offset;
-    while results.len() < count && cursor > 0 {
+    let mut walks = 0usize;
+    let mut eof = false;
+    while results.len() < count {
+        if let Some(max) = max_walks
+            && walks >= max
+        {
+            break;
+        }
+        if cursor == 0 {
+            eof = true;
+            break;
+        }
         let (record_start, bytes) = read_record_before(file, cursor)?;
         let length = cursor - record_start;
+        walks += 1;
         // Trim a single trailing `\r\n` or `\n` for parsing without
         // copying the bytes — `serde_json::from_slice` handles UTF-8
         // validation for us, so this stays bytes-only until parse.
@@ -498,7 +595,7 @@ fn scan_backward(
         );
         cursor = record_start;
     }
-    Ok(())
+    Ok((start_offset - cursor, eof))
 }
 
 /// Pushes a [`QueryRecord`] for a parsed line into `results`,

@@ -27,7 +27,7 @@ use crate::engine::{Cursor, Engine, MergeRecord};
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::render::{RenderOpts, format_event};
-use crate::source::{ByteOffset, SourceId};
+use crate::source::{ByteOffset, Direction, SourceId};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use std::collections::VecDeque;
@@ -151,8 +151,19 @@ enum Anchor {
 /// wall-clock time spent.
 #[derive(Clone, Debug, Default)]
 pub struct ParseStats {
+    /// Records appended to the window (i.e., records that passed the
+    /// filter).  Equals the number of filter-matching records read.
     pub records: u64,
+    /// Bytes of records that landed in the window.  Sum of `length`
+    /// across each appended `MergeRecord`.
     pub bytes: u64,
+    /// Total bytes scanned off disk while populating the window —
+    /// including bytes from records the filter rejected.  Under a
+    /// selective filter `walked_bytes` can be many orders of
+    /// magnitude larger than `bytes`; the TUI uses this for the
+    /// long-op progress bar so the percentage still ticks during
+    /// sparse-region walks.
+    pub walked_bytes: u64,
     pub elapsed: StdDuration,
 }
 
@@ -614,20 +625,50 @@ impl StreamView {
     ) -> WindowFillStatus {
         let target_lines = viewport_height as usize + OVER_FETCH_LINES;
         // Phase 1: initial population.  When the deque's empty or
-        // under target, fetch one batch in the anchor's preferred
-        // direction.  We only do one batch per call so the caller can
-        // render in between.  Phase 2 below resolves PinFront/PinBack
-        // to On once we're done filling.
+        // under target, fetch a *single* matching record in the
+        // anchor's preferred direction.  One match per call keeps each
+        // tick proportional to one match's worth of records walked —
+        // important under selective filters, where finding a batch's
+        // worth of matches (BATCH_SIZE = 64) can mean walking many
+        // thousands of on-disk records and freezing the UI.  The
+        // long-op driver calls us repeatedly within a time budget per
+        // frame, so multiple matches still get fetched per tick on
+        // non-selective filters.  Phase 2 below resolves
+        // PinFront/PinBack to On once we're done filling.
         let need_more = self.records.is_empty()
             || total_lines(&self.records) < target_lines;
         if need_more {
+            // Bounded fill: each tick walks a small, fixed slice of
+            // the file.  `batch_size = max_matches = 1` keeps the
+            // matched-record count low so we don't buffer up matches
+            // we'll discard on the next tick (each fresh stepper
+            // throws away its un-popped buf).  `max_walks` caps the
+            // per-tick wall time: under a 0.1%-selective filter,
+            // 4,000 walks ≈ 400 ms — enough that the per-fill setup
+            // cost amortizes against real work (the per-call file-
+            // open + scan_backward initialization dominates if we
+            // pick walks much smaller), but short enough that the
+            // user sees the progress bar tick several times per
+            // second.
+            const LONG_OP_BATCH: usize = 1;
+            const LONG_OP_WALKS_PER_FILL: usize = 4_000;
             let dir_eof = match self.anchor {
                 Anchor::PinBack => {
-                    self.extend_backward_batch(engine);
+                    self.extend_backward_small_batch(
+                        engine,
+                        LONG_OP_BATCH,
+                        LONG_OP_BATCH,
+                        LONG_OP_WALKS_PER_FILL,
+                    );
                     self.backward_eof
                 }
                 Anchor::PinFront | Anchor::On { .. } => {
-                    self.extend_forward_batch(engine);
+                    self.extend_forward_small_batch(
+                        engine,
+                        LONG_OP_BATCH,
+                        LONG_OP_BATCH,
+                        LONG_OP_WALKS_PER_FILL,
+                    );
                     self.forward_eof
                 }
                 Anchor::Empty => true,
@@ -786,21 +827,140 @@ impl StreamView {
         fetched
     }
 
-    /// Fetches up to `BATCH_SIZE` records backward and prepends them.
-    /// Returns the number actually fetched.
-    fn extend_backward_batch(&mut self, engine: &Engine) -> usize {
-        if self.backward_eof {
+    /// Like [`Self::extend_forward_batch`] but uses a stepper with a
+    /// small per-fill batch size and a per-fill walks budget so each
+    /// `query` call walks only a bounded number of on-disk records.
+    /// Used by the long-op driver behind `G`/`g`/filter rebuild —
+    /// under a selective filter, the default batch size (64 matches)
+    /// can force a fill to walk thousands of records per call and
+    /// freeze the UI for hundreds of milliseconds; the bounded
+    /// variant keeps each tick responsive even when the filter
+    /// rejects almost everything.  Returns the number of matches
+    /// added to the window.
+    fn extend_forward_small_batch(
+        &mut self,
+        engine: &Engine,
+        batch_size: usize,
+        max_matches: usize,
+        max_walks_per_fill: usize,
+    ) -> usize {
+        if self.forward_eof || max_matches == 0 {
             return 0;
         }
         let started = Instant::now();
-        let mut stepper =
-            engine.stepper(self.filter.clone(), &self.front_cursor);
+        let mut stepper = engine.stepper_with_bounds(
+            self.filter.clone(),
+            &self.back_cursor,
+            batch_size,
+            max_walks_per_fill,
+        );
+        let mut fetched = 0;
+        let mut bytes = 0u64;
+        for _ in 0..max_matches {
+            match stepper.step_forward() {
+                Some(record) => {
+                    bytes += record.length;
+                    fetched += 1;
+                    self.records
+                        .push_back(WindowEntry::new(record, &self.opts));
+                }
+                None => {
+                    // `step_forward` returns `None` either at true
+                    // forward EOF or when the budget expired before
+                    // a match surfaced.  Only set our own EOF flag
+                    // when every per-source window is genuinely
+                    // exhausted; otherwise leave it clear so the
+                    // next tick can resume scanning.
+                    if stepper.is_exhausted(Direction::Forward) {
+                        self.forward_eof = true;
+                    }
+                    break;
+                }
+            }
+        }
+        self.back_cursor = stepper.cursor();
+        self.parse_stats.walked_bytes += stepper.walked_bytes();
+        self.parse_stats.records += fetched as u64;
+        self.parse_stats.bytes += bytes;
+        self.parse_stats.elapsed += started.elapsed();
+        fetched
+    }
+
+    /// Fetches up to `BATCH_SIZE` records backward and prepends them.
+    /// Returns the number actually fetched.
+    fn extend_backward_batch(&mut self, engine: &Engine) -> usize {
+        self.extend_backward_batch_n(engine, BATCH_SIZE, BATCH_SIZE)
+    }
+
+    /// Symmetric to [`Self::extend_forward_small_batch`].
+    fn extend_backward_small_batch(
+        &mut self,
+        engine: &Engine,
+        batch_size: usize,
+        max_matches: usize,
+        max_walks_per_fill: usize,
+    ) -> usize {
+        if self.backward_eof || max_matches == 0 {
+            return 0;
+        }
+        let started = Instant::now();
+        let mut stepper = engine.stepper_with_bounds(
+            self.filter.clone(),
+            &self.front_cursor,
+            batch_size,
+            max_walks_per_fill,
+        );
+        let mut fetched = 0;
+        let mut bytes = 0u64;
+        for _ in 0..max_matches {
+            match stepper.step_backward() {
+                Some(record) => {
+                    bytes += record.length;
+                    fetched += 1;
+                    self.records
+                        .push_front(WindowEntry::new(record, &self.opts));
+                }
+                None => {
+                    if stepper.is_exhausted(Direction::Backward) {
+                        self.backward_eof = true;
+                    }
+                    break;
+                }
+            }
+        }
+        self.front_cursor = stepper.cursor();
+        self.parse_stats.walked_bytes += stepper.walked_bytes();
+        self.parse_stats.records += fetched as u64;
+        self.parse_stats.bytes += bytes;
+        self.parse_stats.elapsed += started.elapsed();
+        fetched
+    }
+
+    /// Backward counterpart of `extend_forward_*`.  `stepper_batch`
+    /// controls the per-fill batch size handed to the storage layer;
+    /// `max_matches` caps the number of records appended to the
+    /// window in this call.
+    fn extend_backward_batch_n(
+        &mut self,
+        engine: &Engine,
+        stepper_batch: usize,
+        max_matches: usize,
+    ) -> usize {
+        if self.backward_eof || max_matches == 0 {
+            return 0;
+        }
+        let started = Instant::now();
+        let mut stepper = engine.stepper_with_batch(
+            self.filter.clone(),
+            &self.front_cursor,
+            stepper_batch,
+        );
         let mut fetched = 0;
         let mut bytes = 0u64;
         // step_backward returns records in reverse time order; we
         // push them to the front, so the deque stays sorted oldest
         // first.
-        for _ in 0..BATCH_SIZE {
+        for _ in 0..max_matches {
             match stepper.step_backward() {
                 Some(record) => {
                     bytes += record.length;
@@ -1808,6 +1968,69 @@ mod tests {
     /// it would have reached.
     fn never_cancel() -> impl FnMut() -> bool {
         || false
+    }
+
+    #[test]
+    fn bounded_walks_preserve_multi_source_order() {
+        // Regression: the long-op driver bounds per-fill walks so the
+        // UI stays responsive on selective filters.  With multi-source
+        // merging, that means each source can hit its walks budget
+        // mid-scan with no match yet — and popping a record from a
+        // ready source before the others have walked to their next
+        // match would emit records out of time order.  Verify that
+        // the merge waits for every source to be ready (or at EOF)
+        // before popping.
+        let dir = TestDir::new();
+        // Three sources with interleaved-in-time matches.  Source A
+        // has a dense cluster early; source B has a single late
+        // match; source C is dense early.  Without the all-ready
+        // gate, the late B match could be popped before A and C have
+        // walked far enough to see their earlier records, scrambling
+        // the merge.
+        let engine = build_engine(
+            &[
+                ("a", &[10, 20, 30, 40, 50]),
+                ("b", &[1000]),
+                ("c", &[15, 25, 35, 45]),
+            ],
+            &dir,
+        );
+        let mut view =
+            StreamView::new(Filter::default(), RenderOpts::default());
+        view.prepare_seek_to_end(&engine).unwrap();
+        // Drain the streamview's window via the long-op step
+        // (bounded fills) until done — this exercises the
+        // per-source walks-budget path that the synchronous
+        // `seek_to_end` would skip.  Cap iterations to avoid an
+        // infinite loop if the implementation ever regresses to
+        // not-making-progress.
+        let mut iters = 0;
+        loop {
+            match view.ensure_window_step(&engine, 30) {
+                WindowFillStatus::Done => break,
+                WindowFillStatus::NotDone => {}
+            }
+            iters += 1;
+            if iters > 1000 {
+                panic!("ensure_window_step did not converge");
+            }
+        }
+        // Collect the materialized records' timestamps in deque
+        // (oldest-first) order and assert they're monotonically
+        // increasing.
+        let times: Vec<i64> = view
+            .records()
+            .filter_map(|(r, _)| match &r.event {
+                Ok(e) => Some(e.time.timestamp()),
+                Err(_) => None,
+            })
+            .collect();
+        let want = vec![10, 15, 20, 25, 30, 35, 40, 45, 50, 1000];
+        assert_eq!(
+            times, want,
+            "multi-source backward fill must preserve time order",
+        );
+        dir.cleanup();
     }
 
     #[test]

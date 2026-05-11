@@ -34,11 +34,18 @@ fn opposite(d: Direction) -> Direction {
     }
 }
 
-/// Per-fetch batch size.  Each refill of a [`SourceWindow`] asks the
-/// storage layer for up to this many matching records.  Larger batches
-/// amortize seek cost; smaller batches keep the maximum work per step
-/// bounded when the active filter rejects most records.
+/// Default per-fetch batch size.  Each refill of a [`SourceWindow`]
+/// asks the storage layer for up to this many matching records.
+/// Larger batches amortize seek cost; smaller batches keep the
+/// maximum work per step bounded when the active filter rejects most
+/// records (the storage layer walks until `count` matches are found,
+/// so the wall time per `query` call scales with this constant under
+/// selective filters).  The long-op driver behind `G`/`g`/filter
+/// rebuild overrides this with a small value via
+/// [`Engine::stepper_with_batch`] so each tick yields after a small
+/// chunk of walking and the UI stays responsive.
 const BATCH_SIZE: usize = 64;
+
 
 /// Maximum records held in either direction's buffer for a single
 /// source.  When a step would push beyond this, the oldest entry on
@@ -248,25 +255,69 @@ impl<'a> SourceWindow<'a> {
     /// Ensures the head of `dir`'s buffer is populated, fetching from
     /// the storage layer when needed.  No-op when the buffer is
     /// non-empty or the direction is already known to be exhausted.
-    fn fill(&mut self, dir: Direction, filter: &Filter) {
+    /// Returns the number of bytes the query walked off disk —
+    /// including bytes from records the filter rejected.
+    fn fill(
+        &mut self,
+        dir: Direction,
+        filter: &Filter,
+        batch_size: usize,
+        max_walks: Option<usize>,
+    ) -> u64 {
         if !self.buf(dir).is_empty() || self.eof(dir) {
-            return;
+            return 0;
         }
         // A backward query at offset 0 has no records to return — short
         // circuit so we don't even open the file.
         if matches!(dir, Direction::Backward) && self.position.get() == 0 {
             self.set_eof(dir, true);
-            return;
+            return 0;
         }
-        match self.source.query(self.position, dir, BATCH_SIZE, filter) {
-            Ok(records) => {
-                if records.len() < BATCH_SIZE {
+        match self.source.query_bounded(
+            self.position,
+            dir,
+            batch_size,
+            max_walks,
+            filter,
+        ) {
+            Ok(batch) => {
+                if batch.eof {
                     self.set_eof(dir, true);
                 }
+                let walked = batch.walked_bytes;
+                // When the bounded query walked records without
+                // finding any match (budget exhausted in a sparse
+                // filter region), advance our position to the scan's
+                // end so the next fill picks up where this one
+                // stopped — otherwise we'd loop forever re-scanning
+                // the same prefix.  When matches *were* found, leave
+                // position alone: `pop` will set it to the
+                // most-recently-popped record's offset, which is the
+                // right cursor for both `stepper.cursor()` and the
+                // next refill.  (Some records in the scanned region
+                // past the last match may be re-walked on the next
+                // refill; that redundancy is bounded by `batch_size`
+                // and is the cost of keeping `pop`'s position
+                // semantics intact.)
+                if batch.records.is_empty() && !batch.eof {
+                    match dir {
+                        Direction::Forward => {
+                            self.position = ByteOffset::from(
+                                self.position.get().saturating_add(walked),
+                            );
+                        }
+                        Direction::Backward => {
+                            self.position = ByteOffset::from(
+                                self.position.get().saturating_sub(walked),
+                            );
+                        }
+                    }
+                }
                 let buf = self.buf_mut(dir);
-                for r in records {
+                for r in batch.records {
                     buf.push_back(BufferedRecord::from(r));
                 }
+                walked
             }
             Err(e) => {
                 // Surface the I/O failure inline as a synthetic
@@ -282,6 +333,7 @@ impl<'a> SourceWindow<'a> {
                 };
                 self.buf_mut(dir).push_back(synth);
                 self.set_eof(dir, true);
+                0
             }
         }
     }
@@ -340,6 +392,18 @@ impl<'a> SourceWindow<'a> {
 pub struct Stepper<'a> {
     sources: Vec<SourceWindow<'a>>,
     filter: Filter,
+    batch_size: usize,
+    /// When `Some(n)`, each [`SourceWindow::fill`] examines at most
+    /// `n` records (matching *or* filtered) before returning.  Lets
+    /// the long-op driver bound the wall time per fill on selective
+    /// filters where a single batch of matches would otherwise force
+    /// the underlying scan to walk thousands of on-disk records.
+    max_walks_per_fill: Option<usize>,
+    /// Running total of bytes the stepper's fills have walked off
+    /// disk — including bytes from records the filter rejected.
+    /// Surfaced to callers via [`Self::walked_bytes`] so the TUI's
+    /// progress bar can tick even when fills produce no matches.
+    walked_bytes: u64,
 }
 
 impl<'a> Stepper<'a> {
@@ -350,6 +414,31 @@ impl<'a> Stepper<'a> {
         filter: Filter,
         cursor: &Cursor,
     ) -> Self {
+        Self::with_bounds(sources, filter, cursor, BATCH_SIZE, None)
+    }
+
+    /// Internal constructor that lets the caller override the per-fill
+    /// batch size.  Public callers go through
+    /// [`super::Engine::stepper_with_batch`].
+    pub(super) fn with_batch_size(
+        sources: Vec<&'a dyn Source>,
+        filter: Filter,
+        cursor: &Cursor,
+        batch_size: usize,
+    ) -> Self {
+        Self::with_bounds(sources, filter, cursor, batch_size, None)
+    }
+
+    /// Internal constructor that lets the caller override both the
+    /// per-fill batch size and a per-fill walks budget.  Public
+    /// callers go through [`super::Engine::stepper_with_bounds`].
+    pub(super) fn with_bounds(
+        sources: Vec<&'a dyn Source>,
+        filter: Filter,
+        cursor: &Cursor,
+        batch_size: usize,
+        max_walks_per_fill: Option<usize>,
+    ) -> Self {
         let windows = sources
             .into_iter()
             .map(|s| {
@@ -357,7 +446,28 @@ impl<'a> Stepper<'a> {
                 SourceWindow::new(s, pos)
             })
             .collect();
-        Self { sources: windows, filter }
+        Self {
+            sources: windows,
+            filter,
+            batch_size,
+            max_walks_per_fill,
+            walked_bytes: 0,
+        }
+    }
+
+    /// Total bytes the stepper has walked off disk since construction
+    /// (matching plus filter-rejected records).
+    pub fn walked_bytes(&self) -> u64 {
+        self.walked_bytes
+    }
+
+    /// True iff every per-source window has hit EOF in `dir`.  Used
+    /// by callers running the stepper under a per-fill walks budget
+    /// to distinguish a budget-exhausted `step` (returns `None` but
+    /// has more records to find on a subsequent call) from real
+    /// source exhaustion.
+    pub fn is_exhausted(&self, dir: Direction) -> bool {
+        self.sources.iter().all(|s| s.eof(dir))
     }
 
     /// Returns the active filter.
@@ -402,8 +512,46 @@ impl<'a> Stepper<'a> {
     }
 
     fn step(&mut self, dir: Direction) -> Option<MergeRecord> {
-        for s in &mut self.sources {
-            s.fill(dir, &self.filter);
+        // Multi-source merge requires every source to be "ready" —
+        // either holding a buffered head or at EOF in this direction
+        // — before we can safely pick one to pop.  Without that, a
+        // selective filter under a bounded walks budget can leave one
+        // source mid-scan while another has surfaced its next match;
+        // popping that match would emit a record out of time order
+        // (the still-scanning source could turn up a record with a
+        // closer time on a later fill).  Keep filling non-ready
+        // sources until every one of them either has a head or has
+        // hit its direction's edge.
+        loop {
+            let mut progressed = false;
+            for s in &mut self.sources {
+                if !s.buf(dir).is_empty() || s.eof(dir) {
+                    continue;
+                }
+                let walked = s.fill(
+                    dir,
+                    &self.filter,
+                    self.batch_size,
+                    self.max_walks_per_fill,
+                );
+                self.walked_bytes += walked;
+                progressed = true;
+            }
+            let all_ready = self
+                .sources
+                .iter()
+                .all(|s| !s.buf(dir).is_empty() || s.eof(dir));
+            if all_ready {
+                break;
+            }
+            if !progressed {
+                // Pathological guard: every non-ready source's fill
+                // returned with the source still not ready *and* not
+                // EOF.  Could happen if `max_walks_per_fill` is zero
+                // (no work allowed) or fill silently no-ops.  Bail
+                // out rather than spin.
+                break;
+            }
         }
         let idx = pick(&self.sources, dir)?;
         Some(self.sources[idx].pop(dir))
@@ -1002,15 +1150,17 @@ mod tests {
         {
             self.inner.events()
         }
-        fn query(
+        fn query_bounded(
             &self,
             offset: ByteOffset,
             direction: Direction,
             count: usize,
+            max_walks: Option<usize>,
             filter: &Filter,
-        ) -> std::io::Result<Vec<QueryRecord>> {
+        ) -> std::io::Result<crate::source::QueryBatch> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            self.inner.query(offset, direction, count, filter)
+            self.inner
+                .query_bounded(offset, direction, count, max_walks, filter)
         }
         fn byte_len(&self) -> std::io::Result<u64> {
             self.inner.byte_len()

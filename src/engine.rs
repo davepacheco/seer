@@ -82,6 +82,55 @@ impl Engine {
         Stepper::new(sources, filter, cursor)
     }
 
+    /// Like [`Self::stepper`] but lets the caller override the
+    /// per-fill batch size that the stepper hands to the storage
+    /// layer.  The TUI's long-op driver passes a small value (see
+    /// [`crate::engine::merge::LONG_OP_BATCH_SIZE`]) so each `query`
+    /// walks only a bounded number of records before yielding —
+    /// without it, a single fill under a selective filter can freeze
+    /// the UI for hundreds of milliseconds at a time.
+    pub fn stepper_with_batch(
+        &self,
+        filter: Filter,
+        cursor: &Cursor,
+        batch_size: usize,
+    ) -> Stepper<'_> {
+        let sources: Vec<&dyn Source> = self
+            .sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| s.as_ref())
+            .collect();
+        Stepper::with_batch_size(sources, filter, cursor, batch_size)
+    }
+
+    /// Like [`Self::stepper_with_batch`] but also lets the caller
+    /// impose a per-fill records-walked budget.  The long-op driver
+    /// uses this to cap the wall time spent inside a single
+    /// `stepper.step` call under selective filters that have to walk
+    /// many on-disk records per match.
+    pub fn stepper_with_bounds(
+        &self,
+        filter: Filter,
+        cursor: &Cursor,
+        batch_size: usize,
+        max_walks_per_fill: usize,
+    ) -> Stepper<'_> {
+        let sources: Vec<&dyn Source> = self
+            .sources
+            .iter()
+            .filter(|s| filter.matches_source_id(s.id()))
+            .map(|s| s.as_ref())
+            .collect();
+        Stepper::with_bounds(
+            sources,
+            filter,
+            cursor,
+            batch_size,
+            Some(max_walks_per_fill),
+        )
+    }
+
     /// Sum of `byte_len()` over every source whose id is accepted by
     /// `filter`'s source-id predicates.  Used as the denominator for a
     /// progress bar over a full-file pass: a long-running operation
