@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 3 complete.  Next phase: **4. Save policy.**
+Phase 4 complete.  Next phase: **5. TUI wiring.**
 
 ## Goal
 
@@ -376,9 +376,25 @@ a note when a phase moves to in-progress or done.
     empty-store / empty-session-sources, the kind-then-recency sort,
     and the corrupt-file skip.  460 tests pass.
 
-- [ ] **4. Save policy.**  The dirty-flag + debounce predicate,
+- [x] **4. Save policy.**  The dirty-flag + debounce predicate,
   plus a unit test for the policy itself (no I/O — just the
   decisions).
+  - Landed in new module `src/save_policy.rs`.  `Cadence
+    { Inline, Debounced }` distinguishes user-visible low-frequency
+    mutations from per-pixel ones.  `SavePolicy` holds `dirty:
+    bool`, `last_saved_at: Option<Instant>`, and a debounce
+    `Duration`; the TUI never touches those fields directly.  API:
+    `new(debounce)`, `record(Cadence) -> bool` (true means
+    "flush now"), `due(now) -> bool` (true once the window has
+    elapsed since the last `mark_saved`), `dirty() -> bool` for the
+    exit check, and `mark_saved(now)` to clear the dirty bit and
+    restart the window.  `DEFAULT_DEBOUNCE = 10s`.  Tests pass
+    `Instant`s by addition from a single `t0()` baseline so they're
+    deterministic without a clock trait.  9 unit tests cover the
+    fresh state, both cadences, the debounce boundary, mark_saved,
+    and the inline-after-debounced / debounced-after-inline
+    sequences.  Re-exported `Cadence` and `SavePolicy` from
+    `src/lib.rs`.  469 tests pass.
 
 - [ ] **5. TUI wiring.**  Startup dialog, plumb the policy into
   the TUI event loop, save inline on low-cadence mutations and

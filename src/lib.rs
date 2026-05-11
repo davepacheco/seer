@@ -8,6 +8,7 @@ pub mod engine;
 pub mod event;
 pub mod filter;
 pub mod render;
+pub mod save_policy;
 pub mod session;
 pub mod session_store;
 pub mod source;
@@ -26,6 +27,7 @@ pub use filter::{Filter, FilterParseError, Predicate, TimeOp};
 pub use render::{
     HostnameDisplay, RenderOpts, format_event, format_time, short_hostname,
 };
+pub use save_policy::{Cadence, SavePolicy};
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,
     SessionSource, Tab,
