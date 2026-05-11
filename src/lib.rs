@@ -9,6 +9,7 @@ pub mod event;
 pub mod filter;
 pub mod render;
 pub mod session;
+pub mod session_store;
 pub mod source;
 pub mod stream;
 pub mod streamview;
@@ -27,6 +28,9 @@ pub use render::{
 };
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session, Tab,
+};
+pub use session_store::{
+    STATE_DIR_ENV, SessionId, SessionIdParseError, SessionStore, StoreError,
 };
 pub use source::{
     ByteOffset, Direction, FileSource, QueryRecord, Source, SourceError,

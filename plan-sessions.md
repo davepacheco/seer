@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Not started.  Next phase: **1. Storage primitives.**
+Phase 1 complete.  Next phase: **2. Schema fields + fixture.**
 
 ## Goal
 
@@ -313,9 +313,20 @@ knows about ratatui.
 Each phase is independently mergeable.  Update the checkbox and add
 a note when a phase moves to in-progress or done.
 
-- [ ] **1. Storage primitives.**  `SessionId`, `session_store`
+- [x] **1. Storage primitives.**  `SessionId`, `session_store`
   load/save/list, `SEER_STATE_DIR` resolution, atomic write, unit
   tests.  No integration with the TUI yet.
+  - Landed in `src/session_store.rs`; re-exports added to
+    `src/lib.rs`.  `SessionId` is an 8-char hex newtype (UUIDv4
+    first four bytes) with `Display`/`FromStr`/`Serialize`/
+    `Deserialize`.  `SessionStore::{open, open_at, load, save,
+    list, path_for, sessions_dir}`.  `resolve_state_dir` takes an
+    `env_lookup` closure so the env-var-override path is testable
+    without mutating the process environment.  Added `etcetera =
+    "0.11.0"` as a dependency.  13 unit tests in
+    `session_store::tests` covering id round-trips, save/load,
+    `list` filtering, the no-`.tmp`-leftovers atomicity contract,
+    and the env-override fallback.
 
 - [ ] **2. Schema fields + fixture.**  Add `id`, `sources` (with
   `mtime` and `size`), `created_at`, `last_saved_at`, `last_pid`

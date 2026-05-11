@@ -47,6 +47,7 @@ camino = "1.2.1"
 chrono = { version = "0.4.42", default-features = false, features = ["serde", "std", "clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
 derive_more = { version = "2.0.1", features = ["as_ref", "display", "from"] }
+etcetera = "0.11.0"
 iddqd = { version = "0.3.13", features = ["serde"] }
 ratatui = "0.30.0"
 regex = "1.11.3"
