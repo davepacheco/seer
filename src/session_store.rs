@@ -14,14 +14,17 @@
 //! Writes go through a sibling `.tmp` file plus a rename so a crash
 //! mid-write can't leave a truncated session behind.
 //!
-//! This module is filesystem mechanics only.  Higher-level concerns
-//! (session discovery, save policy) live elsewhere — see
+//! This module owns the filesystem mechanics — paths, atomic write,
+//! enumeration — and the path-set discovery that picks resumable
+//! sessions out of the directory.  Higher-level concerns (the save
+//! policy and the TUI's resume dialog) live elsewhere; see
 //! `plan-sessions.md` for the layering.
 
 use crate::session::Session;
 use camino::{Utf8Path, Utf8PathBuf};
 use etcetera::{BaseStrategy, choose_base_strategy};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -188,6 +191,39 @@ pub enum StoreError {
     Serialize(#[source] serde_json::Error),
 }
 
+/// Classification of how a saved session's source set relates to the
+/// paths the user supplied on the command line.
+///
+/// Variants are declared in display order: sorting a `Vec<SessionMatch>`
+/// by `kind` puts exact matches above supersets above overlaps, which
+/// is the order the resume dialog will want.  Sessions that share no
+/// path with the user are not classified at all — `find_matches` drops
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MatchKind {
+    /// The session's sources are exactly the user's path set.
+    Exact,
+    /// The session's sources include every user path, plus extras.
+    Superset,
+    /// The session shares at least one source with the user, but the
+    /// sets are neither equal nor is the session a strict superset.
+    Overlap,
+}
+
+/// A saved session whose source set overlaps the paths the user
+/// supplied on the command line.
+///
+/// Carries the full deserialized [`Session`] so the resume dialog can
+/// render its preview row (id, last_saved_at, tab count, source count)
+/// and resume into it without a second `load()`.
+#[derive(Debug, Clone)]
+pub struct SessionMatch {
+    /// How this session's sources relate to the user's paths.
+    pub kind: MatchKind,
+    /// The session itself.
+    pub session: Session,
+}
+
 /// Handle to the on-disk session directory.
 ///
 /// Owns the absolute path of the sessions directory and ensures it
@@ -272,6 +308,52 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Returns the saved sessions whose source set overlaps
+    /// `user_paths`, classified by overlap and ordered for display.
+    ///
+    /// `user_paths` should already be canonical (per
+    /// [`std::fs::canonicalize`]); the session sources were captured
+    /// canonical at open time, so the comparison is path-string
+    /// equality.  Sessions whose JSON fails to parse are skipped —
+    /// they would not be resumable anyway, and there is no useful
+    /// action a caller could take with a half-loaded session.
+    ///
+    /// The returned matches are sorted exact first, then by
+    /// `last_saved_at` descending.
+    pub fn find_matches(
+        &self,
+        user_paths: &[Utf8PathBuf],
+    ) -> Result<Vec<SessionMatch>, StoreError> {
+        let user_set: BTreeSet<&Utf8Path> =
+            user_paths.iter().map(|p| p.as_path()).collect();
+
+        let ids = self.list()?;
+        let mut matches = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Parse failures are silently skipped — a session we can't
+            // deserialize can't be resumed.  The file stays on disk so
+            // a human can investigate.
+            let Ok(session) = self.load(id) else { continue };
+            let session_set: BTreeSet<&Utf8Path> =
+                session.sources.iter().map(|s| s.path.as_path()).collect();
+            if let Some(kind) = classify(&user_set, &session_set) {
+                matches.push(SessionMatch { kind, session });
+            }
+        }
+
+        // Exact first (MatchKind ordering), most recent within each
+        // kind.  `last_saved_at` is set by the saver, so the latest
+        // session at the top is the one the user almost certainly
+        // wants.
+        matches.sort_by(|a, b| {
+            a.kind.cmp(&b.kind).then_with(|| {
+                b.session.last_saved_at.cmp(&a.session.last_saved_at)
+            })
+        });
+
+        Ok(matches)
+    }
+
     /// Enumerates session ids in the store.
     ///
     /// `.tmp` files (left over from a crashed save) and filenames
@@ -297,6 +379,31 @@ impl SessionStore {
     }
 }
 
+/// Classifies a session against the user's command-line path set.
+///
+/// Returns `None` for sessions the caller should drop: either side
+/// being empty, or no shared paths.
+fn classify(
+    user: &BTreeSet<&Utf8Path>,
+    session: &BTreeSet<&Utf8Path>,
+) -> Option<MatchKind> {
+    if user.is_empty() || session.is_empty() {
+        return None;
+    }
+    if user == session {
+        return Some(MatchKind::Exact);
+    }
+    if user.is_subset(session) {
+        // Sets aren't equal (checked above), so the session has every
+        // user path plus at least one extra.
+        return Some(MatchKind::Superset);
+    }
+    if !user.is_disjoint(session) {
+        return Some(MatchKind::Overlap);
+    }
+    None
+}
+
 /// Resolves the seer state directory.
 ///
 /// `env_lookup` is passed the env var name and returns its value if
@@ -320,11 +427,11 @@ fn resolve_state_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Session, Tab};
+    use crate::session::{Session, SessionSource, Tab};
     use crate::stream::{LogStream, LogStreamPosition};
     use crate::source::SourceId;
     use camino_tempfile::tempdir;
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
 
     fn session_with_one_tab() -> Session {
         let stream = LogStream::new("Tab 1".to_string());
@@ -340,6 +447,36 @@ mod tests {
             )),
         });
         s
+    }
+
+    fn t(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).single().unwrap()
+    }
+
+    /// Builds and saves a session with the given source paths and
+    /// `last_saved_at` timestamp.  Returns the new session id.
+    fn save_with_sources(
+        store: &SessionStore,
+        paths: &[&str],
+        last_saved_at_secs: i64,
+    ) -> SessionId {
+        let mut s = Session::new();
+        s.last_saved_at = t(last_saved_at_secs);
+        for p in paths {
+            s.sources.push(SessionSource {
+                id: SourceId::from((*p).to_string()),
+                path: Utf8PathBuf::from(*p),
+                mtime: t(0),
+                size: 0,
+            });
+        }
+        let id = s.id;
+        store.save(id, &s).unwrap();
+        id
+    }
+
+    fn user_paths(paths: &[&str]) -> Vec<Utf8PathBuf> {
+        paths.iter().map(|p| Utf8PathBuf::from(*p)).collect()
     }
 
     #[test]
@@ -521,5 +658,156 @@ mod tests {
             got.ends_with("seer"),
             "expected fallback path to end in 'seer', got {got}"
         );
+    }
+
+    #[test]
+    fn find_matches_classifies_exact_match() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let id = save_with_sources(&store, &["/log/a", "/log/b"], 100);
+
+        let matches =
+            store.find_matches(&user_paths(&["/log/a", "/log/b"])).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, MatchKind::Exact);
+        assert_eq!(matches[0].session.id, id);
+
+        // Order of user paths should not matter.
+        let matches =
+            store.find_matches(&user_paths(&["/log/b", "/log/a"])).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, MatchKind::Exact);
+    }
+
+    #[test]
+    fn find_matches_classifies_superset() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        save_with_sources(&store, &["/log/a", "/log/b", "/log/c"], 100);
+
+        let matches =
+            store.find_matches(&user_paths(&["/log/a", "/log/b"])).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, MatchKind::Superset);
+    }
+
+    #[test]
+    fn find_matches_classifies_overlap() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        // Session has b and c; user asks for a and b.  Sets overlap on
+        // b but neither contains the other.
+        save_with_sources(&store, &["/log/b", "/log/c"], 100);
+
+        let matches =
+            store.find_matches(&user_paths(&["/log/a", "/log/b"])).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].kind, MatchKind::Overlap);
+    }
+
+    #[test]
+    fn find_matches_skips_disjoint_sessions() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        save_with_sources(&store, &["/log/a"], 100);
+
+        let matches = store.find_matches(&user_paths(&["/log/b"])).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_returns_empty_for_empty_user_paths() {
+        // With no user paths, no session can overlap.  The caller (the
+        // resume dialog) is responsible for treating an empty path
+        // list as "show all sessions" if that's what it wants.
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        save_with_sources(&store, &["/log/a"], 100);
+
+        let matches = store.find_matches(&[]).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_skips_sessions_with_no_sources() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        // An empty session (e.g. one created but never opened against
+        // a file) can't overlap with any user paths.
+        save_with_sources(&store, &[], 100);
+
+        let matches = store.find_matches(&user_paths(&["/log/a"])).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_returns_empty_when_store_is_empty() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let matches = store.find_matches(&user_paths(&["/log/a"])).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_matches_orders_by_kind_then_recency() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+
+        // For user query [a, x]:
+        //   exact_old, exact_new  — sources [a, x]      → Exact
+        //   superset              — sources [a, x, b]   → Superset
+        //   overlap               — sources [a, c]      → Overlap
+        //                                                 (shares a but
+        //                                                 not x, and not
+        //                                                 a superset)
+        //   disjoint              — sources [d]         → skipped
+        //
+        // Note: the Superset and Overlap rows have *newer*
+        // last_saved_at than the Exact rows.  Kind should still take
+        // precedence over recency.
+        let exact_old = save_with_sources(&store, &["/log/a", "/log/x"], 100);
+        let exact_new = save_with_sources(&store, &["/log/a", "/log/x"], 200);
+        let superset =
+            save_with_sources(&store, &["/log/a", "/log/x", "/log/b"], 500);
+        let overlap = save_with_sources(&store, &["/log/a", "/log/c"], 400);
+        let _disjoint = save_with_sources(&store, &["/log/d"], 600);
+
+        let matches = store
+            .find_matches(&user_paths(&["/log/a", "/log/x"]))
+            .unwrap();
+        let got: Vec<(MatchKind, SessionId)> =
+            matches.iter().map(|m| (m.kind, m.session.id)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (MatchKind::Exact, exact_new),
+                (MatchKind::Exact, exact_old),
+                (MatchKind::Superset, superset),
+                (MatchKind::Overlap, overlap),
+            ],
+            "exact first (newest within kind), then superset, then \
+             overlap; the disjoint session is dropped entirely"
+        );
+    }
+
+    #[test]
+    fn find_matches_skips_corrupt_session_files() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let good = save_with_sources(&store, &["/log/a"], 100);
+
+        // Drop a corrupt file named like a session into the
+        // directory.  list() will surface its id; load() will fail;
+        // find_matches() should silently skip it.
+        std::fs::write(
+            store.sessions_dir().join("deadbeef.json"),
+            "{ not valid",
+        )
+        .unwrap();
+
+        let matches = store.find_matches(&user_paths(&["/log/a"])).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session.id, good);
+        assert_eq!(matches[0].kind, MatchKind::Exact);
     }
 }

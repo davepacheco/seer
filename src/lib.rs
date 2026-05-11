@@ -31,7 +31,8 @@ pub use session::{
     SessionSource, Tab,
 };
 pub use session_store::{
-    STATE_DIR_ENV, SessionId, SessionIdParseError, SessionStore, StoreError,
+    MatchKind, STATE_DIR_ENV, SessionId, SessionIdParseError, SessionMatch,
+    SessionStore, StoreError,
 };
 pub use source::{
     ByteOffset, Direction, FileSource, QueryRecord, Source, SourceError,

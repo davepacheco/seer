@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 2 complete.  Next phase: **3. Discovery.**
+Phase 3 complete.  Next phase: **4. Save policy.**
 
 ## Goal
 
@@ -358,9 +358,23 @@ a note when a phase moves to in-progress or done.
     pattern they relied on no longer round-trips after the
     `#[serde(default)]` removal.  451 tests pass.
 
-- [ ] **3. Discovery.**  `find_matches(paths) -> Vec<Match>`,
+- [x] **3. Discovery.**  `find_matches(paths) -> Vec<Match>`,
   classified exact/superset/overlap.  Unit tests with a temp
   state dir.
+  - Added `MatchKind` (Exact/Superset/Overlap, ordered for display)
+    and `SessionMatch { kind, session }` in
+    `src/session_store.rs`.  `SessionStore::find_matches(&[Utf8PathBuf])
+    -> Vec<SessionMatch>` walks `list()`, deserializes each session,
+    compares the source-path set against the caller's set via a
+    `classify` helper using `BTreeSet<&Utf8Path>`, drops non-overlapping
+    or empty-set sessions, and sorts by `kind` ascending then
+    `last_saved_at` descending.  Parse errors on individual session
+    files are silently skipped — unresumable anyway, and the file
+    stays on disk for human investigation.  Re-exports added to
+    `src/lib.rs`.  Eight new tests in `session_store::tests` cover
+    exact / superset / overlap / disjoint / empty-user-paths /
+    empty-store / empty-session-sources, the kind-then-recency sort,
+    and the corrupt-file skip.  460 tests pass.
 
 - [ ] **4. Save policy.**  The dirty-flag + debounce predicate,
   plus a unit test for the policy itself (no I/O — just the
