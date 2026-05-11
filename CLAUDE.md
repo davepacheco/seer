@@ -287,17 +287,11 @@ New tabs should still open with this dialog.
 
 - parse SMF entries
 - parse CockroachDB log
-- persistent session state
-  - look up based on canonicalized filename
-  - dialog:
-    - resume previous session
-    - create new saved session
-    - create new session and don't save it
+- persistent session state (see separate plan)
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
 - `?` binding to pop up summary of key bindings
-- there should be an indication when you're at EOF
 - second search (e.g., by time):
   - no feedback
   - super slow navigation after that (not as slow as re-parsing everything)
