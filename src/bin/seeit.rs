@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     hostname: HostnameDisplay::Full,
                     show_pid: true,
                     show_name: true,
+                    show_raw: false,
                 };
                 for line in format_event(&ee.event, &opts) {
                     println!("{line}");

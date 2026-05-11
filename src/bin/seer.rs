@@ -1723,6 +1723,20 @@ impl App {
         self.rerender_after_stream_mutation(stream_id, stream);
     }
 
+    /// Toggles raw rendering on the active stream.  In raw mode each
+    /// record renders as its bytes from the source rather than the
+    /// formatted header/extras layout; the other column toggles
+    /// (date, hostname, name/pid, extras) are ignored.  Persisted on
+    /// the [`LogStream`] and applied to every tab targeting it.
+    fn toggle_show_raw(&mut self) {
+        let stream_id = self.tabs[self.active].stream;
+        let Some(mut stream) = self.session.streams.remove(&stream_id) else {
+            return;
+        };
+        stream.show_raw = !stream.show_raw;
+        self.rerender_after_stream_mutation(stream_id, stream);
+    }
+
     /// Replaces the active stream's [`RenderOpts`] with `opts`,
     /// persists it, and re-renders every tab targeting that stream.
     /// Used by the `h` field-display dialog, which mutates several
@@ -1793,6 +1807,14 @@ impl App {
     fn active_show_date(&self) -> bool {
         let stream_id = self.tabs[self.active].stream;
         self.session.streams.get(&stream_id).expect("stream exists").show_date
+    }
+
+    /// Returns whether the active stream is currently rendering its
+    /// records as raw bytes.  Used by the footer to show the R-key
+    /// state.
+    fn active_show_raw(&self) -> bool {
+        let stream_id = self.tabs[self.active].stream;
+        self.session.streams.get(&stream_id).expect("stream exists").show_raw
     }
 
     /// Returns the active stream's hostname-rendering mode.  Used by
@@ -2672,6 +2694,16 @@ impl App {
                     || modifiers == KeyModifiers::SHIFT =>
             {
                 self.toggle_show_date();
+            }
+            // `R`: toggle raw rendering — show each record's bytes
+            // from the source instead of the formatted header/extras
+            // layout.  Useful for inspecting fields the parser dropped
+            // or normalized.  NONE/SHIFT both accepted, like `D`/`F`.
+            KeyEvent { code: KeyCode::Char('R'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.toggle_show_raw();
             }
             // `h`: open the field-display dialog (timestamp format,
             // hostname mode, name/pid/extras visibility).  Replaces the
@@ -3739,22 +3771,24 @@ fn render(frame: &mut Frame, app: &mut App) {
             } else if total == 0 {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     h host={} · / search · </> step={} · \
+                     R raw={} · h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · 0/0",
                     if app.active_show_extras() { "on" } else { "off" },
                     if app.active_show_date() { "on" } else { "off" },
+                    if app.active_show_raw() { "on" } else { "off" },
                     hostname_display_label(app.active_hostname_display()),
                     app.current_step_label(),
                 )
             } else {
                 format!(
                     "q quit · f filter · F fields={} · D date={} · \
-                     h host={} · / search · </> step={} · \
+                     R raw={} · h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · {}-{} of {}",
                     if app.active_show_extras() { "on" } else { "off" },
                     if app.active_show_date() { "on" } else { "off" },
+                    if app.active_show_raw() { "on" } else { "off" },
                     hostname_display_label(app.active_hostname_display()),
                     app.current_step_label(),
                     top + 1,
@@ -6944,6 +6978,54 @@ mod tests {
         let stream_id = a.tabs[a.active].stream;
         let stream = restored.streams.get(&stream_id).unwrap();
         assert!(!stream.show_extras);
+    }
+
+    // ---------- show_raw toggle (R) ----------
+
+    #[test]
+    fn shift_r_toggles_show_raw_and_renders_raw_bytes() {
+        // With raw off, the formatted header carries the level/msg
+        // columns.  Toggle R: the rendered row becomes the JSON line
+        // from the source.  Toggle again: header returns.  Exercise
+        // both NONE and SHIFT modifier forms of `R`.
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[("build", r#""0.1.0""#)])]);
+        // multi_line_app enabled extras; the default (raw off) renders
+        // a header followed by one extras row.
+        assert!(!a.active_show_raw());
+        assert_eq!(a.active_tab().formatted.len(), 2);
+        assert!(a.active_tab().formatted[0].contains("INFO"));
+
+        a.handle_key(shift('R'));
+        assert!(a.active_show_raw());
+        // Raw mode is one line per record regardless of extras.
+        assert_eq!(a.active_tab().formatted.len(), 1);
+        assert!(
+            a.active_tab().formatted[0].starts_with('{')
+                && a.active_tab().formatted[0].contains(r#""msg":"first""#),
+            "raw row should be the source JSON: {:?}",
+            a.active_tab().formatted[0],
+        );
+
+        // Bare `R` (terminals without the SHIFT modifier) flips back.
+        a.handle_key(key(KeyCode::Char('R')));
+        assert!(!a.active_show_raw());
+        assert_eq!(a.active_tab().formatted.len(), 2);
+        assert!(a.active_tab().formatted[0].contains("INFO"));
+    }
+
+    #[test]
+    fn show_raw_persists_into_session_round_trip() {
+        // Toggling raw on must survive a session save/load cycle so
+        // the user doesn't have to flip R again every session.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        a.handle_key(shift('R'));
+        assert!(a.active_show_raw());
+        let json = serde_json::to_string(&a.session).unwrap();
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        let stream_id = a.tabs[a.active].stream;
+        let stream = restored.streams.get(&stream_id).unwrap();
+        assert!(stream.show_raw);
     }
 
     // ---------- show_date toggle (D) ----------

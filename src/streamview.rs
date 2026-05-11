@@ -100,11 +100,24 @@ impl WindowEntry {
 
 /// Renders a [`MergeRecord`] into one or more display lines.
 ///
-/// `Ok` events use [`format_event`] (header plus extras); `Err` events
-/// produce a single line carrying the [`MergeError`]'s `Display`
-/// message — matching the existing TUI behavior of surfacing parse
-/// errors inline next to events.
+/// When `opts.show_raw` is set, the record's raw bytes are returned
+/// verbatim (one line per record); otherwise `Ok` events use
+/// [`format_event`] (header plus extras) and `Err` events produce a
+/// single line carrying the [`MergeError`]'s `Display` message,
+/// matching the existing TUI behavior of surfacing parse errors inline
+/// next to events.
 fn format_record(record: &MergeRecord, opts: &RenderOpts) -> Vec<String> {
+    if opts.show_raw {
+        // Synthetic error placeholders (e.g. an I/O failure from the
+        // source) have empty `raw`; fall back to the error's Display
+        // so the row still says something meaningful.
+        if record.raw.is_empty()
+            && let Err(err) = &record.event
+        {
+            return vec![err.to_string()];
+        }
+        return vec![record.raw.clone()];
+    }
     match &record.event {
         Ok(event) => format_event(event, opts),
         Err(err) => vec![err.to_string()],
@@ -440,10 +453,16 @@ impl StreamView {
         if opts == self.opts {
             return;
         }
-        let extras_changed = opts.show_extras != self.opts.show_extras;
+        // Both `show_extras` and `show_raw` can collapse or expand the
+        // line count per record (raw flattens an `n+1`-line event into
+        // 1, extras adds/removes the trailing `n`).  When either
+        // changes, the anchor's exact line offset within the record
+        // can't be preserved, so snap to the record's first line.
+        let line_count_changed = opts.show_extras != self.opts.show_extras
+            || opts.show_raw != self.opts.show_raw;
         self.opts = opts;
         self.reformat_window();
-        if extras_changed
+        if line_count_changed
             && let Anchor::On { line, .. } = &mut self.anchor
         {
             *line = 0;
@@ -1504,6 +1523,47 @@ mod tests {
         o.show_extras = false;
         view.set_render_opts(o);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        dir.cleanup();
+    }
+
+    #[test]
+    fn set_show_raw_renders_raw_bytes_from_source() {
+        // Toggling `show_raw` should replace the formatted header with
+        // the literal JSON bytes the line was read as.  Verify both the
+        // toggle-on switch and the toggle-off return to the formatted
+        // header.
+        let dir = TestDir::new();
+        let engine = build_engine(&[("a", &[10])], &dir);
+        let mut view =
+            StreamView::new(Filter::default(), RenderOpts::default());
+        view.ensure_window(&engine, 20);
+
+        let formatted =
+            view.records().next().map(|(_, l)| l[0].to_string()).unwrap();
+        assert!(
+            formatted.contains("INFO") && formatted.contains("m10"),
+            "expected formatted header, got {formatted:?}",
+        );
+
+        let mut o = view.render_opts();
+        o.show_raw = true;
+        view.set_render_opts(o);
+        let (record, raw_lines) = view.records().next().unwrap();
+        assert_eq!(raw_lines.len(), 1, "raw mode is one line per record");
+        assert!(
+            raw_lines[0].starts_with('{') && raw_lines[0].contains(r#""msg":"m10""#),
+            "expected raw JSON line, got {:?}",
+            raw_lines[0],
+        );
+        // The stored raw matches the record's `raw` field exactly.
+        assert_eq!(raw_lines[0], record.raw);
+
+        // Toggle off: header returns.
+        o.show_raw = false;
+        view.set_render_opts(o);
+        let restored =
+            view.records().next().map(|(_, l)| l[0].to_string()).unwrap();
+        assert_eq!(restored, formatted);
         dir.cleanup();
     }
 

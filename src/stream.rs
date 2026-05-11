@@ -143,6 +143,12 @@ pub struct LogStream {
     /// quickest way to tell which component a given event came from.
     #[serde(default = "default_true")]
     pub show_name: bool,
+    /// when true, records render as the raw line bytes from the
+    /// source rather than the formatted header/extras layout.  Useful
+    /// for inspecting fields the parser dropped or normalized.
+    /// Defaults to false; toggled with `R` in the TUI.
+    #[serde(default)]
+    pub show_raw: bool,
 }
 
 fn default_true() -> bool {
@@ -167,6 +173,7 @@ impl LogStream {
             hostname_display: opts.hostname,
             show_pid: opts.show_pid,
             show_name: opts.show_name,
+            show_raw: opts.show_raw,
         }
     }
 
@@ -181,6 +188,7 @@ impl LogStream {
             hostname: self.hostname_display,
             show_pid: self.show_pid,
             show_name: self.show_name,
+            show_raw: self.show_raw,
         }
     }
 
@@ -194,6 +202,7 @@ impl LogStream {
         self.hostname_display = opts.hostname;
         self.show_pid = opts.show_pid;
         self.show_name = opts.show_name;
+        self.show_raw = opts.show_raw;
     }
 }
 

@@ -118,11 +118,19 @@ pub enum Direction {
 /// are surfaced inline rather than aborting the query, since a single
 /// bad line is rarely interesting enough to lose the rest of the
 /// file's events to.
+///
+/// `raw` is the record's bytes from the source, minus any trailing
+/// `\r`/`\n` terminator, decoded as UTF-8 (lossy on the rare invalid
+/// byte sequence).  Carried alongside the parsed event so the TUI can
+/// switch between formatted and raw rendering without re-reading the
+/// file.  Memory cost is bounded by the caller's window size, since
+/// `query` only returns up to `count` records per call.
 #[derive(Debug)]
 pub struct QueryRecord {
     pub offset: ByteOffset,
     pub length: u64,
     pub event: Result<Event, SourceError>,
+    pub raw: String,
 }
 
 /// A non-event item surfaced by a source — either a true error
@@ -439,6 +447,7 @@ fn scan_forward(
             ByteOffset(current_offset),
             length,
             parsed,
+            line.to_string(),
             filter,
         );
         current_offset += length;
@@ -471,13 +480,20 @@ fn scan_backward(
         {
             content_end -= 1;
         }
-        let parsed = serde_json::from_slice::<Event>(&bytes[..content_end])
+        let content = &bytes[..content_end];
+        let parsed = serde_json::from_slice::<Event>(content)
             .map_err(SourceError::from);
+        // Decode the trimmed bytes as UTF-8 for the raw view; lossy
+        // conversion preserves the rest of the line when a stray byte
+        // can't be decoded (rare in practice — JSON is UTF-8 by spec —
+        // but cheaper than carrying `Vec<u8>` through the render path).
+        let raw = String::from_utf8_lossy(content).into_owned();
         push_if_accepted(
             results,
             ByteOffset(record_start),
             length,
             parsed,
+            raw,
             filter,
         );
         cursor = record_start;
@@ -493,6 +509,7 @@ fn push_if_accepted(
     offset: ByteOffset,
     length: u64,
     parsed: Result<Event, SourceError>,
+    raw: String,
     filter: &Filter,
 ) {
     match parsed {
@@ -502,6 +519,7 @@ fn push_if_accepted(
                     offset,
                     length,
                     event: Ok(event),
+                    raw,
                 });
             }
         }
@@ -510,6 +528,7 @@ fn push_if_accepted(
                 offset,
                 length,
                 event: Err(e),
+                raw,
             });
         }
     }

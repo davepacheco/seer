@@ -123,6 +123,9 @@ pub struct MergeRecord {
     /// parsed event when the line was valid; otherwise the per-line
     /// parse or I/O error
     pub event: Result<Event, MergeError>,
+    /// the record's bytes as they appear in the source, minus any
+    /// trailing line terminator; empty for synthetic error placeholders
+    pub raw: String,
 }
 
 /// Per-line error surfaced by [`Stepper`].
@@ -162,12 +165,18 @@ struct BufferedRecord {
     offset: ByteOffset,
     length: u64,
     event: Result<Event, MergeError>,
+    raw: String,
 }
 
 impl From<QueryRecord> for BufferedRecord {
     fn from(record: QueryRecord) -> Self {
-        let QueryRecord { offset, length, event } = record;
-        Self { offset, length, event: event.map_err(MergeError::from) }
+        let QueryRecord { offset, length, event, raw } = record;
+        Self {
+            offset,
+            length,
+            event: event.map_err(MergeError::from),
+            raw,
+        }
     }
 }
 
@@ -269,6 +278,7 @@ impl<'a> SourceWindow<'a> {
                     offset: self.position,
                     length: 0,
                     event: Err(MergeError::from(SourceError::from(e))),
+                    raw: String::new(),
                 };
                 self.buf_mut(dir).push_back(synth);
                 self.set_eof(dir, true);
@@ -303,6 +313,7 @@ impl<'a> SourceWindow<'a> {
             offset: r.offset,
             length: r.length,
             event: r.event,
+            raw: r.raw,
         }
     }
 

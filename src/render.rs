@@ -128,6 +128,12 @@ pub struct RenderOpts {
     pub hostname: HostnameDisplay,
     pub show_pid: bool,
     pub show_name: bool,
+    /// When true, the stream renders each record as its raw bytes from
+    /// the source instead of the formatted header/extras layout.
+    /// Bypasses every other field in this struct: raw mode shows the
+    /// line as it appears on disk and ignores the column toggles.
+    /// Toggled with `R` in the TUI; persisted on the host log stream.
+    pub show_raw: bool,
 }
 
 impl Default for RenderOpts {
@@ -138,6 +144,7 @@ impl Default for RenderOpts {
             hostname: HostnameDisplay::Short,
             show_pid: false,
             show_name: true,
+            show_raw: false,
         }
     }
 }
@@ -222,6 +229,7 @@ mod tests {
             hostname,
             show_pid: true,
             show_name: true,
+            show_raw: false,
         }
     }
 
