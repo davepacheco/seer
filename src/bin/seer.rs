@@ -21,7 +21,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Tabs};
+use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
@@ -141,6 +141,57 @@ struct ParseStats {
 /// enough to fill any reasonable terminal so the initial fetch covers
 /// the visible area; the streamview will extend further if needed.
 const INITIAL_VIEWPORT_HEIGHT: u16 = 80;
+
+/// Returns the number of visual rows a `formatted` line will occupy
+/// when wrapped at `width` columns.
+///
+/// Approximates ratatui's `Paragraph::wrap` row count via
+/// `chars().count() / width` — accurate for the long unbroken JSON
+/// strings produced by raw mode (no whitespace to wrap on, so
+/// `break_words` falls back to column-boundary breaks) and within a
+/// row or two for whitespace-rich text.  An empty line is one row.
+/// `width == 0` collapses every line to one row (degenerate terminal
+/// size: don't divide by zero, and the user can't see anything
+/// anyway).
+fn visual_rows_for(line: &str, width: u16) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    line.chars().count().div_ceil(width as usize).max(1)
+}
+
+/// Splits `text` into successive slices that are each at most `width`
+/// characters wide, breaking at the column boundary regardless of word
+/// boundaries.  Used by the raw render path so a copied wrapped line
+/// can be re-joined by stripping newlines: with word-wrap, the wrap
+/// point can replace a space, leaving the copy ambiguous about
+/// whether the newline should re-expand to a space.  With column-wrap,
+/// the visual rows are contiguous bytes of the source line — stripping
+/// newlines recovers the original.
+///
+/// Empty input yields one empty slice so the caller always has at
+/// least one chunk to render.  `width == 0` (degenerate terminal)
+/// returns the whole line in one chunk to avoid a divide-by-zero.
+fn column_chunks(text: &str, width: u16) -> Vec<&str> {
+    if width == 0 || text.is_empty() {
+        return vec![text];
+    }
+    let width = width as usize;
+    let mut chunks = Vec::new();
+    let mut start_byte = 0;
+    let mut chars_in_chunk = 0;
+    // Walk by chars so we never split a multi-byte UTF-8 sequence.
+    for (byte_idx, _) in text.char_indices() {
+        if chars_in_chunk == width {
+            chunks.push(&text[start_byte..byte_idx]);
+            start_byte = byte_idx;
+            chars_in_chunk = 0;
+        }
+        chars_in_chunk += 1;
+    }
+    chunks.push(&text[start_byte..]);
+    chunks
+}
 
 /// Builds a Stream-tab's initial render state by populating a
 /// [`StreamView`] window and materializing it.
@@ -934,13 +985,14 @@ impl Tab {
         &mut self,
         engine: &Engine,
         viewport_height: u16,
+        viewport_width: u16,
     ) {
         let Some(view) = self.streamview.as_mut() else {
             self.viewport_top = 0;
             return;
         };
         view.seek_to_start(engine, viewport_height);
-        self.resync_from_streamview(viewport_height);
+        self.resync_from_streamview(viewport_height, viewport_width);
     }
 
     /// Resets the viewport to the end of the merged stream and rebuilds
@@ -950,13 +1002,14 @@ impl Tab {
         &mut self,
         engine: &Engine,
         viewport_height: u16,
+        viewport_width: u16,
     ) -> std::io::Result<()> {
         let Some(view) = self.streamview.as_mut() else {
-            self.viewport_top = self.max_top(viewport_height);
+            self.viewport_top = self.max_top(viewport_height, viewport_width);
             return Ok(());
         };
         view.seek_to_end(engine, viewport_height)?;
-        self.resync_from_streamview(viewport_height);
+        self.resync_from_streamview(viewport_height, viewport_width);
         Ok(())
     }
 
@@ -977,7 +1030,11 @@ impl Tab {
     /// the streamview's anchor.  Caller must have just driven a
     /// streamview operation that left the anchor on the desired
     /// record/line.  No-op for tabs without a [`StreamView`].
-    fn resync_from_streamview(&mut self, viewport_height: u16) {
+    fn resync_from_streamview(
+        &mut self,
+        viewport_height: u16,
+        viewport_width: u16,
+    ) {
         let Some(view) = self.streamview.as_ref() else {
             return;
         };
@@ -988,7 +1045,7 @@ impl Tab {
         self.event_for_line = rendered.event_for_line;
         self.first_line_for_event = rendered.first_line_for_event;
         self.parse_stats = rendered.parse_stats;
-        let max = self.max_top(viewport_height);
+        let max = self.max_top(viewport_height, viewport_width);
         self.viewport_top = anchor.min(max);
     }
 
@@ -1007,10 +1064,35 @@ impl Tab {
         next_first - 1
     }
 
-    /// Largest valid `viewport_top`: the line index that places the last
-    /// line of `formatted` flush with the bottom of the viewport.
-    fn max_top(&self, viewport_height: u16) -> usize {
-        self.formatted.len().saturating_sub(viewport_height as usize)
+    /// Largest valid `viewport_top`: the smallest logical-line index
+    /// whose tail still fits in `viewport_height` visual rows at
+    /// `viewport_width` columns.
+    ///
+    /// Walks backward from the last formatted line, accumulating each
+    /// line's wrapped row count, and returns the index of the first
+    /// line that would overflow.  Capped at `formatted.len() - 1` so
+    /// that even a single oversized line (whose wrap exceeds the
+    /// viewport on its own) stays reachable rather than scrolling off
+    /// the top.  Returns `0` when the entire buffer fits.  With
+    /// `viewport_width == 0` (degenerate terminal, or pre-render
+    /// fixtures), `visual_rows_for` collapses to one row per line and
+    /// the result matches the original `formatted.len() -
+    /// viewport_height` formula.
+    fn max_top(&self, viewport_height: u16, viewport_width: u16) -> usize {
+        if self.formatted.is_empty() {
+            return 0;
+        }
+        let viewport_height = viewport_height as usize;
+        let last_idx = self.formatted.len() - 1;
+        let mut visual_used: usize = 0;
+        for i in (0..=last_idx).rev() {
+            let rows = visual_rows_for(&self.formatted[i], viewport_width);
+            visual_used = visual_used.saturating_add(rows);
+            if visual_used > viewport_height {
+                return (i + 1).min(last_idx);
+            }
+        }
+        0
     }
 
     /// Scrolls `n` display lines forward.  For streamview-backed tabs
@@ -1025,12 +1107,13 @@ impl Tab {
         engine: &Engine,
         n: usize,
         viewport_height: u16,
+        viewport_width: u16,
     ) {
         if let Some(view) = self.streamview.as_mut() {
             view.scroll_lines(engine, n as isize, viewport_height);
-            self.resync_from_streamview(viewport_height);
+            self.resync_from_streamview(viewport_height, viewport_width);
         } else {
-            let max = self.max_top(viewport_height);
+            let max = self.max_top(viewport_height, viewport_width);
             self.viewport_top = (self.viewport_top + n).min(max);
         }
     }
@@ -1041,10 +1124,11 @@ impl Tab {
         engine: &Engine,
         n: usize,
         viewport_height: u16,
+        viewport_width: u16,
     ) {
         if let Some(view) = self.streamview.as_mut() {
             view.scroll_lines(engine, -(n as isize), viewport_height);
-            self.resync_from_streamview(viewport_height);
+            self.resync_from_streamview(viewport_height, viewport_width);
         } else {
             self.viewport_top = self.viewport_top.saturating_sub(n);
         }
@@ -1138,12 +1222,13 @@ impl Tab {
         engine: &Engine,
         delta: chrono::Duration,
         viewport_height: u16,
+        viewport_width: u16,
     ) {
         if let Some(view) = self.streamview.as_mut() {
             // Lazy path: walks the engine's stepper, fetching only as
             // far as needed to land on the target time.
             view.advance_time(engine, delta, viewport_height);
-            self.resync_from_streamview(viewport_height);
+            self.resync_from_streamview(viewport_height, viewport_width);
             return;
         }
         // Fallback for tabs without a StreamView (test fixtures and
@@ -1158,7 +1243,7 @@ impl Tab {
             .event
             .time;
         let target = anchor_time + delta;
-        let max = self.max_top(viewport_height);
+        let max = self.max_top(viewport_height, viewport_width);
         let new_event = if go_forward {
             self.events.iter().enumerate().skip(anchor_idx).find_map(
                 |(i, e)| {
@@ -1234,6 +1319,12 @@ struct App {
     next_tab_number: usize,
     /// Updated on each [`render`] call from the actual frame size.
     viewport_height: u16,
+    /// Width of the content area in columns.  Updated on each
+    /// [`render`] call from the actual frame size.  Used together with
+    /// [`Self::viewport_height`] to compute visual row counts for
+    /// wrapped lines (so `max_top` and the footer's range stay
+    /// accurate when long lines span multiple terminal rows).
+    viewport_width: u16,
     quit: bool,
     /// When `Some`, this dialog is open and intercepts all keys.
     dialog: Option<Dialog>,
@@ -1294,6 +1385,7 @@ impl App {
             active: 0,
             next_tab_number: 1,
             viewport_height: 0,
+            viewport_width: 0,
             quit: false,
             dialog: None,
             last_search: None,
@@ -1500,10 +1592,11 @@ impl App {
                 let tab_idx = s.tab_idx;
                 let outcome = s.outcome.unwrap_or(SearchOutcome::NotFound);
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 match outcome {
                     SearchOutcome::Found => {
                         if tab_idx < self.tabs.len() {
-                            self.tabs[tab_idx].resync_from_streamview(h);
+                            self.tabs[tab_idx].resync_from_streamview(h, w);
                         }
                     }
                     SearchOutcome::NotFound => {
@@ -1611,8 +1704,9 @@ impl App {
     /// cursor) surface as a notice; the prior viewport is unchanged.
     fn seek_active_to_end(&mut self) {
         let h = self.viewport_height;
+        let w = self.viewport_width;
         let active = self.active;
-        if let Err(e) = self.tabs[active].seek_to_end(&self.engine, h) {
+        if let Err(e) = self.tabs[active].seek_to_end(&self.engine, h, w) {
             self.notice = Some(format!("seek_to_end failed: {e}"));
         }
     }
@@ -1949,9 +2043,10 @@ impl App {
             .and_then(|r| r.event.ok())
             .is_some_and(|e| filter.matches(&e));
         let h = self.viewport_height;
+        let w = self.viewport_width;
         if let Some(view) = self.tabs[tab_idx].streamview.as_mut() {
             view.seek_to_cursor(&self.engine, cursor, h);
-            self.tabs[tab_idx].resync_from_streamview(h);
+            self.tabs[tab_idx].resync_from_streamview(h, w);
         }
         // Tabs constructed by test fixtures without a streamview have
         // no rows to seek across; the tab switch above is the only
@@ -2164,8 +2259,9 @@ impl App {
             delta = -delta;
         }
         let h = self.viewport_height;
+        let w = self.viewport_width;
         let active = self.active;
-        self.tabs[active].advance_time(&self.engine, delta, h);
+        self.tabs[active].advance_time(&self.engine, delta, h, w);
     }
 
     fn next_tab(&mut self) {
@@ -2461,6 +2557,7 @@ impl App {
             // The first push_tab below consumes "Tab 1".
             next_tab_number: 1,
             viewport_height: 0,
+            viewport_width: 0,
             quit: false,
             dialog: None,
             last_search: None,
@@ -2606,8 +2703,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].scroll_down(&self.engine, 1, h);
+                self.tabs[active].scroll_down(&self.engine, 1, h, w);
             }
             KeyEvent {
                 code: KeyCode::Char('k') | KeyCode::Up,
@@ -2615,8 +2713,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].scroll_up(&self.engine, 1, h);
+                self.tabs[active].scroll_up(&self.engine, 1, h, w);
             }
             KeyEvent {
                 code: KeyCode::Char('d'),
@@ -2624,8 +2723,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].scroll_down(&self.engine, half_page, h);
+                self.tabs[active].scroll_down(&self.engine, half_page, h, w);
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
@@ -2633,8 +2733,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].scroll_down(&self.engine, page, h);
+                self.tabs[active].scroll_down(&self.engine, page, h, w);
             }
             KeyEvent {
                 code: KeyCode::Char('u'),
@@ -2642,8 +2743,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].scroll_up(&self.engine, half_page, h);
+                self.tabs[active].scroll_up(&self.engine, half_page, h, w);
             }
             KeyEvent {
                 code: KeyCode::Char('g') | KeyCode::Home,
@@ -2651,8 +2753,9 @@ impl App {
                 ..
             } => {
                 let h = self.viewport_height;
+                let w = self.viewport_width;
                 let active = self.active;
-                self.tabs[active].seek_to_start(&self.engine, h);
+                self.tabs[active].seek_to_start(&self.engine, h, w);
             }
             // Different terminals report `G` with NONE or SHIFT; accept
             // both.  Don't accept CONTROL/ALT — those are unrelated
@@ -3640,6 +3743,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     render_tab_bar(frame, app, tabs_area);
 
     app.viewport_height = content_area.height;
+    app.viewport_width = content_area.width;
 
     if app.bookmarks_active() {
         render_bookmarks_pane(frame, app, content_area);
@@ -3665,7 +3769,9 @@ fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(stats_text), stats_area);
 
     // Re-clamp in case the viewport just shrank past the previous top.
-    let max_top = app.active_tab().max_top(app.viewport_height);
+    let max_top = app
+        .active_tab()
+        .max_top(app.viewport_height, app.viewport_width);
     if app.active_tab().viewport_top > max_top {
         app.active_tab_mut().viewport_top = max_top;
     }
@@ -3673,18 +3779,35 @@ fn render(frame: &mut Frame, app: &mut App) {
     let tab = app.active_tab();
     let total = tab.formatted.len();
     let top = tab.viewport_top;
-    let bottom = (top + content_area.height as usize).min(total);
+    // Walk forward from `top`, accumulating each line's wrapped row
+    // count until we've covered the content area.  The result is the
+    // first logical line index that no longer fits — the slice
+    // `[top..bottom]` is what we hand to the Paragraph (ratatui
+    // clips the last partial visual line if any).
+    let max_visual = content_area.height as usize;
+    let mut bottom = top;
+    let mut visual_used: usize = 0;
+    while bottom < total && visual_used < max_visual {
+        let rows =
+            visual_rows_for(&tab.formatted[bottom], content_area.width);
+        visual_used = visual_used.saturating_add(rows);
+        bottom += 1;
+    }
 
     let selected_event = tab.select.map(|s| s.event_idx);
+    // In raw mode, pre-wrap each logical line at the column boundary
+    // ourselves so the rendered visual rows are contiguous slices of
+    // the source.  That lets the user copy a wrapped line out and
+    // strip newlines to recover the original bytes; word-wrap's
+    // newline-replaces-space behavior would lose that property.
+    // Non-raw mode keeps ratatui's word-wrap, which reads better for
+    // header-and-extras layouts.
+    let raw_mode = app.active_show_raw();
     let lines: Vec<Line<'_>> = tab.formatted[top..bottom]
         .iter()
         .enumerate()
-        .map(|(i, s)| {
+        .flat_map(|(i, s)| {
             let line_index = top + i;
-            let mut line = match &tab.search {
-                Some(search) => highlight_line(s, &search.regex),
-                None => Line::raw(s.as_str()),
-            };
             // Highlight every display line that belongs to the
             // selected record so users see the full record they're
             // about to exclude/include/bookmark, not just its header
@@ -3695,17 +3818,38 @@ fn render(frame: &mut Frame, app: &mut App) {
             let selected = selected_event.is_some_and(|target| {
                 tab.event_for_line.get(line_index).copied() == Some(target)
             });
-            if selected {
-                line = line.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                );
-            }
-            line
+            let selected_style = Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD);
+            let chunks: Vec<&str> = if raw_mode {
+                column_chunks(s, content_area.width)
+            } else {
+                vec![s.as_str()]
+            };
+            chunks
+                .into_iter()
+                .map(|chunk| {
+                    let mut line = match &tab.search {
+                        Some(search) => highlight_line(chunk, &search.regex),
+                        None => Line::raw(chunk),
+                    };
+                    if selected {
+                        line = line.style(selected_style);
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), content_area);
+    // In non-raw mode, let ratatui word-wrap each logical line.
+    // `trim: false` keeps the leading whitespace on `    key = value`
+    // extras lines so wraps don't collapse indentation.  Raw mode
+    // already pre-wrapped above, so each Line is one terminal row.
+    let mut paragraph = Paragraph::new(lines);
+    if !raw_mode {
+        paragraph = paragraph.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(paragraph, content_area);
 
     // Bottom strip: search prompt or footer, never both.
     match app.dialog.as_ref() {
@@ -4993,6 +5137,126 @@ mod tests {
         assert!(a.dialog.as_ref().unwrap().parse_error().is_none());
     }
 
+    // ---------- main pane wrap ----------
+
+    #[test]
+    fn main_pane_wraps_long_logical_lines() {
+        // A logical line longer than the terminal width should appear
+        // on multiple visual rows in the rendered buffer.  Using
+        // ASCII-only content keeps the char-count math straightforward.
+        let long = "A".repeat(80);
+        let mut a = App::with_rows(vec![long.clone()]);
+        // 4 tabs rows total: tab bar (1) + content (n) + stats (1) +
+        // footer (1).  With 5 rows of viewport and 20-col width, an
+        // 80-char line wraps to 4 visual rows — all should fit.
+        let backend = TestBackend::new(20, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // 80 'A's at 20-col width = 4 rows of 'A's.  Count buffer rows
+        // whose content is entirely 'A's (the content area starts
+        // below the tab bar).
+        let full_a_rows =
+            dump.lines().filter(|l| l.chars().all(|c| c == 'A')).count();
+        assert_eq!(
+            full_a_rows, 4,
+            "expected 4 wrapped rows of A's, dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn raw_mode_wraps_at_column_boundary_not_whitespace() {
+        // The raw JSON written by the bunyan logger contains spaces
+        // between key/value pairs.  Word-wrap would break at one of
+        // those spaces; raw mode wraps at the column boundary
+        // instead, so a copy of the wrapped rows can be re-joined by
+        // stripping newlines.  Verify by rendering a real raw line
+        // at a narrow viewport and asserting that the visual rows
+        // are exactly the next N chars of the source, including
+        // spaces that would otherwise have been the wrap point.
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first message", &[])]);
+        a.toggle_show_raw();
+        // Wide enough to fit the JSON in a few rows of column wrap;
+        // narrow enough that any whitespace inside it would be a
+        // word-wrap candidate.
+        let backend = TestBackend::new(30, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+
+        // The active stream's first formatted line is the raw JSON
+        // for the single event.  Compute the expected chunks and
+        // confirm each appears in the dump.
+        let raw = a.active_tab().formatted[0].clone();
+        assert!(
+            raw.starts_with('{') && raw.contains(r#""msg":"first message""#),
+            "raw line should be JSON: {raw}",
+        );
+        for chunk in column_chunks(&raw, 30) {
+            assert!(
+                dump.contains(chunk),
+                "expected column chunk {chunk:?} in dump:\n{dump}",
+            );
+        }
+    }
+
+    #[test]
+    fn column_chunks_handles_empty_and_unicode() {
+        assert_eq!(column_chunks("", 4), vec![""]);
+        assert_eq!(
+            column_chunks("abcdefghij", 4),
+            vec!["abcd", "efgh", "ij"],
+        );
+        // Greek letters are 2 bytes each in UTF-8.  Char-based
+        // counting must produce 4-char chunks regardless.
+        assert_eq!(
+            column_chunks("αβγδεζηθικ", 4),
+            vec!["αβγδ", "εζηθ", "ικ"],
+        );
+        // Width 0 is degenerate; return the whole line so we don't
+        // loop forever or divide by zero.
+        assert_eq!(column_chunks("abc", 0), vec!["abc"]);
+    }
+
+    #[test]
+    fn max_top_accounts_for_wrap() {
+        // 5 short lines and 1 long line that wraps to 4 visual rows.
+        // viewport_height = 10 (visual), viewport_width = 10.  Total
+        // visual rows: 5 + 4 = 9, so max_top should be 0 (everything
+        // fits).
+        let mut rows: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+        rows.push("X".repeat(40)); // wraps to ceil(40/10) = 4 rows
+        let mut a = App::with_rows(rows);
+        a.viewport_height = 10;
+        a.viewport_width = 10;
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
+        assert_eq!(max, 0, "buffer fits, max_top should be 0");
+
+        // Shrink viewport so the long line barely fits but the shorts
+        // don't all join.  viewport_height = 5: only the wrapped line
+        // (4 rows) and one of the short lines (1 row) fit.  max_top
+        // should be 4 (start from row index 4 = the last short row).
+        a.viewport_height = 5;
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
+        assert_eq!(max, 4, "should leave room for short row + wrap");
+    }
+
+    #[test]
+    fn max_top_caps_for_oversized_last_line() {
+        // A single line whose wrap exceeds the viewport on its own
+        // should still scroll to itself (not past it), so the user
+        // can see its start even though its tail is clipped.
+        let big = "Z".repeat(200);
+        let mut a = App::with_rows(vec!["short".to_string(), big]);
+        a.viewport_height = 5;
+        a.viewport_width = 20; // big wraps to 10 rows
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
+        // Last index is 1; max_top is capped to that so the giant
+        // line is reachable as the top of the viewport.
+        assert_eq!(max, 1);
+    }
+
     // ---------- tab-bar rendering ----------
 
     #[test]
@@ -6130,7 +6394,7 @@ mod tests {
         assert_eq!(a.active_tab().viewport_top, 60);
         // Repeat: +1m from row 60 → row 120; clamped to max_top.
         a.handle_key(shift('>'));
-        let max = a.active_tab().max_top(a.viewport_height);
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
         assert_eq!(a.active_tab().viewport_top, max);
     }
 
@@ -6139,7 +6403,7 @@ mod tests {
         // 60 events at 1s; +1m from row 0 has no event at >= t=60.
         let mut a = time_app(60, 10);
         a.handle_key(shift('>'));
-        let max = a.active_tab().max_top(a.viewport_height);
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
         assert_eq!(a.active_tab().viewport_top, max);
     }
 
@@ -6218,7 +6482,7 @@ mod tests {
         a.viewport_height = 5;
         a.active_tab_mut().viewport_top = 1;
         a.handle_key(shift('>'));
-        let max = a.active_tab().max_top(a.viewport_height);
+        let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
         assert_eq!(a.active_tab().viewport_top, max);
         a.handle_key(shift('<'));
         assert_eq!(a.active_tab().viewport_top, 0);
