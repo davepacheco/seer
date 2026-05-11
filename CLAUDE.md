@@ -285,11 +285,10 @@ New tabs should still open with this dialog.
 
 ### TODO
 
+- filter dialog: needs to wrap
 - filtering doesn't always seem correct:
   `msg!=roles msg!="authorize result" background_task=inventory_collection msg=~activating`
-- progress bar, ^C option when:
-  - scanning to enter Summary view
-  - searching
+  - that works, but adding iteration=1 filters out messages that it shouldn't
 - parse SMF entries
 - parse CockroachDB log
 - persistent session state
@@ -301,3 +300,5 @@ New tabs should still open with this dialog.
 - make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
+- `R` binding to show raw JSON instead
+- `?` binding to pop up summary of key bindings

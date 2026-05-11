@@ -3939,7 +3939,27 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
         render_display_fields_dialog(frame, dialog, draft, *cursor, area);
         return;
     }
-    let popup = popup_area(area, 70, 5);
+
+    // Wrap the editor text so a long filter doesn't get clipped at the
+    // popup's right edge.  Compute the inner width from the same
+    // 70%-of-area-width that `popup_area` uses (minus 2 for the
+    // borders) and grow the popup's height to fit the wrapped lines.
+    // `popup_area` clamps the height back down if it would overflow the
+    // screen, so extremely long text is still safe — it just truncates
+    // at the bottom of the available area rather than overflowing.
+    let popup_width = area.width.saturating_mul(70) / 100;
+    let inner_width = (popup_width.saturating_sub(2) as usize).max(1);
+    let edit_rows = dialog
+        .editor()
+        .map(|e| e.text.len().div_ceil(inner_width).max(1))
+        .unwrap_or(1);
+    let edit_rows = u16::try_from(edit_rows).unwrap_or(u16::MAX);
+    // Two rows reserved below the editor for parse-error display (or
+    // blank padding for dialogs without one), matching the original
+    // fixed-height layout so single-line dialogs look unchanged.
+    let popup_height = edit_rows.saturating_add(4);
+
+    let popup = popup_area(area, 70, popup_height);
     // Clear the underlying rows so the editor isn't drawn on top of
     // them.
     frame.render_widget(Clear, popup);
@@ -3948,25 +3968,50 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let [edit_area, error_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
-            .areas(inner);
+    let [edit_area, error_area] = Layout::vertical([
+        Constraint::Length(edit_rows),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
 
     if let Some(editor) = dialog.editor() {
-        frame.render_widget(
-            Paragraph::new(Line::raw(editor.text.as_str())),
-            edit_area,
-        );
-        // Cursor column: the dialog buffers are ASCII in practice
-        // (filter syntax is ASCII, tab names and bookmark names
-        // typically too), so the byte offset doubles as the column.
-        // If we ever accept multibyte chars we'd need to compute the
-        // display width here instead.
+        // Split the text into chunks of `inner_width` columns so the
+        // cursor math below stays in lockstep with what the user sees.
+        // The dialog buffers are ASCII in practice (filter syntax is
+        // ASCII, tab names and bookmark names typically too), so the
+        // byte offset doubles as the column.  If we ever accept
+        // multibyte chars, both this chunking and the cursor
+        // calculation need grapheme-aware replacements.
+        let lines = wrap_dialog_text(&editor.text, inner_width);
+        frame.render_widget(Paragraph::new(lines), edit_area);
+
+        // When the cursor sits exactly on a wrap boundary at the end
+        // of the buffer (e.g. typing the Nth char on a width-N line),
+        // draw it at the right edge of the previous row instead of
+        // column 0 of an empty next row — matches typical editor UX
+        // and keeps the cursor visible without allocating an extra
+        // wrapped line just for it.
+        let (cursor_row, cursor_col) = if editor.cursor > 0
+            && editor.cursor == editor.text.len()
+            && editor.cursor.is_multiple_of(inner_width)
+        {
+            (editor.cursor / inner_width - 1, inner_width)
+        } else {
+            (editor.cursor / inner_width, editor.cursor % inner_width)
+        };
+        let row = edit_area
+            .y
+            .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX))
+            .min(
+                edit_area
+                    .y
+                    .saturating_add(edit_area.height.saturating_sub(1)),
+            );
         let col = edit_area
             .x
-            .saturating_add(u16::try_from(editor.cursor).unwrap_or(u16::MAX));
-        let col = col.min(edit_area.x.saturating_add(edit_area.width));
-        frame.set_cursor_position(Position::new(col, edit_area.y));
+            .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX))
+            .min(edit_area.x.saturating_add(edit_area.width));
+        frame.set_cursor_position(Position::new(col, row));
     }
 
     if let Some(err) = dialog.parse_error()
@@ -3977,6 +4022,34 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             error_area,
         );
     }
+}
+
+/// Splits `text` into [`Line`]s no wider than `width` columns, walking
+/// back to the nearest `char` boundary so multibyte UTF-8 sequences
+/// aren't split.  An empty input still yields one (empty) line so the
+/// caller's cursor has a row to land on.
+fn wrap_dialog_text(text: &str, width: usize) -> Vec<Line<'_>> {
+    if text.is_empty() {
+        return vec![Line::raw("")];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + width).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            // `width` is smaller than the next char's UTF-8 length.
+            // Advance by one char so we don't loop forever; this is a
+            // degenerate case for ASCII content with `width >= 1`.
+            end = start
+                + text[start..].chars().next().expect("non-empty").len_utf8();
+        }
+        lines.push(Line::raw(&text[start..end]));
+        start = end;
+    }
+    lines
 }
 
 /// Draws the field-display dialog: one row per item in
@@ -4610,6 +4683,51 @@ mod tests {
             dump.contains("operator") || dump.contains("token"),
             "expected a parse error in dump:\n{dump}",
         );
+    }
+
+    #[test]
+    fn filter_dialog_wraps_long_text() {
+        // With a narrow terminal a long filter string should wrap onto
+        // additional rows inside the popup rather than being clipped at
+        // the right edge.  Popup width is 70% of 40 = 28 (inner 26), so
+        // a 60-char filter wraps onto 3 rows.
+        let backend = TestBackend::new(40, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('f')));
+        let filter = "level>=warn name=Nexus name=sled-agent name=cockroach";
+        type_into(a.dialog.as_mut().unwrap(), filter);
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // The bug we're guarding against is the tail being clipped
+        // past the popup's right edge — every chunk of the filter must
+        // appear somewhere in the rendered buffer.  Substrings are
+        // chosen to fit within a single 26-column wrapped row so the
+        // assertion isn't broken by intra-substring wrap points.
+        assert!(dump.contains("level>=warn"), "missing prefix in:\n{dump}");
+        assert!(dump.contains("sled-agent"), "missing middle in:\n{dump}");
+        assert!(dump.contains("cockroac"), "missing tail in:\n{dump}");
+        // The popup grew vertically to accommodate the wrap: count
+        // rows containing a left-border glyph.  3 wrapped editor rows
+        // + 2 error-padding rows = 5 interior rows.
+        let interior_rows = dump.lines().filter(|l| l.contains('│')).count();
+        assert_eq!(interior_rows, 5, "expected 5 interior rows in:\n{dump}");
+    }
+
+    #[test]
+    fn wrap_dialog_text_handles_empty_and_chunking() {
+        // Empty input: caller still needs a row for the cursor.
+        let lines = wrap_dialog_text("", 10);
+        assert_eq!(lines.len(), 1);
+
+        // Exact multiple of width yields the minimum number of rows;
+        // the cursor-at-end fixup in render_dialog handles placement.
+        let lines = wrap_dialog_text("abcdef", 3);
+        assert_eq!(lines.len(), 2);
+
+        // Non-multiple wraps to ceil(len/width) rows.
+        let lines = wrap_dialog_text("abcdefg", 3);
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
