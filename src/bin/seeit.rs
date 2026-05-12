@@ -15,14 +15,14 @@
 //!   `seer` would show for that target — same source set, filter, and
 //!   field-visibility settings as the persisted session.
 //!
-//! The two modes are mutually exclusive at the CLI level.  Phase 1
-//! adds the session-mode flags but leaves their execution stubbed out
-//! with an "unimplemented" error — wiring follows in later phases.
+//! The two modes are mutually exclusive at the CLI level.
 
 use camino::Utf8PathBuf;
 use clap::{ArgGroup, Parser, ValueEnum};
 use seer::{
-    Engine, Filter, HostnameDisplay, RenderOpts, SessionId, format_event,
+    Cursor, Engine, Filter, HostnameDisplay, MergeRecord, RenderOpts,
+    ResolvedMode, ResolvedTarget, Selector, SessionId, SessionStore,
+    format_event, format_summary, resolve, summarize,
 };
 
 /// Clap-friendly mirror of [`HostnameDisplay`].
@@ -105,9 +105,11 @@ struct Args {
     /// Filter expression, e.g. `level>=warn name=Nexus msg=~boom
     /// time>=2026-05-09T00:00:00Z`.  See `seer::filter` docs for the
     /// full grammar.  In session mode this replaces the resolved
-    /// filter; in file mode it is the only filter.
-    #[arg(short, long, default_value = "")]
-    filter: String,
+    /// filter; in file mode it is the only filter.  Distinct from
+    /// `--filter ""` (an explicit empty filter that clears the
+    /// resolved one) which is unusual but expressible.
+    #[arg(short, long)]
+    filter: Option<String>,
 
     /// Filter ANDed onto the resolved filter (session mode only).
     /// Mutually exclusive with `--filter`.
@@ -155,6 +157,23 @@ struct Args {
 }
 
 impl Args {
+    /// Translates the at-most-one selector flag into a [`Selector`].
+    ///
+    /// `Args::validate` has already enforced that at most one of
+    /// `stream`, `tab`, `bookmark` is set; with none of them set the
+    /// session-mode default is [`Selector::WholeSession`].
+    fn selector(&self) -> Selector {
+        if let Some(name) = &self.stream {
+            Selector::Stream(name.clone())
+        } else if let Some(name) = &self.tab {
+            Selector::Tab(name.clone())
+        } else if let Some(needle) = &self.bookmark {
+            Selector::Bookmark(needle.clone())
+        } else {
+            Selector::WholeSession
+        }
+    }
+
     /// Verifies cross-arg invariants that clap's `requires` machinery
     /// does not enforce in our group layout.
     ///
@@ -254,16 +273,18 @@ impl Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     args.validate()?;
-
-    // Session-mode execution is wired in a later phase.  Erroring
-    // out here keeps the CLI surface available so docs and tooling
-    // can refer to the flags, while making it obvious that
-    // running in session mode today is a no-op.
-    if args.session.is_some() {
-        return Err("session mode is not yet implemented".into());
+    match args.session {
+        Some(session_id) => run_session_mode(&args, session_id),
+        None => run_file_mode(&args),
     }
+}
 
-    let filter: Filter = args.filter.parse()?;
+/// File-only mode: positional files plus optional filter and
+/// overrides, no persisted session involved.  Preserves the
+/// pre-session-mode behavior — maximalist defaults, no count cap —
+/// when no new flags are passed.
+fn run_file_mode(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let filter: Filter = args.filter.as_deref().unwrap_or("").parse()?;
     let opts = args.apply_overrides(Args::file_mode_defaults());
 
     let mut engine = Engine::new();
@@ -271,27 +292,145 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine.add_file_source(path)?;
     }
 
-    let mut emitted: usize = 0;
-    for result in engine.query_events(&filter) {
-        match result {
-            Ok(ee) => {
-                for line in format_event(&ee.event, &opts) {
-                    println!("{line}");
-                }
-                emitted += 1;
-                if let Some(max) = args.count
-                    && emitted >= max
-                {
-                    break;
-                }
-            }
-            // SourceError's Display already says "I/O error: ...",
-            // "failed to parse ...", or "warning: ..." as appropriate;
-            // don't add another prefix here.
-            Err(err) => eprintln!("{err}"),
+    emit_forward_from_engine(
+        &engine,
+        &filter,
+        &Cursor::default(),
+        args.count,
+        &opts,
+    );
+    Ok(())
+}
+
+/// Session mode: load `session_id`, resolve the selector, apply CLI
+/// overrides, and emit either records or a summary per the resolved
+/// mode.
+fn run_session_mode(
+    args: &Args,
+    session_id: SessionId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = SessionStore::open()?;
+    let selector = args.selector();
+    let resolved = resolve(&store, session_id, &selector)?;
+
+    let filter = combine_filter(args, &resolved.filter)?;
+    let opts = args.apply_overrides(resolved.render_opts);
+
+    let mut engine = Engine::new();
+    for path in &resolved.sources {
+        engine.add_file_source(path)?;
+    }
+
+    match resolved.mode {
+        ResolvedMode::Summary => emit_summary(&engine, &filter),
+        ResolvedMode::Records => {
+            emit_records_window(&engine, &filter, &resolved, args, &opts)
         }
     }
     Ok(())
+}
+
+/// Walks forward from `cursor` and emits each event via
+/// [`format_event`].  Stops after `count` records when set, or when
+/// the engine is exhausted.  Errors are printed to stderr and don't
+/// count toward `count`.
+fn emit_forward_from_engine(
+    engine: &Engine,
+    filter: &Filter,
+    cursor: &Cursor,
+    count: Option<usize>,
+    opts: &RenderOpts,
+) {
+    let mut stepper = engine.stepper(filter.clone(), cursor);
+    let mut emitted: usize = 0;
+    while let Some(r) = stepper.step_forward() {
+        emit_record(&r, opts);
+        if r.event.is_ok() {
+            emitted += 1;
+            if let Some(max) = count
+                && emitted >= max
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Records-mode session emission: `--before N` records strictly
+/// before the resolved cursor (chronological order), then up to
+/// `--count M` records starting at the cursor.
+///
+/// Uses two steppers because a single stepper owns one position that
+/// both directions share — see [`seer::Stepper::step_backward_n`].
+fn emit_records_window(
+    engine: &Engine,
+    filter: &Filter,
+    resolved: &ResolvedTarget,
+    args: &Args,
+    opts: &RenderOpts,
+) {
+    if let Some(before) = args.before {
+        let mut back = engine.stepper(filter.clone(), &resolved.cursor);
+        for r in back.step_backward_n(before) {
+            emit_record(&r, opts);
+        }
+    }
+    emit_forward_from_engine(engine, filter, &resolved.cursor, args.count, opts);
+}
+
+/// Builds a [`Summary`] over `filter` and prints it.  Summary mode
+/// ignores `--before` and `--count` — those are records-mode
+/// concepts; the summary covers the whole filtered set.
+fn emit_summary(engine: &Engine, filter: &Filter) {
+    let summary = summarize(engine, filter);
+    for line in format_summary(&summary) {
+        println!("{line}");
+    }
+}
+
+/// Renders a single [`MergeRecord`].  Successful events print their
+/// formatted lines to stdout; per-line parse/IO errors print their
+/// `Display` form to stderr (matches the legacy file-mode behavior).
+fn emit_record(r: &MergeRecord, opts: &RenderOpts) {
+    match &r.event {
+        Ok(e) => {
+            for line in format_event(e, opts) {
+                println!("{line}");
+            }
+        }
+        // The MergeError's Display already includes context; no
+        // extra prefix here.
+        Err(err) => eprintln!("{err}"),
+    }
+}
+
+/// Combines the CLI's `--filter` / `--and-filter` overrides with the
+/// resolved filter from a session selector.
+///
+/// Returns:
+/// - The resolved filter clone when neither override is set.
+/// - A parsed standalone filter when `--filter` is set.
+/// - The resolved filter with the parsed `--and-filter` predicates
+///   appended when `--and-filter` is set.
+///
+/// Validation has already ruled out the case where both overrides
+/// are set simultaneously.
+fn combine_filter(
+    args: &Args,
+    base: &Filter,
+) -> Result<Filter, seer::FilterParseError> {
+    if let Some(s) = &args.filter {
+        return s.parse();
+    }
+    if let Some(s) = &args.and_filter {
+        let mut combined = base.clone();
+        let extra: Filter = s.parse()?;
+        for p in extra.predicates() {
+            combined.add_predicate(p.clone());
+        }
+        return Ok(combined);
+    }
+    Ok(base.clone())
 }
 
 #[cfg(test)]
@@ -313,7 +452,7 @@ mod tests {
         let a = parse(&["seeit", "foo.log"]).unwrap();
         assert_eq!(a.files, vec![Utf8PathBuf::from("foo.log")]);
         assert!(a.session.is_none());
-        assert_eq!(a.filter, "");
+        assert_eq!(a.filter, None);
         assert_eq!(a.count, None);
     }
 
@@ -333,7 +472,7 @@ mod tests {
             a.files,
             vec![Utf8PathBuf::from("a.log"), Utf8PathBuf::from("b.log")]
         );
-        assert_eq!(a.filter, "level>=warn");
+        assert_eq!(a.filter.as_deref(), Some("level>=warn"));
         assert_eq!(a.count, Some(10));
     }
 

@@ -93,8 +93,10 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: Phase 4 — wire `seeit` session mode.**  Phases 1–3
-landed.  Update the
+**Current phase: Phase 5 — diagnostics polish.**  Phases 1–4 landed
+(file mode unchanged; session mode fully wired through resolver,
+`--before` window, summary path; integration tests under
+`tests/seeit_session.rs`).  Update the
 "Status" line and check the phase box as work lands.
 
 ### Notes from Phase 1
@@ -122,6 +124,18 @@ landed.  Update the
   same cursor for the forward walk.  A `Stepper` owns a single
   position that both directions share, so reusing one would require
   re-walking forward to recover — the two-stepper form is simpler.
+
+### Notes from Phase 4
+
+- `Args::filter` is now `Option<String>` so session mode can
+  distinguish "no override" from "explicit empty filter" (the
+  latter clears the resolved stream's filter).
+- Summary mode ignores `--before` and `--count`; both flags remain
+  parseable in summary-tab invocations for now, but a future polish
+  pass (Phase 5) could warn or reject them outright.
+- `--header` (planned for Phase 5) is not yet wired.  Today the
+  binary prints only the rendered events / summary to stdout,
+  matching what `seer` would draw.
 
 ## Phases
 
@@ -164,7 +178,7 @@ landed.  Update the
 - Tests with hand-built fixtures: bookmarks at the start, middle, and
   end of a file; verify ordering and counts at edges.
 
-### [ ] Phase 4 — Wire it up in `seeit.rs`
+### [x] Phase 4 — Wire it up in `seeit.rs`
 
 - When `--session` is supplied, call `resolve`, build the engine from
   the resolved sources, apply CLI overrides (filter then render opts)
