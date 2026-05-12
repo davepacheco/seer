@@ -288,7 +288,6 @@ New tabs should still open with this dialog.
 
 - parse SMF entries
 - parse CockroachDB log
-- seeit should understand sessions -- see separate plan
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
 - `?` binding to pop up summary of key bindings
@@ -304,3 +303,4 @@ New tabs should still open with this dialog.
   - `SeekFinalize::FrontOrBackFallback` runs `view.ensure_window` synchronously when the forward-from-cursor fetch came up empty.  Fine for typical bookmark navigation; a pathological filter with no matches anywhere could still freeze during finalize.
 - add a marker in the logstream where there are bookmarks
 - should bookmarks be navigable from any tab?
+- press 'Y' over bookmark should open the `seeit` command dialog too
