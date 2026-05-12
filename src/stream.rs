@@ -193,13 +193,28 @@ impl LogStream {
     /// install rendering options on a [`crate::streamview::StreamView`]
     /// when (re)building it.
     pub fn render_opts(&self) -> RenderOpts {
+        // Destructure `self` so that adding a new field to `LogStream`
+        // is a compile error here: the author of the new field has to
+        // decide whether it belongs in `RenderOpts` (add it to the
+        // literal below) or not (extend the `_` list).
+        let LogStream {
+            show_extras,
+            show_date,
+            hostname_display,
+            show_pid,
+            show_name,
+            show_raw,
+            id: _,
+            name: _,
+            filter: _,
+        } = self;
         RenderOpts {
-            show_extras: self.show_extras,
-            show_date: self.show_date,
-            hostname: self.hostname_display,
-            show_pid: self.show_pid,
-            show_name: self.show_name,
-            show_raw: self.show_raw,
+            show_extras: *show_extras,
+            show_date: *show_date,
+            hostname: *hostname_display,
+            show_pid: *show_pid,
+            show_name: *show_name,
+            show_raw: *show_raw,
         }
     }
 
@@ -208,12 +223,23 @@ impl LogStream {
     /// session schema can evolve one knob at a time without breaking
     /// older saves), but the TUI dialog mutates them as a bundle.
     pub fn set_render_opts(&mut self, opts: RenderOpts) {
-        self.show_extras = opts.show_extras;
-        self.show_date = opts.show_date;
-        self.hostname_display = opts.hostname;
-        self.show_pid = opts.show_pid;
-        self.show_name = opts.show_name;
-        self.show_raw = opts.show_raw;
+        // Destructure so adding a new `RenderOpts` field fails to
+        // compile here until the corresponding `LogStream` field is
+        // written through.
+        let RenderOpts {
+            show_extras,
+            show_date,
+            hostname,
+            show_pid,
+            show_name,
+            show_raw,
+        } = opts;
+        self.show_extras = show_extras;
+        self.show_date = show_date;
+        self.hostname_display = hostname;
+        self.show_pid = show_pid;
+        self.show_name = show_name;
+        self.show_raw = show_raw;
     }
 }
 
