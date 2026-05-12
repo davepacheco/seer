@@ -134,6 +134,11 @@ fn run_tui(
     let _guard = TerminalGuard;
     let mut app = App::new_with_session(engine, session, store, policy);
     while !app.quit {
+        // Flush any debounced changes whose window has elapsed.
+        // Cheap when nothing is dirty; the steady-state loop runs
+        // roughly 10×/s in the idle case (event::poll(100ms)), so
+        // the debounce only ever slips by a fraction of a second.
+        app.flush_if_due();
         terminal.draw(|frame| render(frame, &mut app))?;
         if app.long_op.is_some() {
             // Long-op mode: advance one chunk per loop iteration and
@@ -1599,6 +1604,19 @@ impl App {
         }
     }
 
+    /// Polled once per event-loop iteration.  Flushes the session if
+    /// pending debounced changes have aged past the policy's window;
+    /// otherwise a no-op.  Failures are surfaced via
+    /// [`Self::notice`], the dirty bit stays set, and the next tick
+    /// retries.
+    fn flush_if_due(&mut self) {
+        if self.policy.due(Instant::now())
+            && let Err(e) = self.try_save_now()
+        {
+            self.notice = Some(format!("session save failed: {e}"));
+        }
+    }
+
     /// Pushes a new tab backed by a fresh [`LogStream`] with the given
     /// filter.  Does *not* open the filter dialog — callers that want
     /// that (e.g. Ctrl-T) do it explicitly after.  Switches focus to
@@ -2017,6 +2035,7 @@ impl App {
     /// (used to compute the end-of-file cursor) surface as a notice;
     /// the prior viewport is unchanged.
     fn seek_active_to_end(&mut self) {
+        self.policy.record(Cadence::Debounced);
         let h = self.viewport_height;
         let w = self.viewport_width;
         let active = self.active;
@@ -2058,6 +2077,7 @@ impl App {
     /// a [`LongOp::Seek`].  Same UX rationale as
     /// [`Self::seek_active_to_end`].
     fn seek_active_to_start(&mut self) {
+        self.policy.record(Cadence::Debounced);
         let h = self.viewport_height;
         let w = self.viewport_width;
         let active = self.active;
@@ -2090,6 +2110,7 @@ impl App {
     /// the long-op carries the cursor-fallback semantics that
     /// [`StreamView::seek_to_cursor`] does inline.
     fn seek_active_to_cursor(&mut self, cursor: Cursor) {
+        self.policy.record(Cadence::Debounced);
         let h = self.viewport_height;
         let w = self.viewport_width;
         let active = self.active;
@@ -2506,6 +2527,7 @@ impl App {
         let Some(idx) = self.bookmark_cursor_idx() else {
             return;
         };
+        self.policy.record(Cadence::Debounced);
         let bookmarks = self.flat_bookmarks();
         let bm = bookmarks[idx];
         let target_stream = self
@@ -2639,6 +2661,7 @@ impl App {
     /// `exclusive`: skip a match at the current position (used by `n`
     /// repeats so the cursor advances rather than re-landing).
     fn jump_to_match(&mut self, direction: SearchDirection, exclusive: bool) {
+        self.policy.record(Cadence::Debounced);
         let active = self.active;
         if self.tabs[active].streamview.is_some() {
             self.jump_to_match_via_streamview(direction, exclusive);
@@ -2749,6 +2772,7 @@ impl App {
     /// Advances the active tab forward (or backward) by the current
     /// step.  No-op when the tab holds no parsed events.
     fn advance_time(&mut self, forward: bool) {
+        self.policy.record(Cadence::Debounced);
         let mut delta = self.current_step_duration();
         if !forward {
             delta = -delta;
@@ -3214,6 +3238,7 @@ impl App {
                 let w = self.viewport_width;
                 let active = self.active;
                 self.tabs[active].scroll_down(&self.engine, 1, h, w);
+                self.policy.record(Cadence::Debounced);
             }
             KeyEvent {
                 code: KeyCode::Char('k') | KeyCode::Up,
@@ -3224,6 +3249,7 @@ impl App {
                 let w = self.viewport_width;
                 let active = self.active;
                 self.tabs[active].scroll_up(&self.engine, 1, h, w);
+                self.policy.record(Cadence::Debounced);
             }
             KeyEvent {
                 code: KeyCode::Char('d'),
@@ -3234,6 +3260,7 @@ impl App {
                 let w = self.viewport_width;
                 let active = self.active;
                 self.tabs[active].scroll_down(&self.engine, half_page, h, w);
+                self.policy.record(Cadence::Debounced);
             }
             KeyEvent {
                 code: KeyCode::Char(' '),
@@ -3244,6 +3271,7 @@ impl App {
                 let w = self.viewport_width;
                 let active = self.active;
                 self.tabs[active].scroll_down(&self.engine, page, h, w);
+                self.policy.record(Cadence::Debounced);
             }
             KeyEvent {
                 code: KeyCode::Char('u'),
@@ -3254,6 +3282,7 @@ impl App {
                 let w = self.viewport_width;
                 let active = self.active;
                 self.tabs[active].scroll_up(&self.engine, half_page, h, w);
+                self.policy.record(Cadence::Debounced);
             }
             KeyEvent {
                 code: KeyCode::Char('g') | KeyCode::Home,
@@ -4247,8 +4276,18 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     render_tab_bar(frame, app, tabs_area);
 
-    app.viewport_height = content_area.height;
-    app.viewport_width = content_area.width;
+    let new_h = content_area.height;
+    let new_w = content_area.width;
+    // Record a debounced mutation when the terminal size changes, so
+    // the next due() check picks up the resize.  The initial 0→N
+    // transition at first render counts as a resize too; the
+    // resulting flush is a no-op write 10s later and not worth the
+    // extra guard.
+    if app.viewport_height != new_h || app.viewport_width != new_w {
+        app.policy.record(Cadence::Debounced);
+    }
+    app.viewport_height = new_h;
+    app.viewport_width = new_w;
 
     if app.bookmarks_active() {
         render_bookmarks_pane(frame, app, content_area);
@@ -8830,6 +8869,144 @@ mod tests {
             .unwrap()
             .show_extras;
         assert_eq!(after, !before);
+    }
+
+    // ---------- debounced persistence (phase 7) ----------
+
+    /// Subtracts `delta` from "now" without ever underflowing — used
+    /// to rewind a policy's `last_saved_at` so a test can pretend
+    /// the debounce window has elapsed without sleeping.
+    fn now_minus(delta: Duration) -> Instant {
+        let now = Instant::now();
+        now.checked_sub(delta).unwrap_or(now)
+    }
+
+    #[test]
+    fn j_scroll_records_debounced() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // The initial setup flushed the dirty bit.
+        assert!(!a.policy.dirty());
+        a.handle_key(key(KeyCode::Char('j')));
+        assert!(
+            a.policy.dirty(),
+            "j should have marked the policy dirty"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_scroll_records_debounced() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        assert!(!a.policy.dirty());
+        a.handle_key(ctrl('d'));
+        assert!(a.policy.dirty());
+    }
+
+    #[test]
+    fn flush_if_due_flushes_when_window_has_elapsed() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // Pretend the last save happened well outside the debounce
+        // window.
+        a.policy.mark_saved(now_minus(Duration::from_secs(60)));
+        a.policy.record(seer::Cadence::Debounced);
+        assert!(a.policy.dirty());
+
+        a.flush_if_due();
+        assert!(
+            !a.policy.dirty(),
+            "flush_if_due should have cleared the dirty bit"
+        );
+        assert!(
+            a.notice.is_none(),
+            "successful flush should not set a notice"
+        );
+    }
+
+    #[test]
+    fn flush_if_due_is_a_noop_when_clean() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // Even with the window long elapsed, a clean policy stays
+        // clean and no save fires.
+        a.policy.mark_saved(now_minus(Duration::from_secs(60)));
+        assert!(!a.policy.dirty());
+        a.flush_if_due();
+        assert!(!a.policy.dirty());
+    }
+
+    #[test]
+    fn flush_if_due_is_a_noop_within_debounce_window() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // Just-saved + just-recorded: the window has not elapsed.
+        a.policy.mark_saved(Instant::now());
+        a.policy.record(seer::Cadence::Debounced);
+        assert!(a.policy.dirty());
+        a.flush_if_due();
+        assert!(
+            a.policy.dirty(),
+            "dirty bit must persist when the window hasn't elapsed"
+        );
+    }
+
+    #[test]
+    fn flush_if_due_failure_sets_notice_and_keeps_dirty_bit() {
+        // Yank the sessions directory so the save attempt errors.
+        // The debounce check fires, the save fails, the error lands
+        // on `notice`, and the dirty bit stays set so the next
+        // opportunity retries.
+        let dir = camino_tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let store = SessionStore::open_at(&sessions_dir).unwrap();
+        let mut a = App::new(Engine::new());
+        a.store = Some(store);
+        // Make the policy due.
+        a.policy.mark_saved(now_minus(Duration::from_secs(60)));
+        a.policy.record(seer::Cadence::Debounced);
+        // Now break the store.
+        std::fs::remove_dir_all(&sessions_dir).unwrap();
+
+        a.flush_if_due();
+        assert!(a.policy.dirty(), "failed save leaves dirty bit set");
+        let notice = a.notice.as_ref().expect("notice must be set");
+        assert!(
+            notice.contains("session save failed"),
+            "unexpected notice: {notice}"
+        );
+    }
+
+    #[test]
+    fn viewport_resize_in_render_records_debounced() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // First render lands the 0→N transition; let it settle and
+        // then mark_saved so subsequent dirty signals are isolated.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        a.policy.mark_saved(Instant::now());
+        assert!(!a.policy.dirty());
+
+        // Resize to a different geometry and re-render.
+        terminal.backend_mut().resize(40, 12);
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        assert!(
+            a.policy.dirty(),
+            "resize should have recorded a debounced mutation"
+        );
+    }
+
+    #[test]
+    fn render_at_same_size_does_not_record() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        a.policy.mark_saved(Instant::now());
+        assert!(!a.policy.dirty());
+
+        // Re-render at the same size: no resize, no record.
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        assert!(
+            !a.policy.dirty(),
+            "render at the same size must not record"
+        );
     }
 
     #[test]

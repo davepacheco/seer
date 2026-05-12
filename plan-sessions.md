@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 6 complete.  Next phase: **7. Debounced saves at high-cadence mutations.**
+Phase 7 complete.  Next phase: **8. Startup discovery + resume dialog.**
 
 ## Goal
 
@@ -458,10 +458,31 @@ prove itself before the resume dialog lands on top.
     plus a save-failure-into-notice path that yanks the sessions
     directory mid-test.  478 tests pass.
 
-- [ ] **7. Debounced saves at high-cadence mutations.**  Call
+- [x] **7. Debounced saves at high-cadence mutations.**  Call
   `policy.record(Cadence::Debounced)` on cursor scrolling and
   viewport resize.  Add the `due()` check at the top of the event
   loop so debounced changes flush once the window has elapsed.
+  - New `App::flush_if_due()` consults `policy.due(Instant::now())`
+    and calls `try_save_now` when the window has elapsed; failures
+    land on `app.notice`.  `run_tui` calls it once per loop
+    iteration before `terminal.draw`.  Steady-state idle loop runs
+    at ~10 Hz (`event::poll(100ms)`), so the debounce only ever
+    slips by a fraction of a second.  Debounced records added to
+    the App-level navigation methods (`seek_active_to_end`,
+    `seek_active_to_start`, `seek_active_to_cursor`,
+    `navigate_to_bookmark_cursor`, `jump_to_match`, `advance_time`)
+    and inline at the five key-handler arms that call
+    `Tab::scroll_*` directly (`j`/`k`/`^d`/space/`^u`).  `render()`
+    compares the previous `viewport_height`/`viewport_width`
+    against the new geometry and records on any change — the
+    initial 0→N transition at first frame counts as a "resize"; the
+    resulting flush is a no-op write 10s later and not worth a
+    special guard.  Eight new tests: j/`^d` set dirty, the three
+    `flush_if_due` paths (elapsed-window flushes, within-window is
+    a no-op, clean is a no-op), a failure-via-yanked-dir path that
+    asserts the notice, plus two render-driven tests for the
+    resize-detection logic (resize records; same-size render does
+    not).  486 tests pass.
 
 - [ ] **8. Startup discovery + resume dialog.**  Run
   `find_matches` against the canonicalized command-line paths, show
