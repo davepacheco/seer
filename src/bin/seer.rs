@@ -2104,13 +2104,11 @@ impl App {
     /// opportunity tries again.  Callers that want to surface the
     /// error to the user typically do so via [`Self::notice`].
     fn try_save_now(&mut self) -> Result<(), StoreError> {
-        if self.store.is_none() {
-            return Ok(());
-        }
         self.sync_tabs_to_session();
-        let store = self.store.as_ref().unwrap();
-        store.save(self.session.id, &self.session)?;
-        self.policy.mark_saved(Instant::now());
+        if let Some(store) = self.store.as_ref() {
+            store.save(self.session.id, &self.session)?;
+            self.policy.mark_saved(Instant::now());
+        }
         Ok(())
     }
 
@@ -2186,18 +2184,18 @@ impl App {
         stream.filter = filter;
         let stream_id = stream.id;
         let pushed_filter = stream.filter.clone();
+        let render_opts = stream.render_opts();
         self.session
             .streams
             .insert_unique(stream)
             .expect("freshly-minted LogStreamId is unique");
-        let stream = self.session.streams.get(&stream_id).unwrap();
         let tab = Tab::new(
             name,
             kind,
             &self.engine,
             stream_id,
-            &stream.filter,
-            stream.render_opts(),
+            &pushed_filter,
+            render_opts,
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -3113,13 +3111,22 @@ impl App {
         self.policy.record(Cadence::Debounced);
         let bookmarks = self.flat_bookmarks();
         let bm = bookmarks[idx];
-        let target_stream = self
+        let (target_stream, filter) = self
             .session
             .user_bookmarks
             .iter()
-            .find(|(_, v)| v.iter().any(|b| b.id == bm.id))
-            .map(|(s, _)| *s)
-            .expect("bookmark belongs to some stream");
+            .find_map(|(sid, v)| {
+                v.iter()
+                    .any(|b| b.id == bm.id)
+                    .then(|| {
+                        self.session
+                            .streams
+                            .get(sid)
+                            .map(|s| (*sid, s.filter.clone()))
+                    })
+                    .flatten()
+            })
+            .expect("bookmark belongs to a known stream");
         let cursor = bm.cursor.clone();
         // Switch to the tab showing the target stream, opening one if
         // none exists.
@@ -3132,8 +3139,6 @@ impl App {
             }
         };
         self.active = tab_idx;
-        let filter =
-            self.session.streams.get(&target_stream).unwrap().filter.clone();
         // Decide whether the bookmarked event survives the active
         // filter by reading it through an unfiltered stepper.  The
         // streamview's seek will hit it (or the nearest visible

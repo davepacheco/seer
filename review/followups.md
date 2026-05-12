@@ -14,10 +14,10 @@ listed once with all references gathered.
 
 | Field          | Value                                              |
 |----------------|----------------------------------------------------|
-| Items closed   | 1 / 44                                             |
+| Items closed   | 2 / 44                                             |
 | Current item   | —  (pick the first unchecked below)                |
 | Last updated   | 2026-05-12                                         |
-| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live. |
+| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live.  Item 2: each of the three sites restructured to avoid the unwrap entirely — `try_save_now` collapses the redundant `is_none` check into a single `if let`; `push_tab` computes `render_opts` before the insert takes ownership; bookmark navigation fuses the bookmark→stream and stream→filter lookups into one `find_map` so only a single `.expect` (for the joint invariant) remains. |
 
 ### How this state works
 
@@ -44,7 +44,7 @@ genuine design choice to make.
       and import in both call sites.  *Refs:* P1 §6, P3 §S2, P4 §C1.
       *Affects:* `src/engine/merge.rs:48`, `src/streamview.rs:39`.
 
-- [ ] **2. Replace bare `.unwrap()` with `.expect("…")`** at three
+- [x] **2. Replace bare `.unwrap()` with `.expect("…")`** at three
       sites in `bin/seer.rs` so they match the file's documented-
       invariant idiom.  *Refs:* P3 §S10.  *Affects:* `src/bin/seer.rs:2138, :2220, :3169`.
 
