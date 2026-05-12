@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 4 complete.  Next phase: **5. TUI wiring.**
+Phase 5 in progress.
 
 ## Goal
 
@@ -396,11 +396,41 @@ a note when a phase moves to in-progress or done.
     sequences.  Re-exported `Cadence` and `SavePolicy` from
     `src/lib.rs`.  469 tests pass.
 
-- [ ] **5. TUI wiring.**  Startup dialog, plumb the policy into
-  the TUI event loop, save inline on low-cadence mutations and
-  on exit.
+The original phase 5 ("TUI wiring") was substantially larger than
+phases 1–4 — it touched main(), threaded new state through `App`,
+hit every session-affecting mutation site, *and* added a modal
+startup dialog.  Splitting it into four independently-mergeable
+phases keeps each landing reviewable and lets the persistence pipe
+prove itself before the resume dialog lands on top.
 
-- [ ] **6. CLI surface.**  `--resume`, `--list`, exit message.
+- [~] **5. Source capture + policy plumbing + exit save.**  Add
+  `SavePolicy` and `SessionStore` fields to `App`; capture
+  `SessionSource` rows (path + mtime + size) from the command-line
+  files at startup; route every persistence call through a single
+  `App::try_save` helper; do a final save on normal exit and print
+  the resume hint to stdout.  No behavioral change while the TUI
+  is running — but the pipe is alive end-to-end.
 
-- [ ] **7. Integration tests** end-to-end through a synthetic
+- [ ] **6. Inline saves at low-cadence mutations.**  Call
+  `policy.record(Cadence::Inline)` and route through
+  `try_save` at bookmark create / rename / delete, tab open /
+  close, filter changes (named or unnamed), and field show / hide.
+
+- [ ] **7. Debounced saves at high-cadence mutations.**  Call
+  `policy.record(Cadence::Debounced)` on cursor scrolling and
+  viewport resize.  Add the `due()` check at the top of the event
+  loop so debounced changes flush once the window has elapsed.
+
+- [ ] **8. Startup discovery + resume dialog.**  Run
+  `find_matches` against the canonicalized command-line paths, show
+  a modal listing exact / superset / overlap candidates (id,
+  last_saved_at, tab count, source count, exact-match flag), and
+  let the user pick: resume an existing session, start a new
+  saved session, or start a transient session (no saver attached,
+  no file ever written).
+
+- [ ] **9. CLI surface.**  `--resume`, `--list`, exit-message
+  variants for resumed vs. fresh sessions.
+
+- [ ] **10. Integration tests** end-to-end through a synthetic
   engine.
