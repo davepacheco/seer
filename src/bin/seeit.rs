@@ -13,9 +13,13 @@
 //! - **Session mode** (new): given a saved session id plus an optional
 //!   selector (`--stream`, `--tab`, `--bookmark`), reproduce the lines
 //!   `seer` would show for that target — same source set, filter, and
-//!   field-visibility settings as the persisted session.
+//!   field-visibility settings as the persisted session.  Useful for
+//!   bug reports ("here's the exact `seeit` command that reproduces
+//!   what I was looking at") and for piping a `seer` view to a file.
 //!
-//! The two modes are mutually exclusive at the CLI level.
+//! The two modes are mutually exclusive at the CLI level.  `--header`
+//! adds a one-line context banner on stderr so a human reader can
+//! tell what was reproduced without polluting stdout.
 
 use camino::Utf8PathBuf;
 use clap::{ArgGroup, Parser, ValueEnum};
@@ -115,6 +119,13 @@ struct Args {
     /// Mutually exclusive with `--filter`.
     #[arg(long, conflicts_with = "filter")]
     and_filter: Option<String>,
+
+    /// Print a one-line context banner to stderr describing what
+    /// was reproduced (session id, selector, filter, mode).
+    /// Stdout is untouched, so the same invocation still pipes
+    /// cleanly to grep, diff, etc.
+    #[arg(long)]
+    header: bool,
 
     /// Render `key = value` extras below each event's header.
     #[arg(long, overrides_with = "no_extras")]
@@ -270,12 +281,50 @@ impl Args {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let args = Args::parse();
-    args.validate()?;
+    if let Err(err) = run(&args) {
+        report_error(&*err);
+        std::process::exit(1);
+    }
+}
+
+/// Top-level entry point separated from `main` so error handling can
+/// route through [`report_error`].  `main` returning
+/// `Result<_, Box<dyn Error>>` would format failures via `Debug`,
+/// which produces opaque enum variants instead of the carefully-
+/// worded `Display` strings each error type defines.
+fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    args.validate().map_err(boxed_err)?;
     match args.session {
-        Some(session_id) => run_session_mode(&args, session_id),
-        None => run_file_mode(&args),
+        Some(session_id) => run_session_mode(args, session_id),
+        None => run_file_mode(args),
+    }
+}
+
+/// Boxes any [`Error`] into the `Box<dyn Error>` shape `run`
+/// returns.  Used at error-conversion points where the type-erased
+/// box wants an explicit conversion.
+fn boxed_err<E: std::error::Error + Send + Sync + 'static>(
+    e: E,
+) -> Box<dyn std::error::Error> {
+    Box::new(e)
+}
+
+/// Prints `err` and any chained causes to stderr as `Display`
+/// strings.  Each cause appears on its own indented line, so a
+/// resolve failure with a wrapped I/O cause looks like:
+///
+/// ```text
+/// seeit: source /log/a has changed since the session was saved: …
+///   caused by: No such file or directory (os error 2)
+/// ```
+fn report_error(err: &dyn std::error::Error) {
+    eprintln!("seeit: {err}");
+    let mut cause = err.source();
+    while let Some(c) = cause {
+        eprintln!("  caused by: {c}");
+        cause = c.source();
     }
 }
 
@@ -321,6 +370,10 @@ fn run_session_mode(
         engine.add_file_source(path)?;
     }
 
+    if args.header {
+        print_header(session_id, args, &selector, &filter, &resolved);
+    }
+
     match resolved.mode {
         ResolvedMode::Summary => emit_summary(&engine, &filter),
         ResolvedMode::Records => {
@@ -328,6 +381,55 @@ fn run_session_mode(
         }
     }
     Ok(())
+}
+
+/// Writes a one-line context banner to stderr.  Stdout is left
+/// alone so the binary's output remains pipeable.
+///
+/// The banner names what was reproduced: session id, selector
+/// (whole-session / stream / tab / bookmark), final filter, and
+/// mode.  Source paths are summarized by count to keep the line
+/// reasonable on sessions with dozens of files.
+fn print_header(
+    session_id: SessionId,
+    args: &Args,
+    selector: &Selector,
+    filter: &Filter,
+    resolved: &ResolvedTarget,
+) {
+    let selector_str = match selector {
+        Selector::WholeSession => "whole-session".to_string(),
+        Selector::Stream(name) => format!("stream={name:?}"),
+        Selector::Tab(name) => format!("tab={name:?}"),
+        Selector::Bookmark(needle) => format!("bookmark={needle:?}"),
+    };
+    let mode_str = match resolved.mode {
+        ResolvedMode::Records => "records",
+        ResolvedMode::Summary => "summary",
+    };
+    let filter_str = if filter.predicates().is_empty() {
+        "<none>".to_string()
+    } else {
+        // The grammar is the same `seer::filter` parses, so render
+        // the predicates back via Debug on the slice; a richer
+        // round-trip Display would be a separate piece of work.
+        format!("{:?}", filter.predicates())
+    };
+    let window = match (args.before, args.count) {
+        (None, None) => "unbounded".to_string(),
+        (Some(b), None) => format!("before={b} count=unbounded"),
+        (None, Some(c)) => format!("count={c}"),
+        (Some(b), Some(c)) => format!("before={b} count={c}"),
+    };
+    eprintln!(
+        "seeit: session={} target={} mode={} sources={} filter={} window={}",
+        session_id,
+        selector_str,
+        mode_str,
+        resolved.sources.len(),
+        filter_str,
+        window,
+    );
 }
 
 /// Walks forward from `cursor` and emits each event via

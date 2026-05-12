@@ -93,10 +93,10 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: Phase 5 — diagnostics polish.**  Phases 1–4 landed
-(file mode unchanged; session mode fully wired through resolver,
-`--before` window, summary path; integration tests under
-`tests/seeit_session.rs`).  Update the
+**Current phase: Phase 6 — `seer` keybinding for "print equivalent
+`seeit`".**  Phases 1–5 landed.  This phase needs a UX decision from
+the user (see "Open question for Phase 6" below) before the
+keybinding wiring is right.  Update the
 "Status" line and check the phase box as work lands.
 
 ### Notes from Phase 1
@@ -131,11 +131,44 @@ This is a code-sharing exercise, not a re-implementation:
   distinguish "no override" from "explicit empty filter" (the
   latter clears the resolved stream's filter).
 - Summary mode ignores `--before` and `--count`; both flags remain
-  parseable in summary-tab invocations for now, but a future polish
-  pass (Phase 5) could warn or reject them outright.
-- `--header` (planned for Phase 5) is not yet wired.  Today the
-  binary prints only the rendered events / summary to stdout,
-  matching what `seer` would draw.
+  parseable in summary-tab invocations for now.  A future warning
+  ("--before is meaningless in summary mode") could be added if it
+  starts causing confusion.
+
+### Notes from Phase 5
+
+- `main` now exits with code 1 and prints errors as `Display` plus
+  their `source()` chain.  The previous `Box<dyn Error>` return
+  formatted everything via `Debug`, which surfaced enum-variant
+  names instead of the carefully-worded `thiserror` messages.
+- `--header` writes one line to stderr in the form `seeit:
+  session=ID target=X mode=Y sources=N filter=Z window=W`; stdout
+  stays free of context lines so output remains pipeable.
+- The filter portion of the header uses the predicates' `Debug`
+  form for now.  A round-trip `Display` (parsing the printed form
+  back to the same `Filter`) would be a sound piece of follow-up
+  work, but isn't blocking.
+
+### Open question for Phase 6
+
+The keybinding's *destination* needs your call.  Three plausible
+shapes:
+
+1. **Echo on exit**.  Pressing `Y` writes the equivalent `seeit`
+   command to stderr just before the TUI shuts down (so it lands
+   in the terminal scrollback after the alternate screen
+   restores).  Simple, no UI changes; only awkward if you want to
+   keep using the TUI after copying.
+2. **Modal popup**.  Pressing `Y` opens a small dialog showing the
+   command with copy hint; `Esc` closes.  Lets you stay in the
+   TUI; pricier in code.
+3. **Write to file**.  Pressing `Y` writes the command to a
+   user-supplied path (or a default like `seeit-cmd.txt`) and
+   shows a brief flash message.  Friendly for follow-up
+   pasting into a bug report.
+
+The plan currently leans toward option 2 (modal popup, matching
+the bookmark/filter dialog idiom in seer) but the choice is yours.
 
 ## Phases
 
@@ -188,7 +221,7 @@ This is a code-sharing exercise, not a re-implementation:
 - Integration tests under `tests/`: build a session via the library,
   save it, invoke the binary, snapshot stdout.
 
-### [ ] Phase 5 — Diagnostics polish
+### [x] Phase 5 — Diagnostics polish
 
 - `--header` flag prints a one-line context banner to stderr (session
   id, target, starting cursor) for human-reading runs; never to stdout.

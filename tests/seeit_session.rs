@@ -407,9 +407,15 @@ fn unknown_session_returns_nonzero_exit() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The friendly error printer prefixes with "seeit:" and prints
+    // the Display form (no Debug-style enum variant names).
     assert!(
-        stderr.contains("Io") || stderr.contains("session"),
-        "expected error message about missing session, got:\n{stderr}"
+        stderr.starts_with("seeit:"),
+        "expected friendly seeit: prefix, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("I/O error"),
+        "expected I/O error mention from store load failure, got:\n{stderr}"
     );
 }
 
@@ -437,6 +443,97 @@ fn fingerprint_mismatch_fails_loudly() {
         stderr.contains("changed since the session was saved")
             || stderr.contains("SourceFingerprint"),
         "expected fingerprint error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn header_writes_context_to_stderr_not_stdout() {
+    let dir = tempdir().unwrap();
+    let staged = stage_sample(&dir, "sample.log");
+    let (session, _) = build_session(&staged);
+    let id = session.id;
+    save_session(dir.path(), &session);
+
+    let exe = env!("CARGO_BIN_EXE_seeit");
+    let output = Command::new(exe)
+        .env(STATE_DIR_ENV, dir.path().as_str())
+        .args([
+            "--session",
+            &id.to_string(),
+            "--tab",
+            "Tab 1",
+            "--count",
+            "1",
+            "--header",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // Stdout should be the rendered record only, no banner line.
+    assert!(
+        !stdout.contains("seeit: session="),
+        "banner leaked into stdout:\n{stdout}"
+    );
+    assert_eq!(count_records(&stdout), 1);
+
+    // Stderr carries the banner and identifies the target.
+    assert!(
+        stderr.starts_with("seeit: session="),
+        "expected banner on stderr, got:\n{stderr}"
+    );
+    assert!(stderr.contains(&format!("session={id}")));
+    assert!(stderr.contains("target=tab"));
+    assert!(stderr.contains("mode=records"));
+    assert!(stderr.contains("window=count=1"));
+}
+
+#[test]
+fn header_omitted_means_nothing_on_stderr() {
+    let dir = tempdir().unwrap();
+    let staged = stage_sample(&dir, "sample.log");
+    let (session, _) = build_session(&staged);
+    let id = session.id;
+    save_session(dir.path(), &session);
+
+    let exe = env!("CARGO_BIN_EXE_seeit");
+    let output = Command::new(exe)
+        .env(STATE_DIR_ENV, dir.path().as_str())
+        .args(["--session", &id.to_string(), "--count", "1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("seeit: session="),
+        "did not pass --header but got a banner:\n{stderr}"
+    );
+}
+
+#[test]
+fn validation_error_prints_friendly_message() {
+    // --stream without --session is caught by Args::validate; the
+    // friendlier error printer in main should surface the
+    // SessionRequired Display, not the Debug-form of the enum
+    // variant.
+    let exe = env!("CARGO_BIN_EXE_seeit");
+    let output = Command::new(exe)
+        .args(["foo.log", "--stream", "Nexus"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--stream"));
+    assert!(
+        stderr.contains("requires"),
+        "expected friendly 'requires --session' message, got:\n{stderr}"
+    );
+    // The Debug form `SessionRequired { flag: ... }` must NOT appear.
+    assert!(
+        !stderr.contains("SessionRequired"),
+        "Debug-form leaked into output:\n{stderr}"
     );
 }
 
