@@ -93,13 +93,21 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: not started.**  Design agreed in conversation; this file is the
-running record.  Update the "Status" line and check the phase box as
-work lands.
+**Current phase: Phase 2 — target-resolution library helper.**  Phase 1
+landed (CLI restructure committed).  Update the "Status" line and check
+the phase box as work lands.
+
+### Notes from Phase 1
+
+- clap 4.6's per-arg `requires` and group `requires` are not enforced
+  when the input group is satisfied by `files`; cross-arg invariants
+  live in `Args::validate` instead.  Phase 5 should consider whether
+  to convert this error type into a nicer Display in `main` (today it
+  surfaces via `Debug`).
 
 ## Phases
 
-### [ ] Phase 1 — CLI restructure for `seeit` (no behavior change)
+### [x] Phase 1 — CLI restructure for `seeit` (no behavior change)
 
 - Restructure `Args` in `src/bin/seeit.rs` to add `--session`,
   `--stream`, `--tab`, `--bookmark`, `--count`, `--before`, `--filter`,
