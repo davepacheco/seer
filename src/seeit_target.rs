@@ -462,6 +462,56 @@ fn check_source_fingerprints(session: &Session) -> Result<(), ResolveError> {
     Ok(())
 }
 
+/// Builds a shell-quotable `seeit` invocation that reproduces the
+/// `seer` view targeted by `selector` in session `session_id`.
+///
+/// Produces the minimal correct command — for selector-based
+/// targets, all the stream's filter and render-options come along
+/// inside the saved session, so the command itself stays short.  The
+/// only argument that needs shell-aware quoting is the selector's
+/// name (tabs and streams may contain spaces); [`shlex::try_quote`]
+/// handles that, with a fallback to ASCII double-quotes for the
+/// (currently impossible) case where the name contains a NUL.
+pub fn build_seeit_command(
+    session_id: SessionId,
+    selector: &Selector,
+) -> String {
+    match selector {
+        Selector::WholeSession => {
+            format!("seeit --session {session_id}")
+        }
+        Selector::Stream(name) => {
+            format!(
+                "seeit --session {session_id} --stream {}",
+                shell_quote(name),
+            )
+        }
+        Selector::Tab(name) => {
+            format!(
+                "seeit --session {session_id} --tab {}",
+                shell_quote(name),
+            )
+        }
+        Selector::Bookmark(needle) => {
+            format!(
+                "seeit --session {session_id} --bookmark {}",
+                shell_quote(needle),
+            )
+        }
+    }
+}
+
+/// Shell-quotes `s` for inclusion in a `seeit` invocation.  Falls
+/// back to bare double-quoting if `shlex` rejects the input (only
+/// happens for embedded NULs today, but the fallback keeps the
+/// function total).
+fn shell_quote(s: &str) -> String {
+    match shlex::try_quote(s) {
+        Ok(cow) => cow.into_owned(),
+        Err(_) => format!("\"{s}\""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +835,60 @@ mod tests {
         let err =
             resolve_in_session(&session, &Selector::WholeSession).unwrap_err();
         assert!(matches!(err, ResolveError::SourceMissing { .. }));
+    }
+
+    #[test]
+    fn build_command_for_whole_session_omits_selector() {
+        let id: SessionId = "deadbeef".parse().unwrap();
+        assert_eq!(
+            build_seeit_command(id, &Selector::WholeSession),
+            "seeit --session deadbeef",
+        );
+    }
+
+    #[test]
+    fn build_command_for_each_selector_kind() {
+        let id: SessionId = "deadbeef".parse().unwrap();
+        assert_eq!(
+            build_seeit_command(id, &Selector::Stream("Nexus".into())),
+            "seeit --session deadbeef --stream Nexus",
+        );
+        assert_eq!(
+            build_seeit_command(id, &Selector::Tab("Nexus".into())),
+            "seeit --session deadbeef --tab Nexus",
+        );
+        assert_eq!(
+            build_seeit_command(id, &Selector::Bookmark("panic".into())),
+            "seeit --session deadbeef --bookmark panic",
+        );
+    }
+
+    #[test]
+    fn build_command_shell_quotes_names_with_spaces() {
+        let id: SessionId = "deadbeef".parse().unwrap();
+        let cmd = build_seeit_command(id, &Selector::Tab("Tab 1".into()));
+        // `shlex::try_quote` chooses single-quotes for ASCII-with-space
+        // input.  We assert the structure rather than the exact form so
+        // future shlex tweaks (e.g. choosing double-quotes) don't break
+        // the test.
+        assert!(
+            cmd.ends_with("--tab 'Tab 1'") || cmd.ends_with("--tab \"Tab 1\""),
+            "expected shell-quoted tab name, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_command_round_trips_through_a_shell_split() {
+        // The whole point of building this string is feeding it back
+        // to a shell.  Verify that splitting it via shlex yields the
+        // exact arg vector that recreates the selector.
+        let id: SessionId = "12345678".parse().unwrap();
+        let cmd = build_seeit_command(id, &Selector::Tab("Tab 1".into()));
+        let argv = shlex::split(&cmd).expect("valid shell quoting");
+        assert_eq!(
+            argv,
+            vec!["seeit", "--session", "12345678", "--tab", "Tab 1"],
+        );
     }
 
     #[test]

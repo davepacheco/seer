@@ -31,7 +31,7 @@ pub use render::{
 pub use save_policy::{Cadence, SavePolicy};
 pub use seeit_target::{
     BookmarkChoice, ResolveError, ResolvedMode, ResolvedTarget, Selector,
-    resolve, resolve_in_session,
+    build_seeit_command, resolve, resolve_in_session,
 };
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,

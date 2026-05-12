@@ -30,9 +30,9 @@ use seer::{
     Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
     Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
     MatchKind, Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome,
-    Session, SessionId, SessionMatch, SessionSource, SessionStore, SourceId,
-    StoreError, StreamView, SummaryBuilder, TabKind, WindowFillStatus,
-    format_summary,
+    Selector, Session, SessionId, SessionMatch, SessionSource, SessionStore,
+    SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
+    WindowFillStatus, build_seeit_command, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -3024,6 +3024,41 @@ impl App {
         self.tabs[self.active].name = name;
     }
 
+    /// Opens the read-only popup showing the `seeit` command that
+    /// would reproduce the active view.
+    ///
+    /// Saves the session first so the on-disk state matches what the
+    /// user is looking at — the printed command's claims about
+    /// filter, cursor, and field visibility would otherwise lag the
+    /// user's most recent edits.  When the App has no
+    /// [`SessionStore`] attached (a transient session passed via
+    /// `--no-resume` or similar), the command isn't meaningful
+    /// because there's nothing on disk to point `seeit` at; the
+    /// keybinding falls back to a notice.
+    fn open_seeit_command_dialog(&mut self) {
+        if self.store.is_none() {
+            self.notice = Some(
+                "seeit reproduction needs a saved session (this one \
+                 is transient)"
+                    .to_string(),
+            );
+            return;
+        }
+        if let Err(e) = self.try_save_now() {
+            self.notice = Some(format!("save before seeit failed: {e}"));
+            return;
+        }
+        let active = self.active_tab();
+        // The active tab's name is the LogStream's name (the runtime
+        // tab caches it).  `--tab` is the right selector here: it
+        // resumes at the tab's saved cursor, matches the persisted
+        // TabKind (so Summary tabs reproduce as summaries), and works
+        // even for tabs whose cursor is at the start of the stream.
+        let selector = Selector::Tab(active.name.clone());
+        let cmd = build_seeit_command(self.session.id, &selector);
+        self.dialog = Some(Dialog::seeit_command(cmd));
+    }
+
     /// Adds a bookmark to the session, filed under the active tab's
     /// stream.  If this is the user's first bookmark the synthetic
     /// Bookmarks tab will appear in the next render; we leave the
@@ -4062,6 +4097,18 @@ impl App {
             } => {
                 self.close_active_tab();
             }
+            // `Y`: open the seeit-reproduction popup with the
+            // command that would reproduce the active view.
+            // Capital Y is unbound elsewhere; uppercase keeps it from
+            // colliding with the lowercase `y` we may reserve for
+            // yank-style actions later.  Terminals report `Y` with
+            // either NONE or SHIFT — accept both.
+            KeyEvent { code: KeyCode::Char('Y'), modifiers, .. }
+                if modifiers == KeyModifiers::NONE
+                    || modifiers == KeyModifiers::SHIFT =>
+            {
+                self.open_seeit_command_dialog();
+            }
             // Time-navigation step controls.  `=` and `+` grow the
             // step; `-` shrinks it.  `=` is the unshifted character on
             // US layouts (so the user can adjust without holding
@@ -4339,6 +4386,10 @@ enum Dialog {
     /// spacebar; Enter applies the draft to the active stream, Esc
     /// discards it.
     DisplayFields { draft: RenderOpts, cursor: usize },
+    /// Read-only popup showing the `seeit` invocation that would
+    /// reproduce the active view.  `Esc` or `Enter` close it.
+    /// Opened by the `Y` binding.
+    SeeitCommand { text: String },
 }
 
 /// One row in the [`Dialog::DisplayFields`] list.  Items are either
@@ -4517,6 +4568,13 @@ impl Dialog {
         Self::DisplayFields { draft: opts, cursor: 0 }
     }
 
+    /// Read-only `seeit`-command popup carrying the prebuilt
+    /// command string.  Built outside the dialog so the caller can
+    /// fail closed (transient session, etc.) before opening any UI.
+    fn seeit_command(text: String) -> Self {
+        Self::SeeitCommand { text }
+    }
+
     fn editor(&self) -> Option<&LineEditor> {
         match self {
             Self::Filter { editor, .. }
@@ -4525,7 +4583,8 @@ impl Dialog {
             | Self::BookmarkName { editor, .. } => Some(editor),
             Self::ConfirmDeleteBookmark { .. }
             | Self::ConfirmQuit
-            | Self::DisplayFields { .. } => None,
+            | Self::DisplayFields { .. }
+            | Self::SeeitCommand { .. } => None,
         }
     }
 
@@ -4537,7 +4596,8 @@ impl Dialog {
             | Self::BookmarkName { .. }
             | Self::ConfirmDeleteBookmark { .. }
             | Self::ConfirmQuit
-            | Self::DisplayFields { .. } => None,
+            | Self::DisplayFields { .. }
+            | Self::SeeitCommand { .. } => None,
         }
     }
 
@@ -4569,6 +4629,9 @@ impl Dialog {
             Self::DisplayFields { .. } => {
                 "Display fields (Esc cancel · Enter apply · space toggle)"
                     .to_string()
+            }
+            Self::SeeitCommand { .. } => {
+                "seeit reproduction (Esc/Enter close)".to_string()
             }
         }
     }
@@ -4638,7 +4701,9 @@ impl Dialog {
             // Confirmation and selection dialogs have no editor;
             // non-Esc/Enter keys are dropped on the floor so a stray
             // `j`/`q` doesn't fall through to the underlying tab.
-            Self::ConfirmDeleteBookmark { .. } | Self::ConfirmQuit => {
+            Self::ConfirmDeleteBookmark { .. }
+            | Self::ConfirmQuit
+            | Self::SeeitCommand { .. } => {
                 return DialogResult::Stay;
             }
             // Already handled above.
@@ -4706,6 +4771,9 @@ impl Dialog {
             Self::DisplayFields { draft, .. } => {
                 DialogResult::ApplyDisplayFields(*draft)
             }
+            // The seeit-command popup is read-only: Enter just
+            // closes it, same as Esc.
+            Self::SeeitCommand { .. } => DialogResult::Cancel,
         }
     }
 }
@@ -5265,6 +5333,10 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
         render_display_fields_dialog(frame, dialog, draft, *cursor, area);
         return;
     }
+    if let Dialog::SeeitCommand { text } = dialog {
+        render_seeit_command_dialog(frame, dialog, text, area);
+        return;
+    }
 
     // Wrap the editor text so a long filter doesn't get clipped at the
     // popup's right edge.  Compute the inner width from the same
@@ -5422,6 +5494,33 @@ fn render_display_fields_dialog(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Renders the read-only `seeit`-command popup.  The body wraps the
+/// command at the popup's inner width and shows it with no cursor;
+/// `wrap_dialog_text` is shared with the editor variants so a long
+/// command (rare, but possible) flows across multiple rows the same
+/// way a long filter does.
+fn render_seeit_command_dialog(
+    frame: &mut Frame,
+    dialog: &Dialog,
+    text: &str,
+    area: Rect,
+) {
+    let popup_width = area.width.saturating_mul(70) / 100;
+    let inner_width = (popup_width.saturating_sub(2) as usize).max(1);
+    let wrapped = wrap_dialog_text(text, inner_width);
+    // One row per wrapped line plus the two-row outer frame.  Clamp
+    // via `popup_area`'s height-min so an extremely long command
+    // still fits the available screen.
+    let body_rows = u16::try_from(wrapped.len().max(1)).unwrap_or(u16::MAX);
+    let popup_height = body_rows.saturating_add(2);
+    let popup = popup_area(area, 70, popup_height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(dialog.title());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(wrapped), inner);
 }
 
 fn popup_area(area: Rect, percent_width: u16, height: u16) -> Rect {
@@ -10050,5 +10149,93 @@ mod tests {
         );
         // The mutation itself still landed in memory.
         assert!(a.session.user_bookmarks.contains_key(&stream_id));
+    }
+
+    #[test]
+    fn capital_y_opens_seeit_command_dialog() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let session_id = a.session.id;
+        let tab_name = a.active_tab().name.clone();
+
+        a.handle_key(shift('Y'));
+
+        // The dialog now carries the seeit-command popup with the
+        // exact reproduction string for the active tab.
+        let Some(Dialog::SeeitCommand { text }) = &a.dialog else {
+            panic!("expected SeeitCommand dialog after Y");
+        };
+        let expected = format!(
+            "seeit --session {session_id} --tab {}",
+            shlex::try_quote(&tab_name).unwrap(),
+        );
+        assert_eq!(text, &expected);
+    }
+
+    #[test]
+    fn esc_closes_seeit_command_dialog() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        a.handle_key(shift('Y'));
+        assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
+
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn enter_closes_seeit_command_dialog() {
+        // Read-only popup: Enter should close it (same as Esc), not
+        // act on the underlying tab.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        a.handle_key(shift('Y'));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn seeit_command_dialog_ignores_random_keys() {
+        // Non-Esc/Enter keys should not fall through to the
+        // underlying tab (which would scroll or quit) while the popup
+        // is open.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        a.handle_key(shift('Y'));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn seeit_command_dialog_saves_session_before_opening() {
+        // The opening flow calls try_save_now so the on-disk session
+        // matches the user's current state.  Use a save-policy
+        // mutation that hasn't been flushed yet, then press Y, and
+        // assert the dirty bit cleared.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        a.policy.record(Cadence::Inline);
+        // App::new + the constructor's initial save left the policy
+        // clean; we just dirtied it.  Confirm.
+        assert!(a.policy.dirty());
+
+        a.handle_key(shift('Y'));
+        assert!(
+            !a.policy.dirty(),
+            "Y should have flushed the dirty bit via try_save_now",
+        );
+    }
+
+    #[test]
+    fn seeit_command_dialog_notice_when_session_is_transient() {
+        // App with no store attached (the transient-session case).
+        let mut a = App::new(Engine::new());
+        assert!(a.store.is_none());
+
+        a.handle_key(shift('Y'));
+
+        assert!(a.dialog.is_none());
+        let notice = a.notice.as_ref().expect("notice should be set");
+        assert!(
+            notice.contains("transient"),
+            "expected transient-session notice, got: {notice}",
+        );
     }
 }

@@ -8,7 +8,8 @@ A tool for human exploration of bunyan log files from Oxide support cases.  Two 
 - **`seeit`**: a non-interactive development tool that prints filtered entries from the same files.  Not a throwaway proof-of-concept on the way to the TUI; a permanent artifact, useful for:
   - dev/debug iteration on the parser, filter language, and display formatting without ratatui in the way;
   - integration tests of the engine, driven by stdin/stdout;
-  - scripting when you want grep-like output, not an interactive session.
+  - scripting when you want grep-like output, not an interactive session;
+  - reproducing a `seer` view non-interactively: `seeit --session ID --tab NAME` (or `--stream`/`--bookmark`) emits exactly what the TUI would draw.  Press `Y` in `seer` to get the matching command for the active view.
 
 We're still in the exploratory phase.  There's no single milestone where the project is "done" or even "good enough".  There's some point where it's useful enough to share, but the features that define that point aren't yet known.  Hence: prioritize features, don't draw a line labeled "MVP".
 
@@ -302,3 +303,4 @@ New tabs should still open with this dialog.
   - `<` / `>` (`advance_time`) wasn't long-op'd; large time jumps under selective filters will freeze the UI.
   - `SeekFinalize::FrontOrBackFallback` runs `view.ensure_window` synchronously when the forward-from-cursor fetch came up empty.  Fine for typical bookmark navigation; a pathological filter with no matches anywhere could still freeze during finalize.
 - add a marker in the logstream where there are bookmarks
+- should bookmarks be navigable from any tab?

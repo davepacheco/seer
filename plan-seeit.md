@@ -93,10 +93,10 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: Phase 6 — `seer` keybinding for "print equivalent
-`seeit`".**  Phases 1–5 landed.  This phase needs a UX decision from
-the user (see "Open question for Phase 6" below) before the
-keybinding wiring is right.  Update the
+**All six phases landed.**  The Phase 6 popup is bound to `Y`; the
+inverse builder (`seer::build_seeit_command`) lives in
+`seeit_target.rs` alongside the resolver, and is round-trip-tested
+via `tests/seeit_session.rs::printed_seeit_command_actually_reproduces_the_view`.  Update the
 "Status" line and check the phase box as work lands.
 
 ### Notes from Phase 1
@@ -149,26 +149,20 @@ keybinding wiring is right.  Update the
   back to the same `Filter`) would be a sound piece of follow-up
   work, but isn't blocking.
 
-### Open question for Phase 6
+### Notes from Phase 6
 
-The keybinding's *destination* needs your call.  Three plausible
-shapes:
-
-1. **Echo on exit**.  Pressing `Y` writes the equivalent `seeit`
-   command to stderr just before the TUI shuts down (so it lands
-   in the terminal scrollback after the alternate screen
-   restores).  Simple, no UI changes; only awkward if you want to
-   keep using the TUI after copying.
-2. **Modal popup**.  Pressing `Y` opens a small dialog showing the
-   command with copy hint; `Esc` closes.  Lets you stay in the
-   TUI; pricier in code.
-3. **Write to file**.  Pressing `Y` writes the command to a
-   user-supplied path (or a default like `seeit-cmd.txt`) and
-   shows a brief flash message.  Friendly for follow-up
-   pasting into a bug report.
-
-The plan currently leans toward option 2 (modal popup, matching
-the bookmark/filter dialog idiom in seer) but the choice is yours.
+- Chose option 2 (modal popup): `Dialog::SeeitCommand { text }`,
+  opened by `Y` (uppercase, accepted with NONE or SHIFT to be
+  robust across terminals), closed by `Esc` or `Enter`.
+- The keybinding calls `App::try_save_now` before opening so the
+  on-disk session matches the user's current state.  A transient
+  session (no `SessionStore` attached) shows a notice instead of
+  the popup, because there's nothing on disk to point `seeit` at.
+- The reproduced command is always `seeit --session ID --tab NAME`
+  — the saved tab carries the filter, render options, cursor, and
+  `TabKind`, so no override flags are needed to round-trip.
+- `seer::build_seeit_command` is the library helper; tab/stream/
+  bookmark names are shell-quoted via `shlex::try_quote`.
 
 ## Phases
 
@@ -231,7 +225,7 @@ the bookmark/filter dialog idiom in seer) but the choice is yours.
 - Update `seeit.rs` module doc and the CLI `about` string to describe
   session mode.
 
-### [ ] Phase 6 — `seer` keybinding: "print equivalent `seeit`"
+### [x] Phase 6 — `seer` keybinding: "print equivalent `seeit`"
 
 - New binding in `seer` that, given the active tab, prints to a chosen
   destination (stderr after exit / a popup with copy hint / `--echo-cmd`

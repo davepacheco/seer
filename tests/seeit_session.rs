@@ -19,8 +19,8 @@ use camino_tempfile::{Utf8TempDir, tempdir};
 use chrono::{DateTime, Utc};
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, Filter, LogStream,
-    Session, SessionId, SessionSource, SessionStore, STATE_DIR_ENV, Tab,
-    TabKind,
+    Selector, Session, SessionId, SessionSource, SessionStore, STATE_DIR_ENV,
+    Tab, TabKind, build_seeit_command,
 };
 use std::fs;
 use std::process::Command;
@@ -535,6 +535,43 @@ fn validation_error_prints_friendly_message() {
         !stderr.contains("SessionRequired"),
         "Debug-form leaked into output:\n{stderr}"
     );
+}
+
+#[test]
+fn printed_seeit_command_actually_reproduces_the_view() {
+    // Round-trip: build the seeit command for a session's tab,
+    // split it through shlex (the same way a shell would), invoke
+    // the binary with those args, and confirm it produces non-empty
+    // output.  This is the contract Phase 6's seer keybinding relies
+    // on — whatever seer prints, the user can paste into a shell.
+    let dir = tempdir().unwrap();
+    let staged = stage_sample(&dir, "sample.log");
+    let (session, _) = build_session(&staged);
+    let id = session.id;
+    save_session(dir.path(), &session);
+
+    let cmd =
+        build_seeit_command(id, &Selector::Tab("Tab 1".to_string()));
+    let mut argv = shlex::split(&cmd).expect("valid shell quoting");
+    // The first token is "seeit" — drop it and feed the rest to the
+    // real binary the test framework built for us.
+    let program = argv.remove(0);
+    assert_eq!(program, "seeit");
+
+    let exe = env!("CARGO_BIN_EXE_seeit");
+    let output = Command::new(exe)
+        .env(STATE_DIR_ENV, dir.path().as_str())
+        .args(&argv)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "round-trip command failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(count_records(&stdout) >= 10);
 }
 
 #[test]
