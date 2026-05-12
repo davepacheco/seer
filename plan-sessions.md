@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 8 complete.  Next phase: **9. CLI surface.**
+Phase 9 complete.  Next phase: **10. Integration tests.**
 
 ## Goal
 
@@ -517,8 +517,37 @@ prove itself before the resume dialog lands on top.
     render-doesn't-panic smoke test for both empty and populated
     candidate lists.  496 tests pass.
 
-- [ ] **9. CLI surface.**  `--resume`, `--list`, exit-message
+- [x] **9. CLI surface.**  `--resume`, `--list`, exit-message
   variants for resumed vs. fresh sessions.
+  - `Args` gained `--resume SESSION_ID` and `--list`; the
+    positional `files` is now optional and `conflicts_with_all =
+    ["resume", "list"]`.  `--resume` and `--list` are also mutually
+    exclusive via `conflicts_with = "list"` on `--resume`.  Clap's
+    auto-generated --help shows the new flags.  `main` dispatches:
+    `--list` calls `list_sessions` and exits; `--resume` calls
+    `store.load(id)` + `engine_for_resumed_session(&s)` and then
+    `run_with_session(.., resumed = true)`; positional files run
+    the existing discovery + dialog flow.  When `--resume`'s
+    session references a path that no longer exists, the error
+    names every missing path in one message rather than aborting on
+    the first.  Extracted post-TUI bookkeeping into
+    `run_with_session` + `report_exit` so every code path (positional
+    + new-saved, positional + resumed-via-dialog, `--resume`)
+    routes through the same final-flush logic; the resumed-vs-fresh
+    distinction lives in the `RunOutcome.resumed` flag, which picks
+    between "session saved.  resume with: …" and "session
+    continued.  resume again with: …".  Transient sessions still
+    print nothing on a clean exit.  New helpers:
+    `load_all_sessions` (parse-error-tolerant; sorts by
+    `last_saved_at` descending), `format_session_list` (pure: header
+    + one row per session, columns id / `last_saved_at` / streams /
+    sources / first-source-path), `truncate_path_head` (keeps the
+    filename tail; prefixes `...`).  Seven new tests cover empty
+    list output, the row-count contract, truncation behavior on
+    both short and long inputs, missing-path error wording with
+    every missing path named, the success path, and that
+    `load_all_sessions` sorts newest-first and skips corrupt
+    `<id>.json` files.  503 tests pass.
 
 - [ ] **10. Integration tests** end-to-end through a synthetic
   engine.

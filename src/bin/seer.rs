@@ -30,8 +30,8 @@ use seer::{
     Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
     Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
     MatchKind, Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome,
-    Session, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
-    StreamView, SummaryBuilder, WindowFillStatus, format_summary,
+    Session, SessionId, SessionMatch, SessionSource, SessionStore, SourceId,
+    StoreError, StreamView, SummaryBuilder, WindowFillStatus, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -40,8 +40,21 @@ use std::time::{Duration, Instant};
 #[command(about = "interactive log explorer")]
 struct Args {
     /// One or more bunyan log files to read, in order.
-    #[arg(required = true)]
+    ///
+    /// Mutually exclusive with `--resume` and `--list`.
+    #[arg(conflicts_with_all = ["resume", "list"])]
     files: Vec<Utf8PathBuf>,
+
+    /// Resume a saved session by id.  Skips the resume dialog and
+    /// opens the TUI directly on the loaded session; the engine is
+    /// rebuilt from the session's own source list.  Aborts with an
+    /// error if any of the session's source files no longer exist.
+    #[arg(long, value_name = "SESSION_ID", conflicts_with = "list")]
+    resume: Option<SessionId>,
+
+    /// List saved sessions and exit, without opening the TUI.
+    #[arg(long)]
+    list: bool,
 }
 
 /// Registers each user-supplied path with the engine and returns the
@@ -323,8 +336,220 @@ fn run_startup_dialog(
     }
 }
 
+/// Returns the saved sessions in the store sorted by `last_saved_at`
+/// descending, skipping any whose JSON failed to parse.  A parse
+/// error is silently dropped here for the same reason `find_matches`
+/// drops them: an unloadable session is not usefully listable
+/// either, and the file stays on disk for a human to investigate.
+fn load_all_sessions(
+    store: &SessionStore,
+) -> Result<Vec<Session>, StoreError> {
+    let ids = store.list()?;
+    let mut sessions = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Ok(s) = store.load(id) {
+            sessions.push(s);
+        }
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.last_saved_at));
+    Ok(sessions)
+}
+
+/// Truncates `s` to at most `max_len` characters by chopping the
+/// *front* and prefixing `...`.  Path-aware: keeps the tail of the
+/// path (the filename + a bit of the directory) since that is
+/// usually what disambiguates the row.
+fn truncate_path_head(s: &str, max_len: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_len {
+        return s.to_string();
+    }
+    // Take the trailing `max_len - 3` chars; prefix `...`.
+    let skip = count - (max_len - 3);
+    let tail: String = s.chars().skip(skip).collect();
+    format!("...{tail}")
+}
+
+/// Pure function: formats the saved-session table the way `--list`
+/// prints it.  Returns one line per session plus a header line; an
+/// empty input returns a single `"(no saved sessions)"` line so
+/// callers don't have to special-case the empty case.
+fn format_session_list(sessions: &[Session]) -> String {
+    if sessions.is_empty() {
+        return "(no saved sessions)\n".to_string();
+    }
+    // Right-pad ids so the table aligns; the id is fixed-width (8
+    // hex chars) but we own the surrounding formatting.
+    let mut out = String::new();
+    out.push_str(
+        "ID        LAST SAVED (UTC)     STREAMS  SOURCES  FIRST SOURCE\n",
+    );
+    for s in sessions {
+        let first_source = s
+            .sources
+            .first()
+            .map(|src| src.path.as_str())
+            .unwrap_or("(none)");
+        let truncated = truncate_path_head(first_source, 60);
+        out.push_str(&format!(
+            "{}  {}  {:>7}  {:>7}  {}\n",
+            s.id,
+            s.last_saved_at.format("%Y-%m-%d %H:%M:%S"),
+            s.streams.len(),
+            s.sources.len(),
+            truncated,
+        ));
+    }
+    out
+}
+
+/// Prints the saved-session table to stdout.  Backs `--list`.
+fn list_sessions(
+    store: &SessionStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sessions = load_all_sessions(store)?;
+    print!("{}", format_session_list(&sessions));
+    Ok(())
+}
+
+/// Builds an [`Engine`] over the source set the resumed [`Session`]
+/// captured.  Verifies every recorded path still exists on disk;
+/// missing paths are collected and reported in a single error so
+/// the user sees the full list at once.
+fn engine_for_resumed_session(
+    session: &Session,
+) -> Result<Engine, Box<dyn std::error::Error>> {
+    let mut missing = Vec::new();
+    for src in &session.sources {
+        if !src.path.exists() {
+            missing.push(src.path.clone());
+        }
+    }
+    if !missing.is_empty() {
+        let names: Vec<String> =
+            missing.iter().map(|p| p.to_string()).collect();
+        return Err(format!(
+            "cannot resume session {}: missing source files: {}",
+            session.id,
+            names.join(", "),
+        )
+        .into());
+    }
+    let mut engine = Engine::new();
+    for src in &session.sources {
+        engine.add_file_source(&src.path)?;
+    }
+    Ok(engine)
+}
+
+/// Outcome of [`run_tui`] plus the metadata `main` needs to choose
+/// the right exit message.  Carrying the data through a struct
+/// keeps every code path (positional files, `--resume`, dialog
+/// choice) on the same final-flush + exit-message logic.
+struct RunOutcome {
+    app: App,
+    session_id: SessionId,
+    /// `true` when no store was attached for the run (transient
+    /// session).  Final flush is a no-op and no resume hint prints.
+    transient: bool,
+    /// `true` when the run started by resuming a saved session
+    /// (either via `--resume` or via the dialog).  Drives the
+    /// "continued" vs "saved" wording in the exit hint.
+    resumed: bool,
+}
+
+/// Runs the TUI to completion and then handles the final flush and
+/// exit-message printing.  Shared by both CLI dispatch paths
+/// (positional files and `--resume`).
+fn run_with_session(
+    engine: Engine,
+    session: Session,
+    store: Option<SessionStore>,
+    resumed: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = session.id;
+    let transient = store.is_none();
+    let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
+    if !transient {
+        // The on-disk file is up to date (we just saved a fresh
+        // session, or we just loaded a resumed one), so the
+        // debounce window starts now.
+        policy.mark_saved(Instant::now());
+    }
+
+    let app = run_tui(engine, session, store, policy)?;
+    let outcome = RunOutcome { app, session_id, transient, resumed };
+    report_exit(outcome);
+    Ok(())
+}
+
+/// Flushes any final dirty state and prints the exit hint.  Split
+/// out so the post-TUI bookkeeping is exercised by one shared
+/// function regardless of how the run was started.
+fn report_exit(mut outcome: RunOutcome) {
+    let final_save_err = if outcome.app.policy.dirty() {
+        outcome.app.try_save_now().err()
+    } else {
+        None
+    };
+
+    if outcome.transient {
+        // Transient sessions print nothing on a clean exit.
+    } else if let Some(err) = final_save_err {
+        eprintln!("seer: final session save failed: {err}");
+        eprintln!(
+            "session id: {} (state on disk may be partial)",
+            outcome.session_id
+        );
+    } else if outcome.resumed {
+        println!(
+            "session continued.  resume again with: seer --resume {}",
+            outcome.session_id
+        );
+    } else {
+        println!(
+            "session saved.  resume with: seer --resume {}",
+            outcome.session_id
+        );
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let store = SessionStore::open()?;
+
+    // `--list`: print the saved-session table and exit.  Mutually
+    // exclusive with everything else.
+    if args.list {
+        return list_sessions(&store);
+    }
+
+    // `--resume`: load the named session, rebuild the engine from
+    // its own source list, then jump straight into the TUI without
+    // a dialog.  Missing source files abort with a clear error.
+    if let Some(id) = args.resume {
+        let session = store.load(id)?;
+        let engine = engine_for_resumed_session(&session)?;
+        return run_with_session(
+            engine,
+            session,
+            Some(store),
+            /* resumed = */ true,
+        );
+    }
+
+    // Positional-files path: discovery + resume dialog.  Clap allows
+    // an empty file list at this point only because we relaxed
+    // `required = true`; surface a friendly message rather than the
+    // raw clap "missing argument" usage error.
+    if args.files.is_empty() {
+        return Err(
+            "no files provided; use --list to see saved sessions or \
+             --resume <id> to reopen one"
+                .into(),
+        );
+    }
 
     // Register every CLI-supplied file with the engine and capture
     // path / mtime / size for the session's source manifest.  The
@@ -333,22 +558,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new();
     let sources = build_session_sources(&args.files, &mut engine)?;
 
-    // Open the on-disk session store and look for saved sessions
-    // whose source set overlaps the user's command-line paths.  The
-    // dialog runs even when no candidates exist so the
-    // saved-vs-transient choice is still in front of the user.
-    let store = SessionStore::open()?;
+    // Look for saved sessions whose source set overlaps the user's
+    // command-line paths.  The dialog runs even when no candidates
+    // exist so the saved-vs-transient choice is still in front of
+    // the user.
     let user_paths: Vec<Utf8PathBuf> =
         sources.iter().map(|s| s.path.clone()).collect();
     let matches = store.find_matches(&user_paths)?;
 
     let choice = run_startup_dialog(matches)?;
 
-    // Build the [`Session`] that the App will use, plus the optional
+    // Build the [`Session`] the App will use, plus the optional
     // store: transient sessions get `None` and skip every write.
-    let (session, store_for_app) = match choice {
+    let (session, store_for_app, resumed) = match choice {
         StartupChoice::Quit => return Ok(()),
-        StartupChoice::Resume(s) => (s, Some(store)),
+        StartupChoice::Resume(s) => (s, Some(store), true),
         StartupChoice::NewSaved => {
             let mut s = Session::new();
             s.sources = sources;
@@ -356,50 +580,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // directory isn't writable the user hears about it now,
             // not after typing.
             store.save(s.id, &s)?;
-            (s, Some(store))
+            (s, Some(store), false)
         }
         StartupChoice::NewTransient => {
             let mut s = Session::new();
             s.sources = sources;
-            (s, None)
+            (s, None, false)
         }
     };
 
-    let session_id = session.id;
-    let is_transient = store_for_app.is_none();
-    let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
-    if !is_transient {
-        // The on-disk file is up to date (either we just saved the
-        // fresh session, or we just loaded the resumed one), so
-        // start the debounce window from now.
-        policy.mark_saved(Instant::now());
-    }
-
-    let mut app = run_tui(engine, session, store_for_app, policy)?;
-
-    // Final flush.  For transient sessions, try_save_now is a
-    // no-op, so this is harmless even when we never had a store.
-    let final_save_err = if app.policy.dirty() {
-        app.try_save_now().err()
-    } else {
-        None
-    };
-
-    if is_transient {
-        // Transient sessions print nothing on a clean exit.  A
-        // save error is impossible (no store) so nothing to report.
-    } else if let Some(err) = final_save_err {
-        eprintln!("seer: final session save failed: {err}");
-        eprintln!(
-            "session id: {session_id} (state on disk may be partial)"
-        );
-    } else {
-        println!(
-            "session saved.  resume with: seer --resume {session_id}"
-        );
-    }
-
-    Ok(())
+    run_with_session(engine, session, store_for_app, resumed)
 }
 
 /// Runs the ratatui event loop and returns the [`App`] when the user
@@ -9150,6 +9340,143 @@ mod tests {
             .unwrap()
             .show_extras;
         assert_eq!(after, !before);
+    }
+
+    // ---------- CLI surface (phase 9) ----------
+
+    #[test]
+    fn format_session_list_empty_returns_friendly_message() {
+        let out = format_session_list(&[]);
+        assert_eq!(out, "(no saved sessions)\n");
+    }
+
+    #[test]
+    fn format_session_list_contains_one_row_per_session() {
+        let s1 = Session::new();
+        let s2 = Session::new();
+        let out = format_session_list(&[s1.clone(), s2.clone()]);
+        // Header line + 2 data lines = 3 newlines total.
+        assert_eq!(out.matches('\n').count(), 3);
+        // The ids should appear in the output.
+        assert!(out.contains(&s1.id.to_string()));
+        assert!(out.contains(&s2.id.to_string()));
+        // The header line is present.
+        assert!(out.lines().next().unwrap().contains("LAST SAVED"));
+    }
+
+    #[test]
+    fn truncate_path_head_keeps_short_strings_intact() {
+        assert_eq!(truncate_path_head("/foo/bar", 60), "/foo/bar");
+    }
+
+    #[test]
+    fn truncate_path_head_chops_the_front_with_an_ellipsis() {
+        let long = "/a/very/very/long/path/to/some/file.log";
+        let out = truncate_path_head(long, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.starts_with("..."));
+        // The trailing filename is preserved.
+        assert!(out.ends_with("file.log"));
+    }
+
+    #[test]
+    fn engine_for_resumed_session_errors_naming_missing_paths() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let exists = dir.path().join("present.log");
+        std::fs::write(&exists, b"hi\n").unwrap();
+        let missing = dir.path().join("gone.log");
+        // Do *not* create `missing`.
+
+        let mut s = Session::new();
+        s.sources = vec![
+            SessionSource {
+                id: SourceId::from(exists.as_str().to_string()),
+                path: exists.clone(),
+                mtime: chrono::Utc::now(),
+                size: 3,
+            },
+            SessionSource {
+                id: SourceId::from(missing.as_str().to_string()),
+                path: missing.clone(),
+                mtime: chrono::Utc::now(),
+                size: 0,
+            },
+        ];
+        let Err(err) = engine_for_resumed_session(&s) else {
+            panic!("expected error when a source file is missing");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing source files"), "msg = {msg}");
+        assert!(
+            msg.contains(missing.as_str()),
+            "expected msg to name {missing}, got {msg}"
+        );
+    }
+
+    #[test]
+    fn engine_for_resumed_session_succeeds_when_all_paths_present() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.log");
+        let b = dir.path().join("b.log");
+        std::fs::write(&a, b"hi\n").unwrap();
+        std::fs::write(&b, b"").unwrap();
+
+        let mut s = Session::new();
+        s.sources = vec![
+            SessionSource {
+                id: SourceId::from(a.canonicalize_utf8().unwrap().as_str().to_string()),
+                path: a.canonicalize_utf8().unwrap(),
+                mtime: chrono::Utc::now(),
+                size: 3,
+            },
+            SessionSource {
+                id: SourceId::from(b.canonicalize_utf8().unwrap().as_str().to_string()),
+                path: b.canonicalize_utf8().unwrap(),
+                mtime: chrono::Utc::now(),
+                size: 0,
+            },
+        ];
+        let Ok(_engine) = engine_for_resumed_session(&s) else {
+            panic!("expected engine_for_resumed_session to succeed");
+        };
+    }
+
+    #[test]
+    fn load_all_sessions_sorts_newest_first_and_skips_corrupt() {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let store =
+            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+
+        // Save three sessions with explicit timestamps.
+        let make = |secs: i64| {
+            let mut s = Session::new();
+            s.last_saved_at = chrono::TimeZone::timestamp_opt(
+                &chrono::Utc,
+                secs,
+                0,
+            )
+            .single()
+            .unwrap();
+            s
+        };
+        let old = make(100);
+        let mid = make(200);
+        let new = make(300);
+        store.save(old.id, &old).unwrap();
+        store.save(mid.id, &mid).unwrap();
+        store.save(new.id, &new).unwrap();
+
+        // Drop a corrupt JSON named like a session id; it should
+        // be silently skipped.
+        std::fs::write(
+            store.sessions_dir().join("deadbeef.json"),
+            "{ not valid",
+        )
+        .unwrap();
+
+        let sessions = load_all_sessions(&store).unwrap();
+        let ids: Vec<_> = sessions.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![new.id, mid.id, old.id]);
     }
 
     // ---------- startup dialog (phase 8) ----------
