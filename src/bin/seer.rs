@@ -5161,16 +5161,17 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Centered popups (Filter, Rename, BookmarkName,
-    // ConfirmDeleteBookmark, ConfirmQuit, DisplayFields) draw on top
-    // of the rest.  The Search prompt is laid out inline above and is
-    // skipped here.
+    // ConfirmDeleteBookmark, ConfirmQuit, DisplayFields,
+    // SeeitCommand) draw on top of the rest.  The Search prompt is
+    // laid out inline above and is skipped here.
     if let Some(
         dialog @ (Dialog::Filter { .. }
         | Dialog::Rename { .. }
         | Dialog::BookmarkName { .. }
         | Dialog::ConfirmDeleteBookmark { .. }
         | Dialog::ConfirmQuit
-        | Dialog::DisplayFields { .. }),
+        | Dialog::DisplayFields { .. }
+        | Dialog::SeeitCommand { .. }),
     ) = app.dialog.as_ref()
     {
         render_dialog(frame, dialog, area);
@@ -10220,6 +10221,33 @@ mod tests {
         assert!(
             !a.policy.dirty(),
             "Y should have flushed the dirty bit via try_save_now",
+        );
+    }
+
+    #[test]
+    fn seeit_command_dialog_renders_visibly() {
+        // Regression: an earlier version of the SeeitCommand variant
+        // forgot to add itself to the centered-popup dispatch in
+        // `render`, leaving the dialog invisible while still
+        // capturing every keystroke.  Drive a full render and
+        // assert the popup's title text appears in the buffer.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        // Push enough rows that the underlying tab has content to
+        // render under the popup; without rows the assert still
+        // catches the missing dispatch, but the dump is easier to
+        // read with realistic content.
+        let backend = TestBackend::new(200, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        a.handle_key(shift('Y'));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(
+            dump.contains("seeit reproduction"),
+            "expected popup title in rendered buffer, got:\n{dump}",
+        );
+        assert!(
+            dump.contains("seeit --session"),
+            "expected command text in rendered buffer, got:\n{dump}",
         );
     }
 
