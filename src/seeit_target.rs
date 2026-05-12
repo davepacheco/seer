@@ -16,8 +16,10 @@
 use crate::engine::Cursor;
 use crate::filter::Filter;
 use crate::render::RenderOpts;
-use crate::session::{Bookmark, BookmarkId, BookmarkName, Session, TabKind};
-use crate::session_store::{SessionId, SessionStore, StoreError};
+use crate::session::{
+    Bookmark, BookmarkId, BookmarkName, Session, SessionId, TabKind,
+};
+use crate::session_store::{SessionStore, StoreError};
 use crate::stream::{LogStream, LogStreamId};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};

@@ -20,7 +20,6 @@
 //! shim keyed on `version`.
 
 use crate::engine::Cursor;
-use crate::session_store::SessionId;
 use crate::source::SourceId;
 use crate::stream::{LogStream, LogStreamId};
 use camino::Utf8PathBuf;
@@ -30,6 +29,9 @@ use iddqd::IdOrdMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+use thiserror::Error;
 use uuid::Uuid;
 
 /// Current on-disk schema version.  Bump whenever the serialized
@@ -37,6 +39,117 @@ use uuid::Uuid;
 /// fixture test will fail and prompt the author to refresh both
 /// this constant and the checked-in fixture.
 pub const CURRENT_SESSION_VERSION: u32 = 4;
+
+/// Short, user-typeable session id.
+///
+/// Eight lowercase hex characters drawn from the first four bytes of
+/// a UUIDv4.  Long enough that collisions are vanishingly rare in a
+/// single user's session directory; short enough to type after
+/// `--resume`.  The id is the filename stem on disk: `<id>.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId([u8; 4]);
+
+impl SessionId {
+    /// Returns a freshly-generated random session id.
+    pub fn random() -> Self {
+        let bytes = Uuid::new_v4().into_bytes();
+        Self([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// Returns the id as its four underlying bytes.
+    pub fn as_bytes(&self) -> [u8; 4] {
+        self.0
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3]
+        )
+    }
+}
+
+/// Error parsing a [`SessionId`] from a string.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SessionIdParseError {
+    /// Input was not 8 characters long.
+    #[error("session id must be 8 hex characters; got {0}")]
+    WrongLength(usize),
+
+    /// Input contained a non-hex character.
+    #[error("session id contains a non-hex character")]
+    NonHex,
+}
+
+impl FromStr for SessionId {
+    type Err = SessionIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != 8 {
+            return Err(SessionIdParseError::WrongLength(s.len()));
+        }
+        let mut out = [0u8; 4];
+        for (i, byte) in out.iter_mut().enumerate() {
+            let chunk = &s[i * 2..i * 2 + 2];
+            *byte = u8::from_str_radix(chunk, 16)
+                .map_err(|_| SessionIdParseError::NonHex)?;
+        }
+        Ok(Self(out))
+    }
+}
+
+// Serialize as the 8-char hex string the user sees, not as a byte
+// array — so the on-disk representation matches what `--resume`
+// takes on the command line.
+impl Serialize for SessionId {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+// Manual JsonSchema impl: SessionId serializes as the 8-char hex
+// string from `Display`, not as its underlying 4-byte array, so the
+// schema must describe a string with the right shape rather than
+// inheriting the byte-array shape a derive would produce.
+impl schemars::JsonSchema for SessionId {
+    fn schema_name() -> String {
+        "SessionId".to_owned()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("seer::session::SessionId")
+    }
+
+    fn json_schema(
+        _: &mut schemars::r#gen::SchemaGenerator,
+    ) -> schemars::schema::Schema {
+        schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            string: Some(Box::new(schemars::schema::StringValidation {
+                pattern: Some(r"^[0-9a-f]{8}$".to_owned()),
+                min_length: Some(8),
+                max_length: Some(8),
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
 
 /// User-supplied name for a bookmark.
 #[derive(

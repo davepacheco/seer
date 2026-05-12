@@ -14,10 +14,10 @@ listed once with all references gathered.
 
 | Field          | Value                                              |
 |----------------|----------------------------------------------------|
-| Items closed   | 3 / 44                                             |
+| Items closed   | 4 / 44                                             |
 | Current item   | —  (pick the first unchecked below)                |
 | Last updated   | 2026-05-12                                         |
-| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live.  Item 2: each of the three sites restructured to avoid the unwrap entirely — `try_save_now` collapses the redundant `is_none` check into a single `if let`; `push_tab` computes `render_opts` before the insert takes ownership; bookmark navigation fuses the bookmark→stream and stream→filter lookups into one `find_map` so only a single `.expect` (for the joint invariant) remains.  Item 3: `render_opts` destructures `self` (binding render-related fields, `_`-ing `id`/`name`/`filter`) and `set_render_opts` destructures `opts`; adding a new `RenderOpts` field now fails to compile in both directions until propagated. |
+| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live.  Item 2: each of the three sites restructured to avoid the unwrap entirely — `try_save_now` collapses the redundant `is_none` check into a single `if let`; `push_tab` computes `render_opts` before the insert takes ownership; bookmark navigation fuses the bookmark→stream and stream→filter lookups into one `find_map` so only a single `.expect` (for the joint invariant) remains.  Item 3: `render_opts` destructures `self` (binding render-related fields, `_`-ing `id`/`name`/`filter`) and `set_render_opts` destructures `opts`; adding a new `RenderOpts` field now fails to compile in both directions until propagated.  Item 4: `SessionId` and `SessionIdParseError` moved from `session_store` to `session`; `session_store` now imports them from `session` (cycle broken).  `schema_id` updated from `seer::session_store::SessionId` to `seer::session::SessionId`; schema-fixture test still passes since the fixture doesn't `$ref` it.  `seeit_target` and `lib.rs` re-exports adjusted; `session_store` lost its unused `serde`/`fmt`/`FromStr`/`uuid` imports. |
 
 ### How this state works
 
@@ -53,7 +53,7 @@ genuine design choice to make.
       fails to compile until propagated.  *Refs:* P3 §B1, P5 §A1.
       *Affects:* `src/stream.rs:195, :210`.  *Enables:* item 37.
 
-- [ ] **4. Move `SessionId` from `session_store` into `session`.**
+- [x] **4. Move `SessionId` from `session_store` into `session`.**
       Breaks the `session ↔ session_store` cycle.  Pure rename.
       *Refs:* P2 §F2, P4 §B3.  *Affects:* `src/session_store.rs`,
       `src/session.rs`.

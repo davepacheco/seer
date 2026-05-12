@@ -35,11 +35,10 @@ pub use seeit_target::{
 };
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,
-    SessionSource, Tab, TabKind,
+    SessionId, SessionIdParseError, SessionSource, Tab, TabKind,
 };
 pub use session_store::{
-    MatchKind, STATE_DIR_ENV, SessionId, SessionIdParseError, SessionMatch,
-    SessionStore, StoreError,
+    MatchKind, STATE_DIR_ENV, SessionMatch, SessionStore, StoreError,
 };
 pub use source::{
     ByteOffset, Direction, FileSource, QueryRecord, Source, SourceError,
