@@ -26,7 +26,9 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 9 complete.  Next phase: **10. Integration tests.**
+All phases complete.  Persistent sessions are in production shape; the
+saver, discovery, dialog, and CLI surface are fully wired up and
+covered by unit + integration tests.
 
 ## Goal
 
@@ -549,5 +551,23 @@ prove itself before the resume dialog lands on top.
     `load_all_sessions` sorts newest-first and skips corrupt
     `<id>.json` files.  503 tests pass.
 
-- [ ] **10. Integration tests** end-to-end through a synthetic
+- [x] **10. Integration tests** end-to-end through a synthetic
   engine.
+  - New `tests/session_lifecycle.rs` exercises the public library
+    boundary in the same shape the `seer` binary uses it: a session
+    is built with sources, streams, and bookmarks; saved and
+    reloaded through a `SessionStore`; mutated again under the
+    inline-save pattern (`record(Inline)` + `store.save` +
+    `mark_saved`); and finally rediscovered and resumed through a
+    *fresh* `SessionStore` handle, modeling the "quit and restart"
+    flow.  Seven tests: a basic round-trip, the inline-save loop
+    end-to-end, the debounced gate-and-flush pattern, discovery
+    picking the right candidate among unrelated sessions, the
+    cross-"process" resume flow (drop store + session, reopen,
+    discover, assert state), atomic overwrite across three saves
+    in a row, and a multi-id `list` smoke test.  These complement
+    the per-module unit tests rather than duplicating them — the
+    focus here is that `Session`, `SavePolicy`, and `SessionStore`
+    interoperate the way the binary needs them to.  510 tests pass
+    (the integration tests run alongside the existing
+    `session_schema.rs` fixture diff under `cargo nextest`).
