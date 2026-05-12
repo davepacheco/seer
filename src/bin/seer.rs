@@ -27,11 +27,11 @@ use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
-    HostnameDisplay, LogStream, LogStreamId, LogStreamPosition, Predicate,
-    RenderOpts, SavePolicy, SearchDir, SearchOutcome, Session, SessionSource,
-    SessionStore, SourceId, StoreError, StreamView, SummaryBuilder,
-    WindowFillStatus, format_summary,
+    Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
+    Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
+    Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome, Session,
+    SessionSource, SessionStore, SourceId, StoreError, StreamView,
+    SummaryBuilder, WindowFillStatus, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1579,6 +1579,26 @@ impl App {
         Ok(())
     }
 
+    /// Records that an inline-cadence mutation just happened and
+    /// flushes the session to disk right away.  Save failures are
+    /// surfaced through [`Self::notice`] so the user sees them in
+    /// the footer; the dirty bit stays set so the next save
+    /// opportunity (another mutation, the debounce tick, or exit)
+    /// retries.
+    ///
+    /// Call this at the *end* of every low-cadence mutation method
+    /// (bookmark create / delete, tab open / close, filter change,
+    /// field show / hide).  Helper methods that several user
+    /// gestures share — e.g. [`Self::rerender_after_stream_mutation`]
+    /// — must not call this themselves; the user-gesture method on
+    /// the outside is the right level.
+    fn save_after_inline_mutation(&mut self) {
+        self.policy.record(Cadence::Inline);
+        if let Err(e) = self.try_save_now() {
+            self.notice = Some(format!("session save failed: {e}"));
+        }
+    }
+
     /// Pushes a new tab backed by a fresh [`LogStream`] with the given
     /// filter.  Does *not* open the filter dialog — callers that want
     /// that (e.g. Ctrl-T) do it explicitly after.  Switches focus to
@@ -1615,6 +1635,7 @@ impl App {
         if kind == TabKind::Summary {
             self.enqueue_summary_build(self.tabs.len() - 1, pushed_filter);
         }
+        self.save_after_inline_mutation();
     }
 
     /// Queues a Summary rebuild for the tab at `tab_idx`.  Starts the
@@ -1978,6 +1999,7 @@ impl App {
         );
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.save_after_inline_mutation();
     }
 
     fn active_tab(&self) -> &Tab {
@@ -2199,6 +2221,7 @@ impl App {
                 }
             }
         }
+        self.save_after_inline_mutation();
     }
 
     /// Installs a fresh [`StreamView`] (under `filter`/`opts`) on the
@@ -2270,6 +2293,7 @@ impl App {
         };
         stream.show_extras = !stream.show_extras;
         self.rerender_after_stream_mutation(stream_id, stream);
+        self.save_after_inline_mutation();
     }
 
     /// Toggles whether the leading timestamp on each rendered line
@@ -2284,6 +2308,7 @@ impl App {
         };
         stream.show_date = !stream.show_date;
         self.rerender_after_stream_mutation(stream_id, stream);
+        self.save_after_inline_mutation();
     }
 
     /// Toggles raw rendering on the active stream.  In raw mode each
@@ -2298,6 +2323,7 @@ impl App {
         };
         stream.show_raw = !stream.show_raw;
         self.rerender_after_stream_mutation(stream_id, stream);
+        self.save_after_inline_mutation();
     }
 
     /// Replaces the active stream's [`RenderOpts`] with `opts`,
@@ -2311,6 +2337,7 @@ impl App {
         };
         stream.set_render_opts(opts);
         self.rerender_after_stream_mutation(stream_id, stream);
+        self.save_after_inline_mutation();
     }
 
     /// Re-inserts `stream` into the session and triggers a `rerender`
@@ -2417,6 +2444,7 @@ impl App {
             display_msg: draft.display_msg,
         };
         self.session.add_bookmark(stream_id, bookmark);
+        self.save_after_inline_mutation();
     }
 
     /// Removes a bookmark by id.  When this empties the user's
@@ -2434,6 +2462,7 @@ impl App {
         if was_bookmarks_active && !self.has_bookmarks_tab() {
             self.active = self.tabs.len().saturating_sub(1);
         }
+        self.save_after_inline_mutation();
     }
 
     /// All user bookmarks, flattened across streams in the same order
@@ -2759,10 +2788,14 @@ impl App {
         self.adjust_long_op_state_for_closed_tab(closed);
         self.tabs.remove(closed);
         if self.tabs.is_empty() {
+            // push_tab will itself save inline.  The outer save below
+            // is therefore redundant in this branch — accepted for
+            // simplicity, since saves are atomic and cheap.
             self.push_tab(TabKind::Stream, Filter::default());
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.save_after_inline_mutation();
     }
 
     /// Patches up [`Self::long_op`] and [`Self::pending_summary_builds`]
@@ -8676,5 +8709,164 @@ mod tests {
         a.policy.record(seer::Cadence::Debounced);
         a.try_save_now().expect("no-op should succeed");
         assert!(a.policy.dirty(), "dirty bit untouched without a store");
+    }
+
+    // ---------- inline persistence (phase 6) ----------
+
+    /// Builds an [`App`] with no engine but with a freshly-created
+    /// on-disk [`SessionStore`] attached.  Returns the
+    /// `Utf8TempDir` so the caller can keep the backing directory
+    /// alive for the duration of the test.
+    fn app_with_store_and_one_tab() -> (App, camino_tempfile::Utf8TempDir) {
+        let dir = camino_tempfile::tempdir().unwrap();
+        let store =
+            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let mut a = App::new(Engine::new());
+        a.store = Some(store);
+        // The default `App::new` already pushed a tab; that push
+        // would itself have saved if a store had been attached at
+        // construction time.  Save now so the disk file reflects the
+        // app's current state.
+        a.save_after_inline_mutation();
+        (a, dir)
+    }
+
+    /// Reloads the [`App`]'s session from disk through its attached
+    /// store.  Panics if the store is `None` or the file can't be
+    /// loaded.
+    fn reload_session(a: &App) -> Session {
+        let id = a.session.id;
+        a.store.as_ref().unwrap().load(id).unwrap()
+    }
+
+    #[test]
+    fn add_bookmark_persists_inline() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        assert!(reload_session(&a).user_bookmarks.is_empty());
+
+        let stream_id = a.tabs[a.active].stream;
+        let draft = BookmarkDraft {
+            cursor: Cursor::with([]),
+            display_source: SourceId::from("test".to_string()),
+            display_time: chrono::Utc::now(),
+            display_msg: "marked".to_string(),
+        };
+        a.add_bookmark(Some(BookmarkName::from("here".to_string())), draft);
+
+        assert!(!a.policy.dirty(), "save flushed the dirty bit");
+        let reloaded = reload_session(&a);
+        let bms = reloaded.user_bookmarks.get(&stream_id).unwrap();
+        assert_eq!(bms.len(), 1);
+        assert_eq!(bms[0].display_msg, "marked");
+    }
+
+    #[test]
+    fn delete_bookmark_persists_inline() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let stream_id = a.tabs[a.active].stream;
+        let draft = BookmarkDraft {
+            cursor: Cursor::with([]),
+            display_source: SourceId::from("test".to_string()),
+            display_time: chrono::Utc::now(),
+            display_msg: "doomed".to_string(),
+        };
+        a.add_bookmark(None, draft);
+        let id = a.session.user_bookmarks[&stream_id][0].id;
+
+        a.delete_bookmark(id);
+        assert!(!a.policy.dirty());
+        let reloaded = reload_session(&a);
+        assert!(reloaded.user_bookmarks.is_empty());
+    }
+
+    #[test]
+    fn push_tab_persists_the_new_stream_inline() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let before = reload_session(&a).streams.len();
+
+        a.push_tab(TabKind::Stream, Filter::default());
+        assert!(!a.policy.dirty());
+        let after = reload_session(&a).streams.len();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn apply_filter_persists_the_new_filter_inline() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let stream_id = a.tabs[a.active].stream;
+        let mut new_filter = Filter::default();
+        new_filter.add_predicate(Predicate::MsgMatches {
+            regex: regex::Regex::new("hello").unwrap(),
+            negated: false,
+        });
+
+        a.apply_filter(new_filter.clone());
+        assert!(!a.policy.dirty());
+        let reloaded = reload_session(&a);
+        let stream = reloaded.streams.get(&stream_id).unwrap();
+        // Filter doesn't implement Eq, so compare its display form —
+        // round-trip via serde is the contract that matters anyway.
+        assert_eq!(
+            format!("{:?}", stream.filter),
+            format!("{new_filter:?}"),
+        );
+    }
+
+    #[test]
+    fn toggle_show_extras_persists_inline() {
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let stream_id = a.tabs[a.active].stream;
+        let before = reload_session(&a)
+            .streams
+            .get(&stream_id)
+            .unwrap()
+            .show_extras;
+
+        a.toggle_show_extras();
+        assert!(!a.policy.dirty());
+        let after = reload_session(&a)
+            .streams
+            .get(&stream_id)
+            .unwrap()
+            .show_extras;
+        assert_eq!(after, !before);
+    }
+
+    #[test]
+    fn inline_save_failure_sets_notice_and_keeps_dirty_bit() {
+        // Attach a store, then remove the underlying directory so the
+        // next save fails.  The mutation should still proceed; the
+        // save error should land on `notice`; and the dirty bit
+        // should stay set so future opportunities can retry.
+        let dir = camino_tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("sessions");
+        let store = SessionStore::open_at(&sessions_dir).unwrap();
+        let mut a = App::new(Engine::new());
+        a.store = Some(store);
+        // Save once successfully so the initial state is on disk.
+        a.save_after_inline_mutation();
+        assert!(a.notice.is_none());
+
+        // Yank the directory out from under the store.  Subsequent
+        // saves will hit ENOENT or similar.
+        std::fs::remove_dir_all(&sessions_dir).unwrap();
+
+        let stream_id = a.tabs[a.active].stream;
+        let draft = BookmarkDraft {
+            cursor: Cursor::with([]),
+            display_source: SourceId::from("test".to_string()),
+            display_time: chrono::Utc::now(),
+            display_msg: "marked".to_string(),
+        };
+        a.add_bookmark(None, draft);
+
+        assert!(a.policy.dirty(), "failed save leaves dirty bit set");
+        let notice = a.notice.as_ref().expect("notice must be set on failure");
+        assert!(
+            notice.contains("session save failed"),
+            "unexpected notice: {notice}"
+        );
+        // The mutation itself still landed in memory.
+        assert!(a.session.user_bookmarks.contains_key(&stream_id));
     }
 }

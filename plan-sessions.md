@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 5 complete.  Next phase: **6. Inline saves at low-cadence mutations.**
+Phase 6 complete.  Next phase: **7. Debounced saves at high-cadence mutations.**
 
 ## Goal
 
@@ -434,10 +434,29 @@ prove itself before the resume dialog lands on top.
     is a wiring step — `App` itself never sets `dirty` yet, so the
     exit-flush path is exercised in later phases.  472 tests pass.
 
-- [ ] **6. Inline saves at low-cadence mutations.**  Call
+- [x] **6. Inline saves at low-cadence mutations.**  Call
   `policy.record(Cadence::Inline)` and route through
   `try_save` at bookmark create / rename / delete, tab open /
   close, filter changes (named or unnamed), and field show / hide.
+  - Added `App::save_after_inline_mutation()` — calls
+    `policy.record(Cadence::Inline)` then `try_save_now()`, and on
+    failure stashes the error message on `app.notice` while leaving
+    the dirty bit set so the next opportunity retries.  Bookmark
+    rename does not yet exist in the codebase, so this phase wired
+    create + delete; tab rename is intentionally not persisted (the
+    name lives on the local TUI `Tab`, not on the `LogStream`).
+    Call sites: `push_tab`, `push_tab_for_existing_stream`,
+    `close_active_tab`, `apply_filter`, `toggle_show_extras`,
+    `toggle_show_date`, `toggle_show_raw`, `apply_render_opts` (the
+    `h` field-display dialog covers the per-field show/hide
+    knobs), `add_bookmark`, `delete_bookmark`.  Helper methods that
+    several user gestures share (e.g.
+    `rerender_after_stream_mutation`) deliberately do *not* save;
+    the outer user-gesture method is the right level.  Six new
+    tests cover add_bookmark / delete_bookmark / push_tab /
+    apply_filter / toggle_show_extras persisting through the store
+    plus a save-failure-into-notice path that yanks the sessions
+    directory mid-test.  478 tests pass.
 
 - [ ] **7. Debounced saves at high-cadence mutations.**  Call
   `policy.record(Cadence::Debounced)` on cursor scrolling and
