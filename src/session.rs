@@ -22,7 +22,7 @@
 use crate::engine::Cursor;
 use crate::session_store::SessionId;
 use crate::source::SourceId;
-use crate::stream::{LogStream, LogStreamId, LogStreamPosition};
+use crate::stream::{LogStream, LogStreamId};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
@@ -36,7 +36,7 @@ use uuid::Uuid;
 /// shape of a [`Session`] changes — the `schemars`-derived schema
 /// fixture test will fail and prompt the author to refresh both
 /// this constant and the checked-in fixture.
-pub const CURRENT_SESSION_VERSION: u32 = 3;
+pub const CURRENT_SESSION_VERSION: u32 = 4;
 
 /// User-supplied name for a bookmark.
 #[derive(
@@ -118,17 +118,42 @@ pub struct Bookmark {
     pub display_msg: String,
 }
 
+/// What a [`Tab`] displays.
+///
+/// Today this is a binary distinction: regular log-record view versus
+/// the field/time histogram summary.  Persisted on each tab so a
+/// resumed session reopens both kinds in the right shape.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+pub enum TabKind {
+    /// Regular per-record log view.
+    Stream,
+    /// Histogram summary of the active filter's events.
+    Summary,
+}
+
 /// A tab in the TUI.
 ///
 /// A tab is a view onto exactly one [`LogStream`] (referenced by id; the
-/// stream lives in [`Session::streams`]).  `cursor` is the position the
-/// tab is currently scrolled to.  `cursor` is `None` for an
-/// empty-or-unrendered tab.
+/// stream lives in [`Session::streams`]).  `cursor` is the byte-offset
+/// [`Cursor`] the tab is currently scrolled to, captured at save time
+/// so a resumed session can land the viewport on the same record.
+/// `cursor` is `None` for an empty-or-unrendered tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Tab {
     pub stream: LogStreamId,
+    pub kind: TabKind,
     #[serde(default)]
-    pub cursor: Option<LogStreamPosition>,
+    pub cursor: Option<Cursor>,
 }
 
 /// A source the session was opened against.
@@ -260,10 +285,6 @@ mod tests {
         Utc.timestamp_opt(secs, 0).single().unwrap()
     }
 
-    fn position(secs: i64) -> LogStreamPosition {
-        LogStreamPosition::new(SourceId::from("a.log".to_string()), t(secs), 0)
-    }
-
     fn cursor_at(offset: u64) -> Cursor {
         Cursor::with([(
             SourceId::from("a.log".to_string()),
@@ -301,7 +322,11 @@ mod tests {
 
         let mut s = Session::new();
         s.streams.insert_unique(stream).expect("unique id");
-        s.tabs.push(Tab { stream: stream_id, cursor: Some(position(42)) });
+        s.tabs.push(Tab {
+            stream: stream_id,
+            kind: TabKind::Stream,
+            cursor: Some(cursor_at(42 * 100)),
+        });
         s.user_bookmarks.insert(
             stream_id,
             vec![make_bookmark(0, Some("start")), make_bookmark(100, None)],
@@ -313,7 +338,8 @@ mod tests {
         assert_eq!(back.version, CURRENT_SESSION_VERSION);
         assert_eq!(back.tabs.len(), 1);
         assert_eq!(back.tabs[0].stream, stream_id);
-        assert_eq!(back.tabs[0].cursor, Some(position(42)));
+        assert_eq!(back.tabs[0].kind, TabKind::Stream);
+        assert_eq!(back.tabs[0].cursor, Some(cursor_at(42 * 100)));
 
         assert_eq!(back.streams.len(), 1);
         assert!(back.streams.get(&stream_id).is_some());

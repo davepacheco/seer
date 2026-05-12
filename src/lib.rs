@@ -30,7 +30,7 @@ pub use render::{
 pub use save_policy::{Cadence, SavePolicy};
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,
-    SessionSource, Tab,
+    SessionSource, Tab, TabKind,
 };
 pub use session_store::{
     MatchKind, STATE_DIR_ENV, SessionId, SessionIdParseError, SessionMatch,

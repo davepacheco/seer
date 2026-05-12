@@ -427,9 +427,10 @@ fn resolve_state_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Session, SessionSource, Tab};
-    use crate::stream::{LogStream, LogStreamPosition};
-    use crate::source::SourceId;
+    use crate::engine::Cursor;
+    use crate::session::{Session, SessionSource, Tab, TabKind};
+    use crate::source::{ByteOffset, SourceId};
+    use crate::stream::LogStream;
     use camino_tempfile::tempdir;
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -440,11 +441,11 @@ mod tests {
         s.streams.insert_unique(stream).expect("unique id");
         s.tabs.push(Tab {
             stream: stream_id,
-            cursor: Some(LogStreamPosition::new(
+            kind: TabKind::Stream,
+            cursor: Some(Cursor::with([(
                 SourceId::from("a.log".to_string()),
-                Utc.timestamp_opt(42, 0).single().unwrap(),
-                0,
-            )),
+                ByteOffset::from(42_u64),
+            )])),
         });
         s
     }

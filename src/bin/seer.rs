@@ -31,7 +31,8 @@ use seer::{
     Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
     MatchKind, Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome,
     Session, SessionId, SessionMatch, SessionSource, SessionStore, SourceId,
-    StoreError, StreamView, SummaryBuilder, WindowFillStatus, format_summary,
+    StoreError, StreamView, SummaryBuilder, TabKind, WindowFillStatus,
+    format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -763,6 +764,17 @@ fn render_rows(
     (view, rows)
 }
 
+/// Extracts the trailing integer from a default-shaped tab name like
+/// `"Tab 7"` or `"Summary 12"`.  Used on resume to bump
+/// `App::next_tab_number` past every restored name, so a newly-pushed
+/// tab doesn't collide with a name already in use.  Returns `None`
+/// for names that don't fit the `Word N` shape (e.g. user-renamed
+/// tabs once that feature lands).
+fn parse_tab_number(name: &str) -> Option<usize> {
+    let (_, n) = name.rsplit_once(' ')?;
+    n.parse().ok()
+}
+
 /// Translates a [`StreamView`]'s current window into the flat
 /// [`RenderedRows`] shape that the Tab/render pipeline expects.
 ///
@@ -1430,19 +1442,6 @@ struct Tab {
     parse_stats: ParseStats,
 }
 
-/// What kind of view a [`Tab`] presents.  Today this is binary
-/// (records vs. histogram); when more kinds land we can fold per-kind
-/// state into the variants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TabKind {
-    /// One row per log record.  `events` and the line/event index
-    /// vectors are populated; selection and bookmark actions apply.
-    Stream,
-    /// Histogram summary of the active filter's events.  `events` is
-    /// empty; `formatted` holds the rendered histogram rows.
-    Summary,
-}
-
 /// What a select-mode commit will do.
 ///
 /// `x` → exclude (build `msg != <selected>`); `X` → include (build
@@ -1997,14 +1996,15 @@ impl App {
     }
 
     /// Constructs an [`App`] reusing a previously-loaded [`Session`].
-    /// Carries over the user's bookmarks (and the streams those
-    /// bookmarks reference), but always opens a fresh display tab —
-    /// auto-restoring the user's prior tab set is a separate piece of
-    /// work, and dropping into an unfiltered fresh tab is a sensible
-    /// default until then.  Loaded session may include `tabs` from a
-    /// future schema; we leave that field intact so a later
-    /// auto-resume can pick it up without a save round-trip
-    /// re-emptying it.
+    /// Restores the user's prior tab set, their bookmarks, and the
+    /// streams those reference.  Each persisted [`seer::Tab`] becomes
+    /// a runtime tab backed by its target [`LogStream`]'s filter, and
+    /// the saved cursor (if any) is fed to
+    /// [`StreamView::seek_to_cursor`] so the viewport lands back on
+    /// the same record.  When the session has no tabs (a fresh
+    /// session, or one saved before tab persistence landed), the App
+    /// falls back to a single unfiltered Stream tab — the invariant
+    /// is that `tabs` is never empty.
     ///
     /// `store` is `None` for a transient session that should not be
     /// written to disk; `policy` is the save-cadence tracker
@@ -2035,8 +2035,90 @@ impl App {
             store,
             policy,
         };
-        a.push_tab(TabKind::Stream, Filter::default());
+        a.restore_tabs_or_default();
         a
+    }
+
+    /// Rebuilds [`Self::tabs`] from [`Session::tabs`] on resume.  When
+    /// the session has at least one persisted tab whose target stream
+    /// still exists, one runtime tab is built per entry; otherwise the
+    /// App falls back to a single fresh Stream tab so the
+    /// "tabs is never empty" invariant holds.  Persisted Summary tabs
+    /// re-enqueue their histogram build via the standard long-op path,
+    /// matching the behavior the user gets when they open a Summary
+    /// tab interactively.
+    fn restore_tabs_or_default(&mut self) {
+        // Take the persisted list so it doesn't appear "doubled up"
+        // once `push_tab_restored` starts repopulating it on save.
+        let persisted = std::mem::take(&mut self.session.tabs);
+
+        // First pass: bump next_tab_number past every "Tab N" /
+        // "Summary N" name we'll be restoring, so later user-driven
+        // pushes don't collide with names already in use.
+        for ptab in &persisted {
+            let Some(stream) = self.session.streams.get(&ptab.stream) else {
+                continue;
+            };
+            if let Some(n) = parse_tab_number(&stream.name) {
+                self.next_tab_number = self.next_tab_number.max(n + 1);
+            }
+        }
+
+        let mut restored_any = false;
+        for ptab in persisted {
+            let Some(stream) = self.session.streams.get(&ptab.stream) else {
+                // Tab pointed at a stream that's gone — skip it; the
+                // user will see one fewer tab but no broken pointer.
+                continue;
+            };
+            let name = stream.name.clone();
+            let filter = stream.filter.clone();
+            let opts = stream.render_opts();
+            let mut tab = Tab::new(
+                name,
+                ptab.kind,
+                &self.engine,
+                ptab.stream,
+                &filter,
+                opts,
+            );
+            // Restore the scroll position when we have one and the
+            // tab carries a streamview to seek with.  Summary tabs
+            // have no streamview, so cursor restore is a no-op for
+            // them — the histogram build will resume from scratch.
+            //
+            // Passing zero for viewport width/height makes `max_top`
+            // collapse to "the last line", so `resync` lands
+            // `viewport_top` on the streamview anchor; the first
+            // render frame supplies the real terminal size and the
+            // viewport clamps down if needed.
+            if let (Some(cursor), Some(view)) =
+                (ptab.cursor.clone(), tab.streamview.as_mut())
+            {
+                view.seek_to_cursor(
+                    &self.engine,
+                    cursor,
+                    INITIAL_VIEWPORT_HEIGHT,
+                );
+                tab.resync_from_streamview(0, 0);
+            }
+            let tab_idx = self.tabs.len();
+            self.tabs.push(tab);
+            // Summary tabs need their long-op build queued, same as
+            // when the user opens one interactively.
+            if ptab.kind == TabKind::Summary {
+                self.enqueue_summary_build(tab_idx, filter);
+            }
+            restored_any = true;
+        }
+
+        if restored_any {
+            self.active = 0;
+        } else {
+            // No usable persisted tabs — preserve the legacy startup
+            // shape with one fresh Stream tab.
+            self.push_tab(TabKind::Stream, Filter::default());
+        }
     }
 
     /// Persists the current [`Session`] to disk through the attached
@@ -2049,10 +2131,38 @@ impl App {
     /// opportunity tries again.  Callers that want to surface the
     /// error to the user typically do so via [`Self::notice`].
     fn try_save_now(&mut self) -> Result<(), StoreError> {
-        let Some(store) = &self.store else { return Ok(()) };
+        if self.store.is_none() {
+            return Ok(());
+        }
+        self.sync_tabs_to_session();
+        let store = self.store.as_ref().unwrap();
         store.save(self.session.id, &self.session)?;
         self.policy.mark_saved(Instant::now());
         Ok(())
+    }
+
+    /// Mirrors the runtime [`Self::tabs`] list into [`Session::tabs`] so
+    /// a subsequent `store.save` captures the user's open tabs.  Each
+    /// runtime tab contributes its stream id, kind, and (for stream
+    /// tabs) the [`Cursor`] at the viewport anchor — fed back into
+    /// [`StreamView::seek_to_cursor`] on resume to land on the same
+    /// record.  Summary tabs have no streamview, so their `cursor` is
+    /// always `None` — the histogram is rebuilt from the filter, not
+    /// scrolled to a position.
+    fn sync_tabs_to_session(&mut self) {
+        let tabs: Vec<seer::Tab> = self
+            .tabs
+            .iter()
+            .map(|t| seer::Tab {
+                stream: t.stream,
+                kind: t.kind,
+                cursor: t
+                    .streamview
+                    .as_ref()
+                    .and_then(|v| v.cursor_at_anchor()),
+            })
+            .collect();
+        self.session.tabs = tabs;
     }
 
     /// Records that an inline-cadence mutation just happened and
@@ -9298,6 +9408,123 @@ mod tests {
         assert!(!a.policy.dirty());
         let after = reload_session(&a).streams.len();
         assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn save_mirrors_tabs_into_session_tabs() {
+        // `app_with_store_and_one_tab` already saved once with the
+        // default single tab.  Push a second tab, then read back the
+        // session to confirm both tabs were serialized in order.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        let first_stream = a.tabs[0].stream;
+        a.push_tab(TabKind::Stream, Filter::default());
+        let second_stream = a.tabs[1].stream;
+
+        let reloaded = reload_session(&a);
+        assert_eq!(reloaded.tabs.len(), 2);
+        assert_eq!(reloaded.tabs[0].stream, first_stream);
+        assert_eq!(reloaded.tabs[0].kind, TabKind::Stream);
+        assert_eq!(reloaded.tabs[1].stream, second_stream);
+        assert_eq!(reloaded.tabs[1].kind, TabKind::Stream);
+    }
+
+    #[test]
+    fn save_records_summary_tab_kind() {
+        // A Summary tab persists with `kind: Summary` so resume can
+        // restore the histogram view rather than a stream view.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        a.push_tab(TabKind::Summary, Filter::default());
+
+        let reloaded = reload_session(&a);
+        let summary = reloaded
+            .tabs
+            .iter()
+            .find(|t| t.kind == TabKind::Summary)
+            .expect("the summary tab should round-trip");
+        assert_eq!(summary.stream, a.tabs[1].stream);
+    }
+
+    #[test]
+    fn resume_restores_persisted_tabs_into_app() {
+        // Build a session with two persisted tabs and feed it through
+        // `App::new_with_session`: the resulting App should have those
+        // two runtime tabs in the same order, both backed by the
+        // streams the session carries — not the legacy single fresh
+        // tab the pre-restore code path produced.
+        let mut session = Session::new();
+        let stream_a = LogStream::new("Tab 7".to_string());
+        let stream_b = LogStream::new("Summary 9".to_string());
+        let id_a = stream_a.id;
+        let id_b = stream_b.id;
+        session.streams.insert_unique(stream_a).unwrap();
+        session.streams.insert_unique(stream_b).unwrap();
+        session.tabs.push(seer::Tab {
+            stream: id_a,
+            kind: TabKind::Stream,
+            cursor: None,
+        });
+        session.tabs.push(seer::Tab {
+            stream: id_b,
+            kind: TabKind::Summary,
+            cursor: None,
+        });
+
+        let app = App::new_with_session(
+            Engine::new(),
+            session,
+            None,
+            SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
+        );
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[0].stream, id_a);
+        assert_eq!(app.tabs[0].kind, TabKind::Stream);
+        assert_eq!(app.tabs[1].stream, id_b);
+        assert_eq!(app.tabs[1].kind, TabKind::Summary);
+        // `next_tab_number` should be past every restored "Tab N" /
+        // "Summary N" so a newly-pushed tab doesn't collide.
+        assert!(app.next_tab_number > 9);
+    }
+
+    #[test]
+    fn resume_with_no_persisted_tabs_falls_back_to_a_fresh_tab() {
+        // A session with no tabs (the legacy shape, before tab
+        // persistence) must still produce a viable App: one fresh
+        // Stream tab so the "tabs is never empty" invariant holds.
+        let session = Session::new();
+        let app = App::new_with_session(
+            Engine::new(),
+            session,
+            None,
+            SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].kind, TabKind::Stream);
+    }
+
+    #[test]
+    fn resume_drops_tabs_pointing_at_missing_streams() {
+        // A persisted tab whose stream is gone (the user removed it,
+        // or the session got truncated somehow) gets quietly skipped
+        // rather than panicking.  When every persisted tab is broken,
+        // the App falls back to the fresh-tab default.
+        let mut session = Session::new();
+        let phantom = LogStream::new("Tab 1".to_string()).id;
+        session.tabs.push(seer::Tab {
+            stream: phantom,
+            kind: TabKind::Stream,
+            cursor: None,
+        });
+
+        let app = App::new_with_session(
+            Engine::new(),
+            session,
+            None,
+            SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
+        );
+        assert_eq!(app.tabs.len(), 1);
+        // The fallback tab is a *new* stream, not the missing one.
+        assert_ne!(app.tabs[0].stream, phantom);
     }
 
     #[test]

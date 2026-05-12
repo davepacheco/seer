@@ -239,30 +239,6 @@
         }
       }
     },
-    "LogStreamPosition": {
-      "description": "Position within a log stream — a stable anchor that survives filter changes.\n\nA position pins down a specific event by `(source, time, ordinal_within_time)`.  Same-time tiebreaking happens via `ordinal_within_time`: the first event with a given `(source, time)` has ordinal 0, the next has 1, and so on.  This shape was chosen so that adding/removing predicates from the active filter never moves what a saved position refers to: only the row index that position resolves to in a filtered view changes.\n\nThe fields are private so future representations (e.g. a content fingerprint to survive file rewrites) can be added without breaking callers.",
-      "type": "object",
-      "required": [
-        "ordinal_within_time",
-        "source",
-        "time"
-      ],
-      "properties": {
-        "ordinal_within_time": {
-          "description": "0-based count of events from the same `source` with this exact `time`.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "source": {
-          "type": "string"
-        },
-        "time": {
-          "type": "string",
-          "format": "date-time"
-        }
-      }
-    },
     "Predicate": {
       "description": "A single predicate over an [`Event`].\n\nThe equality and regex variants carry a `negated` flag so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in polarity.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
       "oneOf": [
@@ -449,28 +425,52 @@
       }
     },
     "Tab": {
-      "description": "A tab in the TUI.\n\nA tab is a view onto exactly one [`LogStream`] (referenced by id; the stream lives in [`Session::streams`]).  `cursor` is the position the tab is currently scrolled to.  `cursor` is `None` for an empty-or-unrendered tab.",
+      "description": "A tab in the TUI.\n\nA tab is a view onto exactly one [`LogStream`] (referenced by id; the stream lives in [`Session::streams`]).  `cursor` is the byte-offset [`Cursor`] the tab is currently scrolled to, captured at save time so a resumed session can land the viewport on the same record. `cursor` is `None` for an empty-or-unrendered tab.",
       "type": "object",
       "required": [
+        "kind",
         "stream"
       ],
       "properties": {
         "cursor": {
           "default": null,
-          "anyOf": [
-            {
-              "$ref": "#/definitions/LogStreamPosition"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0.0
+          }
+        },
+        "kind": {
+          "$ref": "#/definitions/TabKind"
         },
         "stream": {
           "type": "string",
           "format": "uuid"
         }
       }
+    },
+    "TabKind": {
+      "description": "What a [`Tab`] displays.\n\nToday this is a binary distinction: regular log-record view versus the field/time histogram summary.  Persisted on each tab so a resumed session reopens both kinds in the right shape.",
+      "oneOf": [
+        {
+          "description": "Regular per-record log view.",
+          "type": "string",
+          "enum": [
+            "Stream"
+          ]
+        },
+        {
+          "description": "Histogram summary of the active filter's events.",
+          "type": "string",
+          "enum": [
+            "Summary"
+          ]
+        }
+      ]
     },
     "TimeOp": {
       "description": "Comparison operator for a [`Predicate::TimeBound`].",
