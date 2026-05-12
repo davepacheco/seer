@@ -93,8 +93,8 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: Phase 3 — `--before` emission.**  Phases 1 and 2
-landed (CLI restructure and resolver helper committed).  Update the
+**Current phase: Phase 4 — wire `seeit` session mode.**  Phases 1–3
+landed.  Update the
 "Status" line and check the phase box as work lands.
 
 ### Notes from Phase 1
@@ -113,6 +113,15 @@ landed (CLI restructure and resolver helper committed).  Update the
   engine/UI setup that does not belong in a non-TUI library helper.
   A focused later pass can extract the name lookup + cursor seeding
   if the duplication starts to bite.
+
+### Notes from Phase 3
+
+- `Stepper::step_backward_n` is the primitive.  The pattern for
+  `--before N --count M` in phase 4 is: build one stepper at the
+  resolved cursor for the backward walk, then a fresh stepper at the
+  same cursor for the forward walk.  A `Stepper` owns a single
+  position that both directions share, so reusing one would require
+  re-walking forward to recover — the two-stepper form is simpler.
 
 ## Phases
 
@@ -144,7 +153,7 @@ landed (CLI restructure and resolver helper committed).  Update the
   pieces where it overlaps, rather than duplicate them.
 - Unit tests for each selector and each failure mode.
 
-### [ ] Phase 3 — Bounded emission with `--before`
+### [x] Phase 3 — Bounded emission with `--before`
 
 - Audit whether `Stepper` already supports "N records ending at cursor
   C, then forward from C": its backward stepping likely covers this with
