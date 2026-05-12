@@ -287,8 +287,7 @@ New tabs should still open with this dialog.
 
 - parse SMF entries
 - parse CockroachDB log
-- persistent session state (see separate plan)
-- make a `seeit` command to show the current pane, including bookmarks.  `seeit` should be able to process bookmarks
+- seeit should understand sessions -- see separate plan
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
 - `?` binding to pop up summary of key bindings
