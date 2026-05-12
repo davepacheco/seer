@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 7 complete.  Next phase: **8. Startup discovery + resume dialog.**
+Phase 8 complete.  Next phase: **9. CLI surface.**
 
 ## Goal
 
@@ -484,13 +484,38 @@ prove itself before the resume dialog lands on top.
     resize-detection logic (resize records; same-size render does
     not).  486 tests pass.
 
-- [ ] **8. Startup discovery + resume dialog.**  Run
+- [x] **8. Startup discovery + resume dialog.**  Run
   `find_matches` against the canonicalized command-line paths, show
   a modal listing exact / superset / overlap candidates (id,
   last_saved_at, tab count, source count, exact-match flag), and
   let the user pick: resume an existing session, start a new
   saved session, or start a transient session (no saver attached,
   no file ever written).
+  - Added a small modal in `src/bin/seer.rs`: enum `StartupChoice`
+    (`Resume(Session)` / `NewSaved` / `NewTransient` / `Quit`),
+    struct `StartupDialog { matches, selected }`, and
+    `StartupDialogStep` for the keypress-handler return.
+    `confirm` consumes the dialog so a chosen `Session` is moved
+    out by value — no second `store.load` after the dialog
+    finishes.  Keys: `j/k` or arrows navigate (clamped at the
+    ends), `1..9` jump to that resume candidate, Enter confirms,
+    Esc / `^C` quit.  Per the plan the dialog renders even when
+    `matches` is empty, collapsing to the two fixed rows.
+    `render_startup_dialog` draws a centered bordered popup with
+    one line per candidate (id, `last_saved_at`, stream count,
+    source count, match kind), a separator, the two New options,
+    and a key cheat sheet.  `run_startup_dialog` opens its own
+    ratatui terminal with a `TerminalGuard` and pumps events until
+    `Done`.  `main` now discovers candidates via
+    `store.find_matches`, runs the dialog, then maps the choice
+    into `(Session, Option<SessionStore>)` and runs the TUI; the
+    transient path skips the initial save and the
+    `session saved. resume with…` exit hint.  Ten new tests cover
+    navigation clamping, confirm at each row index, Esc/Ctrl-C →
+    Quit, Enter defaults (first candidate when present, NewSaved
+    when not), the `1..9` jump, out-of-range digit, and a
+    render-doesn't-panic smoke test for both empty and populated
+    candidate lists.  496 tests pass.
 
 - [ ] **9. CLI surface.**  `--resume`, `--list`, exit-message
   variants for resumed vs. fresh sessions.

@@ -29,9 +29,9 @@ use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
     Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
-    Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome, Session,
-    SessionSource, SessionStore, SourceId, StoreError, StreamView,
-    SummaryBuilder, WindowFillStatus, format_summary,
+    MatchKind, Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome,
+    Session, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
+    StreamView, SummaryBuilder, WindowFillStatus, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -69,6 +69,260 @@ fn build_session_sources(
     Ok(sources)
 }
 
+/// Resolution of the startup dialog.
+///
+/// The dialog itself is a small modal that runs before the main TUI
+/// opens; the variant it returns drives the next step in `main`.
+enum StartupChoice {
+    /// Reuse this on-disk [`Session`].  The dialog already had a full
+    /// [`Session`] in hand (it came from
+    /// [`SessionStore::find_matches`]), so no second `load()` is
+    /// needed.
+    Resume(Session),
+    /// Mint a fresh saved session: write to disk, plumb the
+    /// [`SessionStore`] into [`App`].
+    NewSaved,
+    /// Mint a fresh session but skip persistence entirely: no
+    /// initial save, no [`SessionStore`] on the [`App`], and no
+    /// "session saved" hint on exit.
+    NewTransient,
+    /// User dismissed the dialog (Esc / Ctrl-C).  Caller should
+    /// exit immediately.
+    Quit,
+}
+
+/// State of the startup-resume modal.
+///
+/// Holds the candidate sessions returned from
+/// [`SessionStore::find_matches`] plus the user's currently-highlighted
+/// row.  The choice space is the candidate list followed by two fixed
+/// rows: "new saved" and "new transient".  Empty `matches` is
+/// supported and just collapses to the two fixed rows.
+struct StartupDialog {
+    matches: Vec<SessionMatch>,
+    /// Index into the virtual row list: `0..matches.len()` are the
+    /// candidate rows; `matches.len()` is "new saved"; the next
+    /// index is "new transient".
+    selected: usize,
+}
+
+impl StartupDialog {
+    fn new(matches: Vec<SessionMatch>) -> Self {
+        Self { matches, selected: 0 }
+    }
+
+    fn rows(&self) -> usize {
+        // 2 fixed rows + however many resume candidates.
+        self.matches.len() + 2
+    }
+
+    fn new_saved_idx(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn new_transient_idx(&self) -> usize {
+        self.matches.len() + 1
+    }
+
+    /// Returns the [`StartupChoice`] for the currently-highlighted
+    /// row, consuming the dialog so the chosen [`Session`] can be
+    /// moved out by value.
+    fn confirm(mut self) -> StartupChoice {
+        if self.selected < self.matches.len() {
+            // `swap_remove` is fine — we are dropping `self` either
+            // way, so element-order disturbance is irrelevant.
+            let m = self.matches.swap_remove(self.selected);
+            StartupChoice::Resume(m.session)
+        } else if self.selected == self.new_saved_idx() {
+            StartupChoice::NewSaved
+        } else {
+            StartupChoice::NewTransient
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    fn move_down(&mut self) {
+        let last = self.rows().saturating_sub(1);
+        if self.selected < last {
+            self.selected += 1;
+        }
+    }
+
+    /// Routes one keypress.  Returns `Some(choice)` when the user
+    /// has finalized a choice (Enter or Esc); `None` when the key
+    /// was navigation or unhandled.
+    fn handle_key(self, key: KeyEvent) -> StartupDialogStep {
+        match key.code {
+            KeyCode::Esc => StartupDialogStep::Done(StartupChoice::Quit),
+            KeyCode::Char('c')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                StartupDialogStep::Done(StartupChoice::Quit)
+            }
+            KeyCode::Enter => StartupDialogStep::Done(self.confirm()),
+            KeyCode::Char('j') | KeyCode::Down => {
+                let mut d = self;
+                d.move_down();
+                StartupDialogStep::Continue(d)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                let mut d = self;
+                d.move_up();
+                StartupDialogStep::Continue(d)
+            }
+            // Numeric shortcuts: 1..9 jump to the corresponding
+            // resume candidate (1-indexed).  Out-of-range numbers
+            // are ignored; the user can still scroll.
+            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < self.matches.len() {
+                    let mut d = self;
+                    d.selected = idx;
+                    StartupDialogStep::Continue(d)
+                } else {
+                    StartupDialogStep::Continue(self)
+                }
+            }
+            _ => StartupDialogStep::Continue(self),
+        }
+    }
+}
+
+/// Result of stepping the startup dialog with one keypress.
+///
+/// `Continue` returns ownership of the dialog so the event loop can
+/// re-render it; `Done` signals the user has made (or dismissed)
+/// their choice.
+enum StartupDialogStep {
+    Continue(StartupDialog),
+    Done(StartupChoice),
+}
+
+/// Human-friendly tag for a [`MatchKind`].
+fn match_kind_label(kind: MatchKind) -> &'static str {
+    match kind {
+        MatchKind::Exact => "exact",
+        MatchKind::Superset => "superset",
+        MatchKind::Overlap => "overlap",
+    }
+}
+
+/// Renders the startup dialog into a centered modal pane.
+fn render_startup_dialog(frame: &mut Frame, dialog: &StartupDialog) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    // Build all rows up front so we can size the popup to fit the
+    // content.  Two trailing rows for "new saved"/"new transient",
+    // plus an optional separator row when there are candidates.
+    let mut rows: Vec<Line<'_>> = Vec::new();
+    for (i, m) in dialog.matches.iter().enumerate() {
+        let row = format!(
+            "{}  Resume {}  ({} UTC, {} streams, {} sources, {})",
+            (i + 1).min(9),
+            m.session.id,
+            m.session.last_saved_at.format("%Y-%m-%d %H:%M:%S"),
+            m.session.streams.len(),
+            m.session.sources.len(),
+            match_kind_label(m.kind),
+        );
+        rows.push(highlight_if_selected(row, i == dialog.selected));
+    }
+    if !dialog.matches.is_empty() {
+        rows.push(Line::raw("─".repeat(60)));
+    }
+    rows.push(highlight_if_selected(
+        "   Start a new saved session".to_string(),
+        dialog.selected == dialog.new_saved_idx(),
+    ));
+    rows.push(highlight_if_selected(
+        "   Start a transient session (no file written)".to_string(),
+        dialog.selected == dialog.new_transient_idx(),
+    ));
+    // Footer: short key-binding cheat sheet.
+    rows.push(Line::raw(""));
+    rows.push(Line::raw("j/k or ↑/↓ navigate · enter confirm · esc quit"));
+
+    // Centered popup sized to fit the rows (plus borders and a
+    // small horizontal margin).  Capped at the terminal size.
+    let content_h = (rows.len() as u16) + 2; // + 2 for borders
+    let content_w = rows
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(40)
+        + 4; // + 4 for borders + margin
+    let h = content_h.min(area.height);
+    let w = content_w.min(area.width);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+
+    let title = if dialog.matches.is_empty() {
+        " seer — no saved sessions match these files "
+    } else {
+        " seer — saved sessions for these files "
+    };
+    let block = Block::bordered().title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
+/// Wraps `text` in a `Line` whose style flips to a highlighted bar
+/// when `selected` is true.
+fn highlight_if_selected(text: String, selected: bool) -> Line<'static> {
+    let line = Line::from(text);
+    if selected {
+        line.style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        line
+    }
+}
+
+/// Drives the startup-resume dialog in its own ratatui session and
+/// returns the user's choice.
+///
+/// Owns the [`TerminalGuard`] for the dialog's duration; the caller
+/// receives the dialog's result, then opens a fresh terminal for the
+/// main TUI.  Calling `ratatui::init` twice (once here, once in
+/// `run_tui`) can briefly flash; in practice the dialog frame is
+/// drawn within a few milliseconds so the seam is invisible on a
+/// reasonable terminal.
+fn run_startup_dialog(
+    matches: Vec<SessionMatch>,
+) -> Result<StartupChoice, Box<dyn std::error::Error>> {
+    let mut terminal = ratatui::try_init()?;
+    let _guard = TerminalGuard;
+    let mut dialog = StartupDialog::new(matches);
+    loop {
+        terminal.draw(|frame| render_startup_dialog(frame, &dialog))?;
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match dialog.handle_key(key) {
+            StartupDialogStep::Continue(d) => dialog = d,
+            StartupDialogStep::Done(choice) => return Ok(choice),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
@@ -79,40 +333,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new();
     let sources = build_session_sources(&args.files, &mut engine)?;
 
-    // Open the on-disk session store and write the freshly-minted
-    // session to it *before* opening the TUI.  If the user's state
-    // directory isn't writable (permission denied, full disk, …)
-    // they should hear about it now, not after they've done work
-    // that will silently fail to persist.
+    // Open the on-disk session store and look for saved sessions
+    // whose source set overlaps the user's command-line paths.  The
+    // dialog runs even when no candidates exist so the
+    // saved-vs-transient choice is still in front of the user.
     let store = SessionStore::open()?;
-    let mut session = Session::new();
-    session.sources = sources;
+    let user_paths: Vec<Utf8PathBuf> =
+        sources.iter().map(|s| s.path.clone()).collect();
+    let matches = store.find_matches(&user_paths)?;
+
+    let choice = run_startup_dialog(matches)?;
+
+    // Build the [`Session`] that the App will use, plus the optional
+    // store: transient sessions get `None` and skip every write.
+    let (session, store_for_app) = match choice {
+        StartupChoice::Quit => return Ok(()),
+        StartupChoice::Resume(s) => (s, Some(store)),
+        StartupChoice::NewSaved => {
+            let mut s = Session::new();
+            s.sources = sources;
+            // Initial save before opening the TUI.  If the state
+            // directory isn't writable the user hears about it now,
+            // not after typing.
+            store.save(s.id, &s)?;
+            (s, Some(store))
+        }
+        StartupChoice::NewTransient => {
+            let mut s = Session::new();
+            s.sources = sources;
+            (s, None)
+        }
+    };
+
     let session_id = session.id;
-    store.save(session_id, &session)?;
-
+    let is_transient = store_for_app.is_none();
     let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
-    policy.mark_saved(Instant::now());
+    if !is_transient {
+        // The on-disk file is up to date (either we just saved the
+        // fresh session, or we just loaded the resumed one), so
+        // start the debounce window from now.
+        policy.mark_saved(Instant::now());
+    }
 
-    // Drive the TUI in a separate function so the `TerminalGuard`
-    // restores the terminal before we print to stdout below.
-    let mut app = run_tui(engine, session, Some(store), policy)?;
+    let mut app = run_tui(engine, session, store_for_app, policy)?;
 
-    // Final flush.  Today (phase 5) the App never sets `dirty`, so
-    // this is dead code; later phases will record inline / debounced
-    // mutations and make this matter.  Doing it now keeps the exit
-    // path honest from the start.
+    // Final flush.  For transient sessions, try_save_now is a
+    // no-op, so this is harmless even when we never had a store.
     let final_save_err = if app.policy.dirty() {
         app.try_save_now().err()
     } else {
         None
     };
 
-    if let Some(err) = final_save_err {
+    if is_transient {
+        // Transient sessions print nothing on a clean exit.  A
+        // save error is impossible (no store) so nothing to report.
+    } else if let Some(err) = final_save_err {
         eprintln!("seer: final session save failed: {err}");
         eprintln!(
             "session id: {session_id} (state on disk may be partial)"
         );
-    } else if app.store.is_some() {
+    } else {
         println!(
             "session saved.  resume with: seer --resume {session_id}"
         );
@@ -8869,6 +9150,176 @@ mod tests {
             .unwrap()
             .show_extras;
         assert_eq!(after, !before);
+    }
+
+    // ---------- startup dialog (phase 8) ----------
+
+    fn fake_match(kind: MatchKind) -> SessionMatch {
+        SessionMatch { kind, session: Session::new() }
+    }
+
+    fn keypress(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn startup_dialog_with_no_matches_has_two_rows() {
+        let d = StartupDialog::new(Vec::new());
+        assert_eq!(d.rows(), 2);
+        assert_eq!(d.new_saved_idx(), 0);
+        assert_eq!(d.new_transient_idx(), 1);
+        assert_eq!(d.selected, 0);
+    }
+
+    #[test]
+    fn startup_dialog_navigation_clamps_at_ends() {
+        let mut d = StartupDialog::new(vec![
+            fake_match(MatchKind::Exact),
+            fake_match(MatchKind::Overlap),
+        ]);
+        // rows = 2 candidates + 2 fixed = 4
+        assert_eq!(d.rows(), 4);
+
+        // Pressing k at the top is a no-op.
+        d.move_up();
+        assert_eq!(d.selected, 0);
+
+        for expected in 1..4 {
+            d.move_down();
+            assert_eq!(d.selected, expected);
+        }
+        // Pressing j past the bottom is a no-op.
+        d.move_down();
+        assert_eq!(d.selected, 3);
+    }
+
+    #[test]
+    fn startup_dialog_confirm_at_each_index() {
+        let make = || {
+            StartupDialog::new(vec![
+                fake_match(MatchKind::Exact),
+                fake_match(MatchKind::Overlap),
+            ])
+        };
+
+        // Row 0: first candidate.
+        let mut d = make();
+        d.selected = 0;
+        assert!(matches!(d.confirm(), StartupChoice::Resume(_)));
+
+        // Row 1: second candidate.
+        let mut d = make();
+        d.selected = 1;
+        assert!(matches!(d.confirm(), StartupChoice::Resume(_)));
+
+        // Row 2: New saved.
+        let mut d = make();
+        d.selected = 2;
+        assert!(matches!(d.confirm(), StartupChoice::NewSaved));
+
+        // Row 3: New transient.
+        let mut d = make();
+        d.selected = 3;
+        assert!(matches!(d.confirm(), StartupChoice::NewTransient));
+    }
+
+    #[test]
+    fn startup_dialog_esc_returns_quit() {
+        let d = StartupDialog::new(Vec::new());
+        match d.handle_key(keypress(KeyCode::Esc)) {
+            StartupDialogStep::Done(StartupChoice::Quit) => {}
+            other => {
+                panic!(
+                    "expected Done(Quit), got something else: {}",
+                    match other {
+                        StartupDialogStep::Continue(_) => "Continue",
+                        StartupDialogStep::Done(_) => "Done(non-Quit)",
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_dialog_ctrl_c_returns_quit() {
+        let d = StartupDialog::new(Vec::new());
+        match d.handle_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )) {
+            StartupDialogStep::Done(StartupChoice::Quit) => {}
+            _ => panic!("expected Done(Quit)"),
+        }
+    }
+
+    #[test]
+    fn startup_dialog_enter_at_default_picks_first_candidate() {
+        // When there are candidates, `selected` defaults to 0 (the
+        // first candidate); Enter resumes it.
+        let d = StartupDialog::new(vec![fake_match(MatchKind::Exact)]);
+        match d.handle_key(keypress(KeyCode::Enter)) {
+            StartupDialogStep::Done(StartupChoice::Resume(_)) => {}
+            _ => panic!("expected Done(Resume)"),
+        }
+    }
+
+    #[test]
+    fn startup_dialog_enter_with_no_candidates_picks_new_saved() {
+        // Empty matches => selected=0 maps to NewSaved (no candidate
+        // rows in between).
+        let d = StartupDialog::new(Vec::new());
+        match d.handle_key(keypress(KeyCode::Enter)) {
+            StartupDialogStep::Done(StartupChoice::NewSaved) => {}
+            _ => panic!("expected Done(NewSaved)"),
+        }
+    }
+
+    #[test]
+    fn startup_dialog_digit_shortcut_jumps_to_candidate() {
+        let d = StartupDialog::new(vec![
+            fake_match(MatchKind::Exact),
+            fake_match(MatchKind::Superset),
+            fake_match(MatchKind::Overlap),
+        ]);
+        // '2' jumps to the second candidate (index 1).
+        let d = match d.handle_key(keypress(KeyCode::Char('2'))) {
+            StartupDialogStep::Continue(d) => d,
+            _ => panic!("expected Continue"),
+        };
+        assert_eq!(d.selected, 1);
+    }
+
+    #[test]
+    fn startup_dialog_digit_shortcut_out_of_range_is_ignored() {
+        let d = StartupDialog::new(vec![fake_match(MatchKind::Exact)]);
+        // '5' is out of range (only one candidate); selection unchanged.
+        let d = match d.handle_key(keypress(KeyCode::Char('5'))) {
+            StartupDialogStep::Continue(d) => d,
+            _ => panic!("expected Continue"),
+        };
+        assert_eq!(d.selected, 0);
+    }
+
+    #[test]
+    fn render_startup_dialog_does_not_panic_on_empty_or_populated() {
+        // We don't assert on pixels — just that the render path
+        // handles both shapes without panicking.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let dialog = StartupDialog::new(Vec::new());
+        terminal
+            .draw(|frame| render_startup_dialog(frame, &dialog))
+            .unwrap();
+
+        let dialog = StartupDialog::new(vec![
+            fake_match(MatchKind::Exact),
+            fake_match(MatchKind::Superset),
+            fake_match(MatchKind::Overlap),
+        ]);
+        terminal
+            .draw(|frame| render_startup_dialog(frame, &dialog))
+            .unwrap();
     }
 
     // ---------- debounced persistence (phase 7) ----------
