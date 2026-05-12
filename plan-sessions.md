@@ -26,7 +26,7 @@ done and what's next.  So:
 
 ## Current status
 
-Phase 5 in progress.
+Phase 5 complete.  Next phase: **6. Inline saves at low-cadence mutations.**
 
 ## Goal
 
@@ -403,13 +403,36 @@ startup dialog.  Splitting it into four independently-mergeable
 phases keeps each landing reviewable and lets the persistence pipe
 prove itself before the resume dialog lands on top.
 
-- [~] **5. Source capture + policy plumbing + exit save.**  Add
+- [x] **5. Source capture + policy plumbing + exit save.**  Add
   `SavePolicy` and `SessionStore` fields to `App`; capture
   `SessionSource` rows (path + mtime + size) from the command-line
   files at startup; route every persistence call through a single
   `App::try_save` helper; do a final save on normal exit and print
   the resume hint to stdout.  No behavioral change while the TUI
   is running — but the pipe is alive end-to-end.
+  - `App` gained `store: Option<SessionStore>` (`None` reserved for
+    phase 8's transient sessions) and `policy: SavePolicy`.
+    `App::new_with_session` now takes `(engine, session, store,
+    policy)`; the test-only `App::new(engine)` passes `None` and a
+    default `SavePolicy`.  Added `App::try_save_now` — saves through
+    the store and calls `policy.mark_saved(Instant::now())` on
+    success; no-op when `store` is `None`.  New free function
+    `build_session_sources(paths, engine)` canonicalizes each CLI
+    path, stats it for `mtime`+`size`, and registers it with the
+    engine, returning the `SessionSource` rows in CLI order.  `main`
+    splits into `main` + `run_tui`: `main` does source capture,
+    opens the `SessionStore`, builds a fresh `Session` with the
+    captured sources, does an initial `store.save` before opening
+    the TUI (so a write-permission failure aborts before any user
+    work), and after `run_tui` returns it flushes again if
+    `policy.dirty()` and prints `session saved.  resume with: seer
+    --resume <id>` on stdout (or the failure on stderr).
+    `run_tui` owns the `TerminalGuard` so the terminal is restored
+    before stdout printing.  Three new App-level tests cover the
+    source-capture helper, the persistence round-trip via
+    `try_save_now`, and the no-op-without-a-store contract.  Phase 5
+    is a wiring step — `App` itself never sets `dirty` yet, so the
+    exit-flush path is exercised in later phases.  472 tests pass.
 
 - [ ] **6. Inline saves at low-cadence mutations.**  Call
   `policy.record(Cadence::Inline)` and route through

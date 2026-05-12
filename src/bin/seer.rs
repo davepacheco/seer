@@ -13,6 +13,7 @@
 //! path.
 
 use camino::Utf8PathBuf;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use ratatui::Frame;
 use ratatui::crossterm::event::{
@@ -28,8 +29,9 @@ use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, EngineEvent, Filter,
     HostnameDisplay, LogStream, LogStreamId, LogStreamPosition, Predicate,
-    RenderOpts, SearchDir, SearchOutcome, Session, SourceId,
-    StreamView, SummaryBuilder, WindowFillStatus, format_summary,
+    RenderOpts, SavePolicy, SearchDir, SearchOutcome, Session, SessionSource,
+    SessionStore, SourceId, StoreError, StreamView, SummaryBuilder,
+    WindowFillStatus, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -42,23 +44,95 @@ struct Args {
     files: Vec<Utf8PathBuf>,
 }
 
+/// Registers each user-supplied path with the engine and returns the
+/// corresponding [`SessionSource`] rows.
+///
+/// Each path is canonicalized and stat'd at startup so the saved
+/// session captures a stable path-plus-fingerprint pair: a later
+/// resume can detect a file whose content has changed since the
+/// session was last written.  The [`SourceId`] in each row is the
+/// one the engine assigned to the file, so cursors and bookmarks
+/// in the session line up with the engine's view of the world.
+fn build_session_sources(
+    paths: &[Utf8PathBuf],
+    engine: &mut Engine,
+) -> std::io::Result<Vec<SessionSource>> {
+    let mut sources = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = path.canonicalize_utf8()?;
+        let metadata = std::fs::metadata(&canonical)?;
+        let size = metadata.len();
+        let mtime: DateTime<Utc> = metadata.modified()?.into();
+        let id = engine.add_file_source(&canonical)?;
+        sources.push(SessionSource { id, path: canonical, mtime, size });
+    }
+    Ok(sources)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Register every CLI-supplied file with the engine and capture
+    // path / mtime / size for the session's source manifest.  The
+    // assignment is in lockstep so the engine and session agree on
+    // the SourceId for each file.
     let mut engine = Engine::new();
-    for path in &args.files {
-        engine.add_file_source(path)?;
+    let sources = build_session_sources(&args.files, &mut engine)?;
+
+    // Open the on-disk session store and write the freshly-minted
+    // session to it *before* opening the TUI.  If the user's state
+    // directory isn't writable (permission denied, full disk, …)
+    // they should hear about it now, not after they've done work
+    // that will silently fail to persist.
+    let store = SessionStore::open()?;
+    let mut session = Session::new();
+    session.sources = sources;
+    let session_id = session.id;
+    store.save(session_id, &session)?;
+
+    let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
+    policy.mark_saved(Instant::now());
+
+    // Drive the TUI in a separate function so the `TerminalGuard`
+    // restores the terminal before we print to stdout below.
+    let mut app = run_tui(engine, session, Some(store), policy)?;
+
+    // Final flush.  Today (phase 5) the App never sets `dirty`, so
+    // this is dead code; later phases will record inline / debounced
+    // mutations and make this matter.  Doing it now keeps the exit
+    // path honest from the start.
+    let final_save_err = if app.policy.dirty() {
+        app.try_save_now().err()
+    } else {
+        None
+    };
+
+    if let Some(err) = final_save_err {
+        eprintln!("seer: final session save failed: {err}");
+        eprintln!(
+            "session id: {session_id} (state on disk may be partial)"
+        );
+    } else if app.store.is_some() {
+        println!(
+            "session saved.  resume with: seer --resume {session_id}"
+        );
     }
 
-    // Sessions are intentionally ephemeral right now: each run starts
-    // with no bookmarks, no saved streams, no resumed tabs.  The TODO
-    // for per-project persistence (canonicalized filename → session
-    // file, with a resume/new-saved/new-ephemeral startup dialog) is
-    // open work; until it lands, persisting state to a single global
-    // file would silently mix bookmarks across unrelated investigations.
+    Ok(())
+}
+
+/// Runs the ratatui event loop and returns the [`App`] when the user
+/// quits, so the caller can inspect the final session state (and
+/// trigger a final save) after the terminal has been restored.
+fn run_tui(
+    engine: Engine,
+    session: Session,
+    store: Option<SessionStore>,
+    policy: SavePolicy,
+) -> Result<App, Box<dyn std::error::Error>> {
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    let mut app = App::new_with_session(engine, Session::new());
+    let mut app = App::new_with_session(engine, session, store, policy);
     while !app.quit {
         terminal.draw(|frame| render(frame, &mut app))?;
         if app.long_op.is_some() {
@@ -85,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             app.handle_key(key);
         }
     }
-    Ok(())
+    Ok(app)
 }
 
 /// Restores the terminal on drop so panics and `?`-returns don't leave
@@ -1419,15 +1493,31 @@ struct App {
     /// build runs at a time, so a filter change that would dirty
     /// several Summary tabs queues each tab's rebuild here.
     pending_summary_builds: std::collections::VecDeque<(usize, Filter)>,
+    /// On-disk store backing this session, or `None` for a transient
+    /// session that should never be written to disk.  Test
+    /// constructors leave this `None`.
+    store: Option<SessionStore>,
+    /// Save-cadence bookkeeping for session-affecting mutations.
+    /// Phase 5 only flushes on exit; later phases call
+    /// `policy.record(Cadence::Inline)` and `Cadence::Debounced` at
+    /// the appropriate mutation sites and consult `policy.due()` in
+    /// the event loop.
+    policy: SavePolicy,
 }
 
 impl App {
     /// Convenience constructor for tests that don't care about the
-    /// session.  Production code goes through [`Self::new_with_session`]
-    /// so a previously-saved session is honored.
+    /// session or persistence.  Production code goes through
+    /// [`Self::new_with_session`] so a previously-saved session and
+    /// the on-disk store are honored.
     #[cfg(test)]
     fn new(engine: Engine) -> Self {
-        Self::new_with_session(engine, Session::new())
+        Self::new_with_session(
+            engine,
+            Session::new(),
+            None,
+            SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
+        )
     }
 
     /// Constructs an [`App`] reusing a previously-loaded [`Session`].
@@ -1439,7 +1529,17 @@ impl App {
     /// future schema; we leave that field intact so a later
     /// auto-resume can pick it up without a save round-trip
     /// re-emptying it.
-    fn new_with_session(engine: Engine, session: Session) -> Self {
+    ///
+    /// `store` is `None` for a transient session that should not be
+    /// written to disk; `policy` is the save-cadence tracker
+    /// (initialized by the caller so the freshly-saved-at-startup
+    /// timestamp is already recorded).
+    fn new_with_session(
+        engine: Engine,
+        session: Session,
+        store: Option<SessionStore>,
+        policy: SavePolicy,
+    ) -> Self {
         let mut a = Self {
             engine,
             session,
@@ -1456,9 +1556,27 @@ impl App {
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
+            store,
+            policy,
         };
         a.push_tab(TabKind::Stream, Filter::default());
         a
+    }
+
+    /// Persists the current [`Session`] to disk through the attached
+    /// [`SessionStore`], if any, and records the flush with the save
+    /// policy.  Returns `Ok(())` (with no I/O) when no store is
+    /// attached — a transient session quietly skips persistence.
+    ///
+    /// On failure the policy's `dirty` bit is left alone (it stays
+    /// set if the caller had just recorded a mutation) so the next
+    /// opportunity tries again.  Callers that want to surface the
+    /// error to the user typically do so via [`Self::notice`].
+    fn try_save_now(&mut self) -> Result<(), StoreError> {
+        let Some(store) = &self.store else { return Ok(()) };
+        store.save(self.session.id, &self.session)?;
+        self.policy.mark_saved(Instant::now());
+        Ok(())
     }
 
     /// Pushes a new tab backed by a fresh [`LogStream`] with the given
@@ -2921,6 +3039,8 @@ impl App {
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
+            store: None,
+            policy: SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
         };
         // Manually push so we can override the row data (the engine has
         // no sources, so a real push_tab would yield empty vecs).
@@ -8487,5 +8607,74 @@ mod tests {
             "expected `Summary N`, got {:?}",
             a.active_tab().name,
         );
+    }
+
+    // ---------- persistent-session plumbing (phase 5) ----------
+
+    #[test]
+    fn build_session_sources_canonicalizes_and_stats_each_file() {
+        use camino_tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let a_path = dir.path().join("a.log");
+        let b_path = dir.path().join("b.log");
+        std::fs::write(&a_path, b"hello\n").unwrap();
+        std::fs::write(&b_path, b"").unwrap();
+
+        let mut engine = Engine::new();
+        let sources =
+            build_session_sources(&[a_path.clone(), b_path.clone()], &mut engine)
+                .unwrap();
+
+        assert_eq!(sources.len(), 2);
+        // Order is preserved.
+        assert_eq!(sources[0].path, a_path.canonicalize_utf8().unwrap());
+        assert_eq!(sources[1].path, b_path.canonicalize_utf8().unwrap());
+        // Sizes match the bytes we wrote.
+        assert_eq!(sources[0].size, 6);
+        assert_eq!(sources[1].size, 0);
+        // The SourceId the engine assigned matches the one recorded
+        // in the SessionSource — that's the alignment cursors and
+        // bookmarks rely on.
+        let id_as_str: &str = sources[0].id.as_ref();
+        assert_eq!(id_as_str, sources[0].path.as_str());
+    }
+
+    #[test]
+    fn try_save_now_persists_session_and_marks_policy_clean() {
+        use camino_tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let store =
+            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let session_id = Session::new().id;
+
+        let mut a = App::new(Engine::new());
+        a.session.id = session_id;
+        a.store = Some(store);
+        // Simulate a debounced mutation having dirtied the session.
+        a.policy.record(seer::Cadence::Debounced);
+        assert!(a.policy.dirty());
+
+        a.try_save_now().unwrap();
+        assert!(!a.policy.dirty());
+
+        // Round-trip: the file the store wrote should load back to the
+        // same session id.
+        let reloaded = a.store.as_ref().unwrap().load(session_id).unwrap();
+        assert_eq!(reloaded.id, session_id);
+    }
+
+    #[test]
+    fn try_save_now_is_a_noop_without_a_store() {
+        // A transient session (phase 8) has `store: None`; calling
+        // try_save_now must succeed without touching disk.  The
+        // policy's dirty bit is also left alone — there's no flush
+        // to record.
+        let mut a = App::new(Engine::new());
+        assert!(a.store.is_none());
+        a.policy.record(seer::Cadence::Debounced);
+        a.try_save_now().expect("no-op should succeed");
+        assert!(a.policy.dirty(), "dirty bit untouched without a store");
     }
 }
