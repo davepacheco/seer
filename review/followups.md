@@ -1,0 +1,306 @@
+# Plan: review follow-ups
+
+A flattened, deduped list of every actionable item from `review/phase-1`
+through `review/phase-5`.  Ordered roughly easiest-first — the user
+expects to discuss each item before it lands, so items that involve
+the smallest mechanical change come earliest.
+
+References use the form `P{n} §{key}` to point back to the originating
+review file (e.g. `P3 §B1` = phase-3-type-safety.md, blocking finding
+about `LogStream::render_opts`).  Items flagged in multiple phases are
+listed once with all references gathered.
+
+## Status
+
+| Field          | Value                                              |
+|----------------|----------------------------------------------------|
+| Items closed   | 1 / 44                                             |
+| Current item   | —  (pick the first unchecked below)                |
+| Last updated   | 2026-05-12                                         |
+| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live. |
+
+### How this state works
+
+Same convention as `test-plan.md`.  Each item is a checkbox.  When the
+user asks for "the next item", pick the first unchecked one in this
+list, discuss it briefly, land the change, tick the box, and update
+the **Items closed** and **Last updated** rows.  If an item splits
+into sub-tasks during discussion, add them as nested checkboxes under
+the parent — don't silently absorb scope.
+
+If discussion lands on "skip this one" or "fold into item N", record
+that in **Notes** (with a one-line reason) and tick the box; the
+record matters more than the binary outcome.
+
+---
+
+## Quick mechanical wins
+
+Each of these is a single-file or single-concept change with no
+genuine design choice to make.
+
+- [x] **1. Dedupe `BATCH_SIZE = 64`.**  Define once (e.g.
+      `pub const FETCH_BATCH_SIZE: usize = 64;` at the engine root)
+      and import in both call sites.  *Refs:* P1 §6, P3 §S2, P4 §C1.
+      *Affects:* `src/engine/merge.rs:48`, `src/streamview.rs:39`.
+
+- [ ] **2. Replace bare `.unwrap()` with `.expect("…")`** at three
+      sites in `bin/seer.rs` so they match the file's documented-
+      invariant idiom.  *Refs:* P3 §S10.  *Affects:* `src/bin/seer.rs:2138, :2220, :3169`.
+
+- [ ] **3. Destructure `LogStream::render_opts` and `set_render_opts`.**
+      Pattern-bind every `RenderOpts` field so adding a new dimension
+      fails to compile until propagated.  *Refs:* P3 §B1, P5 §A1.
+      *Affects:* `src/stream.rs:195, :210`.  *Enables:* item 37.
+
+- [ ] **4. Move `SessionId` from `session_store` into `session`.**
+      Breaks the `session ↔ session_store` cycle.  Pure rename.
+      *Refs:* P2 §F2, P4 §B3.  *Affects:* `src/session_store.rs`,
+      `src/session.rs`.
+
+- [ ] **5. Drop `bin/seer.rs`'s local `ParseStats` in favor of
+      `streamview::ParseStats`.**  The streamview type is a strict
+      superset (it carries `walked_bytes`).  *Refs:* P2 §F6, P4 §A3,
+      P5 §A3.  *Affects:* `src/bin/seer.rs:683` and call sites.
+
+- [ ] **6. Rename `seeit_target.rs` → `view_target.rs` (or
+      `resolved_view.rs`).**  The file resolves a saved view for both
+      `seer` and `seeit`; the `seeit_` prefix misreads as binary-
+      specific.  *Refs:* P2 §F9.  *Affects:* `src/seeit_target.rs`.
+
+- [ ] **7. Centralize the bunyan-level numeric mapping.**  One
+      `const TABLE: &[(u8, Level)]` walked by both `as_bunyan_number`
+      and `TryFrom<u8>`, with `JsonSchema` reading from it too.
+      *Refs:* P3 §S3.  *Affects:* `src/event.rs:152, :196, :243`.
+
+- [ ] **8. Consolidate `App`'s five `active_*` helpers** into one
+      `active_stream(&self) -> &LogStream` (and a `_mut` sibling).
+      Callers pluck the field they want; the single
+      `.expect("stream exists")` lives in one place.  *Refs:* P4 §A9.
+      *Affects:* `src/bin/seer.rs:2983, :2991, :2999, :3007, :3014`.
+
+## Targeted type-safety improvements
+
+Each is bounded in scope but touches a few files.  Where an item
+collapses follow-on tests automatically, that's noted.
+
+- [ ] **9. `Polarity` enum replaces `negated: bool` on `Predicate`.**
+      `Polarity::Affirm` / `Polarity::Deny`; matching is a
+      `match polarity` instead of an XOR.  Eliminates the
+      `/* negated = */ false` comments at every DSL parse site.
+      *Refs:* P3 §S1, P5 §A2.  *Affects:* `src/filter.rs:99, :181, :290, :294, :309, :312, :323`.
+      *Enables:* item 38, possibly item 30.
+
+- [ ] **10. Replace `forward_eof: bool` / `backward_eof: bool` with a
+      `Direction`-keyed structure.**  Either a small `DirectionalEof`
+      wrapper or `EnumMap<Direction, bool>`.  *Refs:* P3 §S6, P4 §C3.
+      *Affects:* `src/streamview.rs:256, :257` and all read sites.
+
+- [ ] **11. Delete `streamview::TimeDir`** and reuse the existing
+      `source::Direction`.  *Refs:* P4 §C3.  *Affects:*
+      `src/streamview.rs:200` and call sites.
+
+- [ ] **12. Replace opaque `bool` function parameters with named
+      enums.**  Cases: `format_time(_, show_date: bool)`,
+      `Tab::advance_time(forward: bool)`,
+      `Tab::time_anchor_idx(prefer_forward: bool)`,
+      `Tab::jump_to_match(_, exclusive: bool)`,
+      `SourceWindow::set_eof(_, value: bool)`.  *Refs:* P3 §S7.
+
+- [ ] **13. Introduce `ByteLen(u64)` newtype.**  Same affordances as
+      `ByteOffset`.  Type-checks the combination
+      `ByteOffset + ByteLen → ByteOffset`.  *Refs:* P3 §S4, P4 §C2.
+      *Affects:* `QueryRecord.length`, `MergeRecord.length`,
+      `QueryBatch.walked_bytes`, `ParseStats.bytes`,
+      `EventStream::bytes_read`, `LongOp.*total_bytes`.
+
+- [ ] **14. Introduce `TabIdx`, `EventIdx`, `LineIdx` newtypes.**
+      Catches the inevitable transposition between
+      `event_for_line` (LineIdx → EventIdx) and
+      `first_line_for_event` (EventIdx → LineIdx) at compile time.
+      *Refs:* P3 §S5, P4 §C2.  *Affects:* `src/bin/seer.rs:671,
+      :672, :1014, :1097, :1180`.
+
+- [ ] **15. Replace bare `as usize` / `as isize` casts in StreamView
+      navigation** with `try_from(...)` + comments justifying each
+      remaining cast.  *Refs:* P3 §S11.  *Affects:*
+      `src/streamview.rs:1108-1178, :1556-1616, :1650`.
+
+## Module reshapes
+
+Small placement changes that clean up the dependency graph.
+
+- [ ] **16. Move `Cursor` out of `engine/merge.rs`** into a new
+      top-level home (e.g. `position.rs`) alongside `ByteOffset`.
+      Today it's an internal helper that half the codebase persists.
+      *Refs:* P2 §F3, P4 §B1.
+
+- [ ] **17. Move `LogStreamPosition` out of `stream.rs`** to sit next
+      to `Cursor` (item 16).  `LogStream` itself stays.  *Refs:*
+      P2 §F4, P4 §B2.
+
+- [ ] **18. Decide on `Cursor` absent-vs-zero semantics.**  Either
+      normalize on construction so the map is dense, or document
+      explicitly next to `PartialEq` that absence and zero compare
+      unequal.  *Refs:* P3 §S8.  *Affects:* `src/engine/merge.rs:70`.
+
+## Collection types
+
+- [ ] **19. `Session.sources: Vec<SessionSource>` → `IdOrdMap`.**
+      `SessionSource: IdOrdItem` keyed by `id`.  Serde form stays a
+      JSON array; no on-disk migration.  *Refs:* P3 §B4.
+      *Affects:* `src/session.rs:199`.
+
+- [ ] **20. `Session.user_bookmarks` inner `Vec<Bookmark>` →
+      `IdOrdMap<Bookmark>`.**  `add_bookmark` becomes
+      `insert_unique`; `remove_bookmark` becomes an O(log n)
+      lookup.  *Refs:* P3 §B5.  *Affects:* `src/session.rs:216, :255`.
+
+## Stepper / merge API
+
+- [ ] **21. Consolidate Engine's three stepper constructors.**
+      Either a `StepperBuilder` returned by `Engine::stepper(...)`,
+      or one `stepper_with_bounds(...)` + named defaults.  *Refs:*
+      P1 §2, P4 §A1.  *Affects:* `src/engine.rs:75, :92, :112` and
+      the matching trio on `Stepper` in `src/engine/merge.rs`.
+
+- [ ] **22. Drop or symmetrize `Stepper::step_backward_n`.**  Either
+      add a `step_forward_n`, or remove and let callers loop (only
+      in-tree caller is `seeit`'s `--before N`).  *Refs:* P4 §A7.
+      *Affects:* `src/engine/merge.rs:529`.
+
+- [ ] **23. Consolidate StreamView's five `extend_*` methods** into
+      one or two methods parameterized by `(direction, batch_size,
+      max_walks)`.  *Refs:* P4 §A8.  *Affects:* `src/streamview.rs:809,
+      :849, :900, :905, :952`.
+
+- [ ] **24. Extract `OutOfOrderDetector` helper** used by both
+      `SourceCursor::fill` and the stepper, until the two merges
+      unify (item 35).  *Refs:* P4 §C5.
+
+## Design discussions
+
+Each of these has multiple plausible answers; the right call depends
+on tradeoffs the user will want to weigh.
+
+- [ ] **25. `RenderOpts.show_raw` → `RenderMode` enum.**
+      `RenderMode::Raw | Formatted { show_extras, show_date, hostname,
+      show_pid, show_name }`.  Makes the "raw silently ignores other
+      fields" hazard a compile-time impossibility.  *Refs:* P3 §B2.
+      *Pairs with:* the `LogStream` mirror question (items 3 / 27).
+
+- [ ] **26. `RenderedRows.events: Vec<Option<EngineEvent>>` →
+      `Vec<Row>`** where `Row` is `Event(EngineEvent) | Error(String)`.
+      Removes the parallel-`None`/error-string invariant.  *Refs:*
+      P3 §B6.  *Affects:* `src/bin/seer.rs:669`.
+
+- [ ] **27. `Tab.kind: TabKind` + `streamview: Option<StreamView>` →
+      `TabContent` enum.**  `Stream { view, rendered }` /
+      `Summary { rendered }`.  Eliminates the documented "iff"
+      invariant.  *Refs:* P3 §B3.  *Affects:* `src/bin/seer.rs:1396`.
+
+- [ ] **28. Resolve `Tab` vs `StreamView` materialization.**  Either
+      move materialization onto `StreamView` (return a borrowed
+      `&Materialized`), or have `StreamView` own the flat lines
+      directly and drop the deque shape.  Today's "both" is the
+      worst answer.  *Refs:* P2 §F5, P4 §A4.
+
+- [ ] **29. Split `Predicate` into `EventPredicate` and
+      `SourcePredicate`.**  Removes the `Predicate::SourceIdMatches`
+      "matches returns true" lie.  Pairs naturally with `Polarity`
+      (item 9).  *Refs:* P1 §10, P4 §A10.  *Affects:* `src/filter.rs`.
+
+- [ ] **30. `FieldName { Core(CoreField), Extra(String) }`** for
+      filter field names.  Lets `SourceMetadata::excludes_all` match
+      on a typed enum instead of comparing strings.  *Refs:* P3 §S9.
+      *Affects:* `src/filter.rs:115, :220`, `src/source.rs:330`.
+
+- [ ] **31. Filter ↔ source cycle: accept or break.**  Either lift
+      `SourceId` to a common types module (e.g. `position.rs` from
+      item 16) so the cycle is broken at the type level, or accept
+      the cycle (it's small) and document why.  *Refs:* P2 §F1.
+
+- [ ] **32. Re-examine `MergeError(Arc<SourceError>)`.**  Today the
+      `Arc` exists only because `std::io::Error` and
+      `serde_json::Error` aren't `Clone`.  Alternative: store
+      `Display` strings on merged records (raw line is already
+      retained).  *Refs:* P4 §A6.  *Affects:* `src/engine/merge.rs:148`.
+
+- [ ] **33. Tighten `LogStream` ↔ `RenderOpts` mirror long-term.**
+      Item 3 fixes the silent-failure today via destructuring; the
+      deeper choice is whether `LogStream` should embed
+      `RenderOpts` directly (one schema bump + migration shim) or
+      stay flat for per-field schema evolution.  *Refs:* P3 §B1, P4 §C4.
+
+## Large refactors
+
+- [ ] **34. Lift `LongOp` + `SummaryOp` + `SearchOp` + `SeekOp` into
+      the library** (e.g. `engine::long_op`).  Makes them
+      unit-testable without spinning up `App` and lets `seeit` reuse
+      them for a future `--progress` mode.  *Refs:* P2 §F7, P4 §A5.
+      *Affects:* `src/bin/seer.rs:939-1240` (~300 lines).
+
+- [ ] **35. Unify the two k-way merges.**  One merged record type
+      carrying source_id + offset + length + raw + event + position;
+      `EventStream` becomes a thin wrapper around
+      `Stepper::step_forward`; out-of-order detection lives in one
+      place.  Largest single library cleanup.  *Refs:* P1 §1, P2 §F8,
+      P4 §A2, P4 §C5.
+
+- [ ] **36. Decide on splitting `bin/seer.rs`.**  10K lines, ~80
+      top-level items, 2K-line `App` impl, 450-line `Tab` impl.
+      Candidates to split out: input handling, rendering, dialog
+      logic.  *Refs:* P1 §5.
+
+## Test cleanups
+
+Mostly automatic consequences of the type-safety changes above.
+
+- [ ] **37. Collapse the five `show_X_persists_into_session_round_trip`
+      tests** into one that mutates every `RenderOpts` field.  Lands
+      after item 3.  *Refs:* P5 §A1.
+
+- [ ] **38. Fold the eleven `Predicate` negated-flag tests** after
+      `Polarity` lands (item 9).  *Refs:* P5 §A2.
+
+- [ ] **39. Delete `serde_payload_without_negated_field_defaults_false`.**
+      Either redundant after item 9, or testing serde itself.  *Refs:*
+      P5 §C1.  *Affects:* `src/filter.rs:1033`.
+
+- [ ] **40. Merge `column_chunks_handles_empty_and_unicode` with
+      `wrap_dialog_text_handles_empty_and_chunking`.**  Same wrap
+      helper, two test bodies.  *Refs:* P5 §C2.  *Affects:*
+      `src/bin/seer.rs:6225, :6534`.
+
+- [ ] **41. Extract a `LineEditor` test module.**  Drop the
+      per-dialog editor duplicates (insert / backspace / left-right /
+      delete / ctrl-u across filter, search, rename); keep one
+      "dialog passes through" test per dialog kind.  *Refs:* P5 §C4.
+
+## Coverage adds
+
+- [ ] **42. Add test for `Engine::cursor_for_position`'s walked-off-
+      group return-None branch.**  *Refs:* P5 §D1.  *Affects:*
+      `src/engine.rs:202-225`.
+
+- [ ] **43. Add a property test for `Filter::matches` being a
+      conjunction.**  Random predicates; assert
+      `f.matches(e) == f.predicates().all(...)`.  *Refs:* P5 §D2.
+
+- [ ] **44. Add an agreement test between
+      `SourceMetadata::excludes_all` and per-line filter.**  Worth
+      adding once SMF / CockroachDB formats land, per the CLAUDE.md
+      callout.  *Refs:* P5 §D3.
+
+---
+
+## Items intentionally left off this list
+
+- **Phase 5 §B1–B3 (release events, dialog key-swallow, quit
+  confirmation).**  Phase 5 explicitly recommends keeping these; no
+  action.
+- **Phase 5 §C3, §C5, §C6.**  Style judgement calls the review says
+  are fine as-is; the user can revive them as standalone items if
+  they disagree.
+- **Phase 2 §F10, all of Phase 4's "what looks well-shaped" list.**
+  Positive findings; no work.

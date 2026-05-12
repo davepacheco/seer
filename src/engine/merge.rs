@@ -35,17 +35,21 @@ fn opposite(d: Direction) -> Direction {
     }
 }
 
-/// Default per-fetch batch size.  Each refill of a [`SourceWindow`]
-/// asks the storage layer for up to this many matching records.
-/// Larger batches amortize seek cost; smaller batches keep the
-/// maximum work per step bounded when the active filter rejects most
-/// records (the storage layer walks until `count` matches are found,
-/// so the wall time per `query` call scales with this constant under
-/// selective filters).  The long-op driver behind `G`/`g`/filter
-/// rebuild overrides this with a small value via
-/// [`Engine::stepper_with_batch`] so each tick yields after a small
-/// chunk of walking and the UI stays responsive.
-const BATCH_SIZE: usize = 64;
+/// Default per-fetch batch size for the merge stepper.  Each refill
+/// of a [`SourceWindow`] asks the storage layer for up to this many
+/// matching records; [`crate::streamview::StreamView`] uses the same
+/// value when it asks the stepper to extend a cached window in either
+/// direction, so the two layers stay in lock-step instead of one
+/// over-fetching beyond what the other can hold.  Larger batches
+/// amortize seek cost; smaller batches keep the maximum work per step
+/// bounded when the active filter rejects most records (the storage
+/// layer walks until `count` matches are found, so the wall time per
+/// `query` call scales with this constant under selective filters).
+/// The long-op driver behind `G`/`g`/filter rebuild overrides this
+/// with a small value via [`super::Engine::stepper_with_batch`] so each
+/// tick yields after a small chunk of walking and the UI stays
+/// responsive.
+pub const FETCH_BATCH_SIZE: usize = 64;
 
 /// Maximum records held in either direction's buffer for a single
 /// source.  When a step would push beyond this, the oldest entry on
@@ -408,7 +412,7 @@ impl<'a> Stepper<'a> {
         filter: Filter,
         cursor: &Cursor,
     ) -> Self {
-        Self::with_bounds(sources, filter, cursor, BATCH_SIZE, None)
+        Self::with_bounds(sources, filter, cursor, FETCH_BATCH_SIZE, None)
     }
 
     /// Internal constructor that lets the caller override the per-fill
@@ -1167,13 +1171,13 @@ mod tests {
 
     #[test]
     fn many_records_force_multiple_batch_fetches() {
-        // Write more records than `BATCH_SIZE` so the stepper must
-        // refill at least twice.  A counting source wraps the
+        // Write more records than `FETCH_BATCH_SIZE` so the stepper
+        // must refill at least twice.  A counting source wraps the
         // underlying file source and asserts the stepper isn't
         // single-fetching everything.
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
-        let n = (BATCH_SIZE * 3 + 5) as i64;
+        let n = (FETCH_BATCH_SIZE * 3 + 5) as i64;
         let secs: Vec<i64> = (0..n).collect();
         write_fixture(&p, "x", &secs);
         let inner = FileSource::open(&p).unwrap();
@@ -1185,9 +1189,9 @@ mod tests {
         let msgs = forward_msgs(&mut stepper);
         assert_eq!(msgs.len(), n as usize);
         let calls = counter.load(Ordering::SeqCst);
-        // We should see at least `ceil(n / BATCH_SIZE)` query calls;
-        // a single huge fetch would be only 1.
-        let expected_min = (n as usize).div_ceil(BATCH_SIZE);
+        // We should see at least `ceil(n / FETCH_BATCH_SIZE)` query
+        // calls; a single huge fetch would be only 1.
+        let expected_min = (n as usize).div_ceil(FETCH_BATCH_SIZE);
         assert!(
             calls >= expected_min,
             "expected at least {expected_min} fetches, got {calls}",

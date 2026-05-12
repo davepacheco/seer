@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 
 mod merge;
 
-pub use merge::{Cursor, MergeError, MergeRecord, Stepper};
+pub use merge::{Cursor, FETCH_BATCH_SIZE, MergeError, MergeRecord, Stepper};
 
 /// An [`Event`] paired with the [`LogStreamPosition`] identifying which
 /// source it came from and its position within that source.
@@ -84,8 +84,9 @@ impl Engine {
 
     /// Like [`Self::stepper`] but lets the caller override the
     /// per-fill batch size that the stepper hands to the storage
-    /// layer.  The TUI's long-op driver passes a small value (see
-    /// [`crate::engine::merge::LONG_OP_BATCH_SIZE`]) so each `query`
+    /// layer.  The TUI's long-op driver passes a small value (one
+    /// match per call, paired with a `max_walks_per_fill` budget — see
+    /// [`crate::StreamView::ensure_window_step`]) so each `query`
     /// walks only a bounded number of records before yielding —
     /// without it, a single fill under a selective filter can freeze
     /// the UI for hundreds of milliseconds at a time.

@@ -16,14 +16,14 @@
 //! and constructs a fresh [`Stepper`] on every fetch.  The `&Engine`
 //! parameter on every fetching method threads the engine in by
 //! reference.  Each refetch reopens the underlying file once per
-//! [`BATCH_SIZE`]-sized batch, which is small relative to the parse
-//! cost.
+//! [`FETCH_BATCH_SIZE`]-sized batch, which is small relative to the
+//! parse cost.
 //!
 //! Summary tabs do not use `StreamView`; they keep the existing
 //! full-pass model since their output is bounded by the histogram
 //! shape, not by the file size.
 
-use crate::engine::{Cursor, Engine, MergeRecord};
+use crate::engine::{Cursor, Engine, FETCH_BATCH_SIZE, MergeRecord};
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::render::{RenderOpts, format_event};
@@ -32,11 +32,6 @@ use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use std::collections::VecDeque;
 use std::time::{Duration as StdDuration, Instant};
-
-/// Per-fetch batch size.  Each call to extend the window in either
-/// direction asks the stepper for up to this many records.  Matches
-/// the storage layer's batch size so we don't over-fetch.
-const BATCH_SIZE: usize = 64;
 
 /// Soft cap on cached records.  When extending in a direction would
 /// push the window past this, we trim from the opposite end.
@@ -626,7 +621,7 @@ impl StreamView {
         // anchor's preferred direction.  One match per call keeps each
         // tick proportional to one match's worth of records walked —
         // important under selective filters, where finding a batch's
-        // worth of matches (BATCH_SIZE = 64) can mean walking many
+        // worth of matches (FETCH_BATCH_SIZE = 64) can mean walking many
         // thousands of on-disk records and freezing the UI.  The
         // long-op driver calls us repeatedly within a time budget per
         // frame, so multiple matches still get fetched per tick on
@@ -785,8 +780,8 @@ impl StreamView {
         });
     }
 
-    /// Fetches up to `BATCH_SIZE` records forward and appends them.
-    /// Returns the number actually fetched.
+    /// Fetches up to `FETCH_BATCH_SIZE` records forward and appends
+    /// them.  Returns the number actually fetched.
     fn extend_forward_batch(&mut self, engine: &Engine) -> usize {
         if self.forward_eof {
             return 0;
@@ -796,7 +791,7 @@ impl StreamView {
             engine.stepper(self.filter.clone(), &self.back_cursor);
         let mut fetched = 0;
         let mut bytes = 0u64;
-        for _ in 0..BATCH_SIZE {
+        for _ in 0..FETCH_BATCH_SIZE {
             match stepper.step_forward() {
                 Some(record) => {
                     bytes += record.length;
@@ -876,10 +871,10 @@ impl StreamView {
         fetched
     }
 
-    /// Fetches up to `BATCH_SIZE` records backward and prepends them.
-    /// Returns the number actually fetched.
+    /// Fetches up to `FETCH_BATCH_SIZE` records backward and prepends
+    /// them.  Returns the number actually fetched.
     fn extend_backward_batch(&mut self, engine: &Engine) -> usize {
-        self.extend_backward_batch_n(engine, BATCH_SIZE, BATCH_SIZE)
+        self.extend_backward_batch_n(engine, FETCH_BATCH_SIZE, FETCH_BATCH_SIZE)
     }
 
     /// Symmetric to [`Self::extend_forward_small_batch`].
@@ -971,7 +966,7 @@ impl StreamView {
         fetched
     }
 
-    /// Repeatedly extends forward in `BATCH_SIZE` chunks until `done`
+    /// Repeatedly extends forward in `FETCH_BATCH_SIZE` chunks until `done`
     /// returns true, EOF is reached, or we exceed `WINDOW_SOFT_CAP`.
     /// `done` is called with the current records and the new entries
     /// pushed in the last batch.
@@ -1778,17 +1773,17 @@ mod tests {
     fn scroll_extends_forward_when_past_window() {
         // Force the initial fetch to be small by using a tiny over-fetch
         // implicitly via small viewport height.  The first ensure_window
-        // fetches BATCH_SIZE records (64), so any modest fixture will
-        // fit; for this test we just verify scroll past the cached set
-        // triggers more fetching.
+        // fetches FETCH_BATCH_SIZE records (64), so any modest fixture
+        // will fit; for this test we just verify scroll past the cached
+        // set triggers more fetching.
         let dir = TestDir::new();
-        let n = (BATCH_SIZE * 2 + 5) as i64;
+        let n = (FETCH_BATCH_SIZE * 2 + 5) as i64;
         let secs: Vec<i64> = (0..n).collect();
         let engine = build_engine(&[("a", &secs)], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 5);
-        // Initial window is BATCH_SIZE records.
+        // Initial window is FETCH_BATCH_SIZE records.
         let initial = view.record_count();
         // Scroll past the initial window.
         for _ in 0..initial + 10 {
