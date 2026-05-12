@@ -653,7 +653,7 @@ fn pop_next<'a>(
 mod tests {
     use super::*;
     use crate::event::Level;
-    use crate::test_util::{
+    use crate::test_fixtures::{
         TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
     use slog::{debug, error, info};

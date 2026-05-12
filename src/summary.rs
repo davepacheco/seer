@@ -633,7 +633,7 @@ fn render_bar(count: u64, max: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{TestDir, append_bunyan, append_bunyan_at};
+    use crate::test_fixtures::{TestDir, append_bunyan, append_bunyan_at};
     use chrono::TimeZone;
     use slog::info;
 

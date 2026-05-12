@@ -796,7 +796,7 @@ fn read_last_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{
+    use crate::test_fixtures::{
         TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
     use slog::{error, info};

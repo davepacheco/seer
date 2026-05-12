@@ -5,6 +5,13 @@ version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
 
+[features]
+# Exposes `seer::test_fixtures` for integration tests and benchmarks that
+# need to generate synthetic log files.  Always available to unit tests
+# via `#[cfg(test)]`; this feature makes the same helpers reachable from
+# code outside the crate's `src/` tree.
+test-fixtures = []
+
 #
 # Tree-wide lint configuration, copied from Omicron.
 # https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-lints-section
@@ -44,6 +51,7 @@ cast_lossless = "warn"
 
 [dependencies]
 camino = { version = "1.2.1", features = ["serde1"] }
+camino-tempfile = "1.4.1"
 chrono = { version = "0.4.42", default-features = false, features = ["serde", "std", "clock"] }
 clap = { version = "4.6.1", features = ["derive"] }
 derive_more = { version = "2.0.1", features = ["as_ref", "display", "from"] }
@@ -59,7 +67,18 @@ thiserror = "2.0.18"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-camino-tempfile = "1.4.1"
+criterion = { version = "0.5", features = ["html_reports"] }
 expectorate = "1.2.0"
 slog = "2.7.0"
 slog-bunyan = "2.5.0"
+
+[[test]]
+name = "scale"
+path = "tests/scale.rs"
+required-features = ["test-fixtures"]
+
+[[bench]]
+name = "engine"
+path = "benches/engine.rs"
+harness = false
+required-features = ["test-fixtures"]

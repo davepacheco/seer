@@ -651,7 +651,7 @@ fn pick(
 mod tests {
     use super::*;
     use crate::source::FileSource;
-    use crate::test_util::{TestDir, append_bunyan_at, append_raw, t};
+    use crate::test_fixtures::{TestDir, append_bunyan_at, append_raw, t};
     use camino::Utf8Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

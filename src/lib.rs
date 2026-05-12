@@ -17,8 +17,8 @@ pub mod stream;
 pub mod streamview;
 pub mod summary;
 
-#[cfg(test)]
-mod test_util;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_fixtures;
 
 pub use engine::{
     Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,

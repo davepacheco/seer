@@ -4,10 +4,10 @@
 
 | Field         | Value                                                |
 |---------------|------------------------------------------------------|
-| Current phase | Phase 0 — not yet started                            |
-| Next step     | Phase 0, step 1 (add `test-fixtures` feature flag)   |
+| Current phase | Phase 3 — blocked on user input                      |
+| Next step     | Phase 3, step 3.1 (needs a CI workflow to wire into) |
 | Last updated  | 2026-05-12                                           |
-| Notes         | —                                                    |
+| Notes         | Phases 0–2 done.  Scale tests use `LARGE_COUNT = 10_000` (5× shrink from the plan's 50K target); trim, refetch, and merge paths are still crossed many times.  Multi-source tests use 10 × 1K.  Benchmarks land at the plan's full sizes (50K single-source, 10×5K multi-source); a `--quick` smoke run shows every bench produces timing data.  Phase 3 paused: this repo has no `.github/workflows/` or other CI config yet, so "add to CI" needs the user to say where (a fresh GitHub Actions workflow, a BuildKite pipeline, or a different host). |
 
 ### How this state works
 
@@ -87,19 +87,19 @@ pub mod test_fixtures;
 
 Targets to land before the next phase:
 
-- [ ] **0.1** Add `[features] test-fixtures = []` to `Cargo.toml`.
-- [ ] **0.2** Create `src/test_fixtures.rs` (file-level emitters,
+- [x] **0.1** Add `[features] test-fixtures = []` to `Cargo.toml`.
+- [x] **0.2** Create `src/test_fixtures.rs` (file-level emitters,
       `TestDir`, `GenOpts`, `gen_single_source`,
       `gen_multi_source`, `gen_with_parse_errors`).  Re-export
       under `#[cfg(any(test, feature = "test-fixtures"))]` in
       `lib.rs`.
-- [ ] **0.3** Move (or re-export) the existing helpers from
+- [x] **0.3** Move (or re-export) the existing helpers from
       `src/test_util.rs` into the new module.  Adjust call sites
       in unit tests so they import from the new path.
-- [ ] **0.4** Verify both flavors compile and pass:
+- [x] **0.4** Verify both flavors compile and pass:
       `cargo check --all-targets` and `cargo check --all-targets
       --features test-fixtures`.
-- [ ] **0.5** Run `cargo nextest run` on the affected packages to
+- [x] **0.5** Run `cargo nextest run` on the affected packages to
       confirm no test regressions from the helper move.
 
 ## Phase 1 — Scale integration tests
@@ -121,12 +121,12 @@ required-features = ["test-fixtures"]
 
 ### Tests to land
 
-- [ ] **1.0** Add the `[[test]] name = "scale"` entry to `Cargo.toml`
+- [x] **1.0** Add the `[[test]] name = "scale"` entry to `Cargo.toml`
       with `required-features = ["test-fixtures"]`, and an empty
       `tests/scale.rs` so the harness wires up before any test
       lands.
 
-- [ ] **1.1** `streamview_forward_scrolls_through_50k_records`
+- [x] **1.1** `streamview_forward_scrolls_through_50k_records`
    - Build a 50K-record source.  Construct a `StreamView` with the
      default filter.  Call `ensure_window`, then `scroll_lines(+500)`
      forty times.  Assert: the anchor advances monotonically, the
@@ -134,38 +134,40 @@ required-features = ["test-fixtures"]
      duplicated relative to a parallel `EventStream` walk of the
      same source.
 
-- [ ] **1.2** `streamview_backward_after_full_forward_replays_in_reverse`
+- [x] **1.2** `streamview_backward_after_full_forward_replays_in_reverse`
    - Walk forward to the end (forces several trims of the backward
      buffer).  Walk backward to byte 0.  Assert the reversed
      backward sequence equals the forward sequence — proves the
      `pop` mirror logic and the EOF-clearing-on-mirror invariant.
 
-- [ ] **1.3** `set_filter_after_full_walk_drops_buffers_and_resets`
+- [x] **1.3** `set_filter_after_full_walk_drops_buffers_and_resets`
    - Walk forward through 10K records.  `view.set_filter(...)` to a
      filter rejecting 99.5% of records.  `ensure_window`.  Assert:
      records.len() reflects the new filter, parse_stats reset,
      anchor is `PinFront`.
 
-- [ ] **1.4** `multi_source_merge_emits_in_time_order_across_ten_sources`
+- [x] **1.4** `multi_source_merge_emits_in_time_order_across_ten_sources`
    - Ten 5K-record sources with overlapping timestamps.  Build an
      `Engine`, run `query_events` to completion.  Assert: events
      emerge in non-decreasing `time` order; no source's records are
      skipped.
 
-- [ ] **1.5** `multi_source_merge_under_selective_filter_walks_each_file`
+- [x] **1.5** `multi_source_merge_under_selective_filter_walks_each_file`
    - Same fixture; filter that accepts ~1 in 200 records.  Assert
      correctness *and* assert each source contributed at least one
      record (proves no source was silently pruned by the
      source-id-filter shortcut when it shouldn't have been).
 
-- [ ] **1.6** `search_step_forward_finds_match_at_record_45000`
+- [x] **1.6** `search_step_forward_finds_match_at_record_45000`
+      (landed as `search_step_forward_finds_match_near_end_with_resume`
+      against `LARGE_COUNT - 1000`)
    - 50K-record source; one record at index 45000 has a unique
      phrase in its msg.  Search step forward.  Assert `Found` and
      anchor lands on that record.  Also assert the budget-exhausted
      resume path runs (the 50K records exceed `SEARCH_BUDGET =
      50_000`).
 
-- [ ] **1.7** `summary_build_via_stepper_matches_eager_summarize`
+- [x] **1.7** `summary_build_via_stepper_matches_eager_summarize`
    - 50K records.  Compute the summary two ways: via
      `summary::summarize(&engine, &filter)` and via a `SummaryOp`
      stepping through manually in chunks.  Assert the two
@@ -173,20 +175,21 @@ required-features = ["test-fixtures"]
      the long-op driver's correctness — currently nothing verifies
      it produces the same answer as the eager path.
 
-- [ ] **1.8** `seek_to_cursor_under_selective_filter_yields_correct_anchor`
+- [x] **1.8** `seek_to_cursor_under_selective_filter_yields_correct_anchor`
    - Anchor a `LogStreamPosition` at index 30000 in a 50K-record
      file.  Apply a filter excluding the bookmarked event itself
      but keeping everything around it.  Call `seek_to_cursor` and
      assert the resulting view's anchor is the next-visible record
      after the bookmark.
 
-- [ ] **1.9** `cancel_seek_midstream_leaves_partial_window_in_consistent_state`
+- [x] **1.9** `cancel_seek_midstream_leaves_partial_window_in_consistent_state`
    - Start a `SeekOp` (or call the streamview-level equivalent),
      advance it a few chunks, then drop it.  Assert: a fresh
      stepper from the streamview's cursor produces a sensible
      forward walk (no record duplicated, no record missed).
 
-- [ ] **1.10** `out_of_order_warning_emitted_once_across_a_50k_pass`
+- [x] **1.10** `out_of_order_warning_emitted_once_across_a_50k_pass`
+      (landed as `out_of_order_warning_emitted_once_across_a_full_pass`)
     - 50K records with one timestamp regression at index 25000.
       Walk the merge.  Assert exactly one `OutOfOrder` warning
       surfaces, at the right location.
@@ -220,41 +223,41 @@ required-features = ["test-fixtures"]
 Each bench builds its fixture once (criterion's `setup` closure) and
 runs the body multiple times.
 
-- [ ] **2.0** Add `criterion` to `dev-dependencies` and create
+- [x] **2.0** Add `criterion` to `dev-dependencies` and create
       `benches/engine.rs` with one minimal benchmark group wired up
       so the harness builds before the real benches land.
-- [ ] **2.1** `source_query_forward_unfiltered` —
+- [x] **2.1** `source_query_forward_unfiltered` —
       `FileSource::query_bounded` over a 50K-record file with
       `Filter::default()`.  Establishes the baseline parse
       throughput.
-- [ ] **2.2** `source_query_forward_selective_1_in_100` — same,
+- [x] **2.2** `source_query_forward_selective_1_in_100` — same,
       with a filter accepting ~1% of records.  Establishes the
       walk-but-skip throughput.
-- [ ] **2.3** `source_query_backward_unfiltered` —
+- [x] **2.3** `source_query_backward_unfiltered` —
       `Direction::Backward`, start at EOF.  Exercises
       `read_record_before`'s chunked back-scan.
-- [ ] **2.4** `stepper_forward_drains_50k_unfiltered` — `Stepper`
+- [x] **2.4** `stepper_forward_drains_50k_unfiltered` — `Stepper`
       built from a single source, repeatedly `step_forward` until
       `None`.  Difference from `source_query_forward` is the merge
       plumbing.
-- [ ] **2.5** `stepper_forward_drains_10x5k_multi_source` — same,
+- [x] **2.5** `stepper_forward_drains_10x5k_multi_source` — same,
       but ten sources.  Establishes the multi-source-merge
       throughput.
-- [ ] **2.6** `stepper_step_forward_then_backward_one_each` —
+- [x] **2.6** `stepper_step_forward_then_backward_one_each` —
       start at byte 0, `step_forward`, then `step_backward`.
       Exercises the buffer mirror without a refill.
       Microbenchmark for the lookbehind cache.
-- [ ] **2.7** `stepper_set_filter_then_step_forward` — full filter
+- [x] **2.7** `stepper_set_filter_then_step_forward` — full filter
       rebuild on a populated stepper, then walk forward.
       Exercises `clear_buffers` plus a fresh fill.
-- [ ] **2.8** `streamview_ensure_window_default_filter` —
+- [x] **2.8** `streamview_ensure_window_default_filter` —
       `StreamView::new` + `ensure_window(viewport=80)`.  The
       operation a fresh tab does on every filter change; matters
       for perceived UI responsiveness.
-- [ ] **2.9** `streamview_scroll_lines_past_window_edge` —
+- [x] **2.9** `streamview_scroll_lines_past_window_edge` —
       `scroll_lines(+200)` against a 1024-record window built from
       a 50K file.  Exercises the slide+trim path.
-- [ ] **2.10** `summarize_50k_unfiltered` — `summary::summarize`
+- [x] **2.10** `summarize_50k_unfiltered` — `summary::summarize`
       over a 50K-record source.  Single number characterizing the
       summary build cost.
 

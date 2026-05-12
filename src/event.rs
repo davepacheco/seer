@@ -280,7 +280,7 @@ pub struct Pid(u32);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{TestDir, append_bunyan};
+    use crate::test_fixtures::{TestDir, append_bunyan};
     use slog::info;
 
     #[test]

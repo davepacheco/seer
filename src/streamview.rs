@@ -1716,7 +1716,7 @@ fn anchor_idx_in(
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::test_util::{TestDir, append_bunyan_at, append_raw, t};
+    use crate::test_fixtures::{TestDir, append_bunyan_at, append_raw, t};
     use camino::Utf8Path;
 
     fn write_fixture(path: &Utf8Path, name: &str, secs: &[i64]) {
