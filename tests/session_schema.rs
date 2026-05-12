@@ -19,8 +19,5 @@ use seer::Session;
 fn session_schema_matches_fixture() {
     let schema = schema_for!(Session);
     let body = serde_json::to_string_pretty(&schema).unwrap() + "\n";
-    expectorate::assert_contents(
-        "tests/fixtures/session.schema.json",
-        &body,
-    );
+    expectorate::assert_contents("tests/fixtures/session.schema.json", &body);
 }

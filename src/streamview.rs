@@ -70,10 +70,7 @@ pub struct RecordKey {
 impl RecordKey {
     /// Builds a [`RecordKey`] from a [`MergeRecord`].
     pub fn from_record(record: &MergeRecord) -> Self {
-        Self {
-            source_id: record.source_id.clone(),
-            offset: record.offset,
-        }
+        Self { source_id: record.source_id.clone(), offset: record.offset }
     }
 }
 
@@ -329,10 +326,7 @@ impl StreamView {
         let mut remaining = flat_line;
         for entry in self.records.iter() {
             if remaining < entry.lines.len() {
-                self.anchor = Anchor::On {
-                    key: entry.key(),
-                    line: remaining,
-                };
+                self.anchor = Anchor::On { key: entry.key(), line: remaining };
                 return;
             }
             remaining -= entry.lines.len();
@@ -392,8 +386,7 @@ impl StreamView {
 
     fn find_record_idx(&self, key: &RecordKey) -> Option<usize> {
         self.records.iter().position(|e| {
-            e.record.source_id == key.source_id
-                && e.record.offset == key.offset
+            e.record.source_id == key.source_id && e.record.offset == key.offset
         })
     }
 
@@ -492,8 +485,7 @@ impl StreamView {
             || opts.show_raw != self.opts.show_raw;
         self.opts = opts;
         self.reformat_window();
-        if line_count_changed
-            && let Anchor::On { line, .. } = &mut self.anchor
+        if line_count_changed && let Anchor::On { line, .. } = &mut self.anchor
         {
             *line = 0;
         }
@@ -511,11 +503,7 @@ impl StreamView {
 
     /// Resets the view to the start of the merged stream and ensures
     /// the window covers `viewport_height + OVER_FETCH_LINES` lines.
-    pub fn seek_to_start(
-        &mut self,
-        engine: &Engine,
-        viewport_height: u16,
-    ) {
+    pub fn seek_to_start(&mut self, engine: &Engine, viewport_height: u16) {
         self.prepare_seek_to_start();
         self.ensure_window(engine, viewport_height);
     }
@@ -700,9 +688,7 @@ impl StreamView {
             }
             Anchor::PinFront => {
                 self.anchor = match self.records.front() {
-                    Some(entry) => {
-                        Anchor::On { key: entry.key(), line: 0 }
-                    }
+                    Some(entry) => Anchor::On { key: entry.key(), line: 0 },
                     None => Anchor::Empty,
                 };
             }
@@ -748,10 +734,9 @@ impl StreamView {
         if self.records.is_empty() {
             match self.anchor {
                 Anchor::PinBack => {
-                    self.extend_backward_until(
-                        engine,
-                        |records, _| total_lines(records) >= target_lines,
-                    );
+                    self.extend_backward_until(engine, |records, _| {
+                        total_lines(records) >= target_lines
+                    });
                     if let Some(entry) = self.records.back() {
                         self.anchor = Anchor::On {
                             key: entry.key(),
@@ -762,15 +747,11 @@ impl StreamView {
                     }
                 }
                 _ => {
-                    self.extend_forward_until(
-                        engine,
-                        |records, _| total_lines(records) >= target_lines,
-                    );
+                    self.extend_forward_until(engine, |records, _| {
+                        total_lines(records) >= target_lines
+                    });
                     if let Some(entry) = self.records.front() {
-                        self.anchor = Anchor::On {
-                            key: entry.key(),
-                            line: 0,
-                        };
+                        self.anchor = Anchor::On { key: entry.key(), line: 0 };
                     } else {
                         self.anchor = Anchor::Empty;
                     }
@@ -1171,13 +1152,9 @@ impl StreamView {
             }
             // Update anchor each iteration so anchor_indices() is
             // consistent for the next refetch's index computation.
-            self.anchor = Anchor::On {
-                key: self.records[idx].key(),
-                line,
-            };
+            self.anchor = Anchor::On { key: self.records[idx].key(), line };
         }
-        self.anchor =
-            Anchor::On { key: self.records[idx].key(), line };
+        self.anchor = Anchor::On { key: self.records[idx].key(), line };
     }
 
     /// Resolves the current anchor to `(record_idx, line)` in the
@@ -1239,24 +1216,17 @@ impl StreamView {
         }
         let (anchor_idx, _) = self.anchor_indices();
         let event_time = |i: usize| -> Option<DateTime<Utc>> {
-            self.records[i]
-                .record
-                .event
-                .as_ref()
-                .ok()
-                .map(|e: &Event| e.time)
+            self.records[i].record.event.as_ref().ok().map(|e: &Event| e.time)
         };
         match dir {
             TimeDir::Forward => (anchor_idx..self.records.len())
                 .find_map(event_time)
                 .or_else(|| (0..anchor_idx).rev().find_map(event_time)),
-            TimeDir::Backward => (0..=anchor_idx)
-                .rev()
-                .find_map(event_time)
-                .or_else(|| {
-                    ((anchor_idx + 1)..self.records.len())
-                        .find_map(event_time)
-                }),
+            TimeDir::Backward => {
+                (0..=anchor_idx).rev().find_map(event_time).or_else(|| {
+                    ((anchor_idx + 1)..self.records.len()).find_map(event_time)
+                })
+            }
         }
     }
 
@@ -1287,10 +1257,7 @@ impl StreamView {
                 let key = self.records[last].key();
                 self.anchor = Anchor::On {
                     key,
-                    line: self.records[last]
-                        .lines
-                        .len()
-                        .saturating_sub(1),
+                    line: self.records[last].lines.len().saturating_sub(1),
                 };
                 return;
             }
@@ -1632,8 +1599,7 @@ impl StreamView {
         let mut idx = self.find_record_idx(current)? as isize;
         let mut target = idx + delta;
         // Extend forward to make `target` representable.
-        while target >= self.records.len() as isize && !self.forward_eof
-        {
+        while target >= self.records.len() as isize && !self.forward_eof {
             self.extend_forward_batch(engine);
             self.trim_front();
             idx = self.find_record_idx(current).map(|i| i as isize)?;
@@ -1902,7 +1868,8 @@ mod tests {
         let (record, raw_lines) = view.records().next().unwrap();
         assert_eq!(raw_lines.len(), 1, "raw mode is one line per record");
         assert!(
-            raw_lines[0].starts_with('{') && raw_lines[0].contains(r#""msg":"m10""#),
+            raw_lines[0].starts_with('{')
+                && raw_lines[0].contains(r#""msg":"m10""#),
             "expected raw JSON line, got {:?}",
             raw_lines[0],
         );
@@ -1929,8 +1896,11 @@ mod tests {
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
-        let dated_first =
-            view.records().next().map(|(_, lines)| lines[0].to_string()).unwrap();
+        let dated_first = view
+            .records()
+            .next()
+            .map(|(_, lines)| lines[0].to_string())
+            .unwrap();
         assert!(
             dated_first.starts_with("1970-01-01T00:00:10.000Z "),
             "expected dated header, got {dated_first:?}",
@@ -1940,8 +1910,11 @@ mod tests {
         o.show_date = false;
         view.set_render_opts(o);
         assert!(!view.render_opts().show_date);
-        let undated_first =
-            view.records().next().map(|(_, lines)| lines[0].to_string()).unwrap();
+        let undated_first = view
+            .records()
+            .next()
+            .map(|(_, lines)| lines[0].to_string())
+            .unwrap();
         assert!(
             undated_first.starts_with("00:00:10.000Z "),
             "expected time-only header after toggle, got {undated_first:?}",
@@ -2198,8 +2171,7 @@ mod tests {
         // Five records; the match is the last.  A budget of 2 forces
         // BudgetExhausted on the first call (records 0 and 1 scanned)
         // and Found on the second.
-        let engine =
-            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
@@ -2235,8 +2207,7 @@ mod tests {
     #[test]
     fn search_step_resume_invalidated_by_anchor_move() {
         let dir = TestDir::new();
-        let engine =
-            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
@@ -2274,8 +2245,7 @@ mod tests {
     #[test]
     fn search_step_resume_invalidated_by_pattern_change() {
         let dir = TestDir::new();
-        let engine =
-            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
@@ -2316,8 +2286,7 @@ mod tests {
         // same regex/dir/budget and a too-tight budget should now hit
         // a fresh BudgetExhausted relative to the new anchor.
         let dir = TestDir::new();
-        let engine =
-            build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
+        let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
@@ -2487,14 +2456,12 @@ mod tests {
         view.ensure_window(&engine, 20);
         // First record's cursor is `front_cursor` itself.
         let c0 = view.cursor_before_record(0).unwrap();
-        let mut v0 =
-            StreamView::new(Filter::default(), RenderOpts::default());
+        let mut v0 = StreamView::new(Filter::default(), RenderOpts::default());
         v0.seek_to_cursor(&engine, c0, 20);
         assert_eq!(anchor_msg(&v0).as_deref(), Some("m10"));
         // A middle record: walks past two preceding entries.
         let c2 = view.cursor_before_record(2).unwrap();
-        let mut v2 =
-            StreamView::new(Filter::default(), RenderOpts::default());
+        let mut v2 = StreamView::new(Filter::default(), RenderOpts::default());
         v2.seek_to_cursor(&engine, c2, 20);
         assert_eq!(anchor_msg(&v2).as_deref(), Some("m30"));
         // Past the end is a clean None.
@@ -2509,10 +2476,8 @@ mod tests {
         // otherwise a forward step from the cursor would re-emit A's
         // earlier records.
         let dir = TestDir::new();
-        let engine = build_engine(
-            &[("a", &[10, 30, 50]), ("b", &[20, 40, 60])],
-            &dir,
-        );
+        let engine =
+            build_engine(&[("a", &[10, 30, 50]), ("b", &[20, 40, 60])], &dir);
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);

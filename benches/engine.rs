@@ -144,8 +144,7 @@ fn bench_stepper_forward_drains(c: &mut Criterion) {
     let filter = Filter::default();
     c.bench_function("stepper_forward_drains_50k_unfiltered", |b| {
         b.iter(|| {
-            let mut stepper =
-                engine.stepper(filter.clone(), &Cursor::new());
+            let mut stepper = engine.stepper(filter.clone(), &Cursor::new());
             while let Some(rec) = stepper.step_forward() {
                 black_box(rec);
             }
@@ -158,8 +157,7 @@ fn bench_stepper_forward_multi_source(c: &mut Criterion) {
     let filter = Filter::default();
     c.bench_function("stepper_forward_drains_10x5k_multi_source", |b| {
         b.iter(|| {
-            let mut stepper =
-                engine.stepper(filter.clone(), &Cursor::new());
+            let mut stepper = engine.stepper(filter.clone(), &Cursor::new());
             while let Some(rec) = stepper.step_forward() {
                 black_box(rec);
             }
@@ -259,10 +257,8 @@ fn bench_streamview_scroll_past_edge(c: &mut Criterion) {
     c.bench_function("streamview_scroll_lines_past_window_edge", |b| {
         b.iter_batched(
             || {
-                let mut view = StreamView::new(
-                    Filter::default(),
-                    RenderOpts::default(),
-                );
+                let mut view =
+                    StreamView::new(Filter::default(), RenderOpts::default());
                 view.ensure_window(&engine, 80);
                 view
             },

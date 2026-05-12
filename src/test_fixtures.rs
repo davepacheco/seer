@@ -244,8 +244,7 @@ pub fn gen_single_source(
             "msg": msg,
         });
         if opts.extras_every > 0 && i % opts.extras_every == 0 {
-            let obj =
-                record.as_object_mut().expect("record is a JSON object");
+            let obj = record.as_object_mut().expect("record is a JSON object");
             obj.insert(
                 "req_id".to_string(),
                 serde_json::Value::String(format!("req-{i}")),
@@ -282,8 +281,8 @@ pub fn gen_multi_source(
     let mut paths = Vec::with_capacity(source_names.len());
     for (idx, name) in source_names.iter().enumerate() {
         let path = dir.join(format!("{name}.log"));
-        let idx_i32 = i32::try_from(idx)
-            .expect("source index fits in i32 for fixtures");
+        let idx_i32 =
+            i32::try_from(idx).expect("source index fits in i32 for fixtures");
         let opts = GenOpts {
             base_time: base.base_time + stagger * idx_i32,
             ..base.clone()

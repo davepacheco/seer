@@ -487,10 +487,7 @@ pub fn build_seeit_command(
             )
         }
         Selector::Tab(name) => {
-            format!(
-                "seeit --session {session_id} --tab {}",
-                shell_quote(name),
-            )
+            format!("seeit --session {session_id} --tab {}", shell_quote(name),)
         }
         Selector::Bookmark(needle) => {
             format!(
@@ -586,8 +583,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let session = fixture_session(dir.path());
 
-        let t =
-            resolve_in_session(&session, &Selector::WholeSession).unwrap();
+        let t = resolve_in_session(&session, &Selector::WholeSession).unwrap();
         assert_eq!(t.sources.len(), 2);
         assert_eq!(t.mode, ResolvedMode::Records);
         assert_eq!(t.cursor, Cursor::default());
@@ -700,11 +696,9 @@ mod tests {
     fn unknown_stream_errors() {
         let dir = tempdir().unwrap();
         let session = fixture_session(dir.path());
-        let err = resolve_in_session(
-            &session,
-            &Selector::Stream("nope".to_string()),
-        )
-        .unwrap_err();
+        let err =
+            resolve_in_session(&session, &Selector::Stream("nope".to_string()))
+                .unwrap_err();
         match err {
             ResolveError::UnknownStream { name, .. } => {
                 assert_eq!(name, "nope");
@@ -738,11 +732,9 @@ mod tests {
     fn unknown_tab_errors() {
         let dir = tempdir().unwrap();
         let session = fixture_session(dir.path());
-        let err = resolve_in_session(
-            &session,
-            &Selector::Tab("Nope".to_string()),
-        )
-        .unwrap_err();
+        let err =
+            resolve_in_session(&session, &Selector::Tab("Nope".to_string()))
+                .unwrap_err();
         assert!(matches!(err, ResolveError::UnknownTab { .. }));
     }
 
@@ -768,11 +760,9 @@ mod tests {
             bookmark_at(Some("x"), dir.path().join("a.log").as_str()),
         );
 
-        let err = resolve_in_session(
-            &session,
-            &Selector::Bookmark(String::new()),
-        )
-        .unwrap_err();
+        let err =
+            resolve_in_session(&session, &Selector::Bookmark(String::new()))
+                .unwrap_err();
         assert!(matches!(err, ResolveError::UnknownBookmark { .. }));
     }
 
@@ -901,8 +891,7 @@ mod tests {
         let id = session.id;
         store.save(id, &session).unwrap();
 
-        let t =
-            resolve(&store, id, &Selector::WholeSession).unwrap();
+        let t = resolve(&store, id, &Selector::WholeSession).unwrap();
         assert_eq!(t.sources.len(), 2);
     }
 }

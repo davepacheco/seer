@@ -138,9 +138,7 @@ impl schemars::JsonSchema for SessionId {
         _: &mut schemars::r#gen::SchemaGenerator,
     ) -> schemars::schema::Schema {
         schemars::schema::SchemaObject {
-            instance_type: Some(
-                schemars::schema::InstanceType::String.into(),
-            ),
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
             string: Some(Box::new(schemars::schema::StringValidation {
                 pattern: Some(r"^[0-9a-f]{8}$".to_owned()),
                 min_length: Some(8),
@@ -271,10 +269,8 @@ impl SessionStore {
     /// Loads the session with the given id.
     pub fn load(&self, id: SessionId) -> Result<Session, StoreError> {
         let path = self.path_for(id);
-        let bytes = fs::read(&path).map_err(|source| StoreError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let bytes = fs::read(&path)
+            .map_err(|source| StoreError::Io { path: path.clone(), source })?;
         serde_json::from_slice(&bytes)
             .map_err(|source| StoreError::Parse { path, source })
     }
@@ -301,10 +297,8 @@ impl SessionStore {
             path: tmp_path.clone(),
             source,
         })?;
-        fs::rename(&tmp_path, &final_path).map_err(|source| StoreError::Io {
-            path: final_path,
-            source,
-        })?;
+        fs::rename(&tmp_path, &final_path)
+            .map_err(|source| StoreError::Io { path: final_path, source })?;
         Ok(())
     }
 
@@ -590,9 +584,7 @@ mod tests {
         let id: SessionId = "12345678".parse().unwrap();
         store.save(id, &Session::new()).unwrap();
 
-        let tmp_path = store
-            .sessions_dir()
-            .join(format!("{id}.json.tmp"));
+        let tmp_path = store.sessions_dir().join(format!("{id}.json.tmp"));
         std::fs::write(&tmp_path, "{ not valid").unwrap();
 
         // load() reads the real file, not the tmp.
@@ -613,16 +605,10 @@ mod tests {
         store.save(b, &Session::new()).unwrap();
 
         // Drop unrelated junk into the directory.
-        std::fs::write(
-            store.sessions_dir().join("not-a-session.txt"),
-            "hi",
-        )
-        .unwrap();
-        std::fs::write(
-            store.sessions_dir().join("badname.json"),
-            "{}",
-        )
-        .unwrap();
+        std::fs::write(store.sessions_dir().join("not-a-session.txt"), "hi")
+            .unwrap();
+        std::fs::write(store.sessions_dir().join("badname.json"), "{}")
+            .unwrap();
 
         let mut ids = store.list().unwrap();
         ids.sort();
@@ -773,9 +759,8 @@ mod tests {
         let overlap = save_with_sources(&store, &["/log/a", "/log/c"], 400);
         let _disjoint = save_with_sources(&store, &["/log/d"], 600);
 
-        let matches = store
-            .find_matches(&user_paths(&["/log/a", "/log/x"]))
-            .unwrap();
+        let matches =
+            store.find_matches(&user_paths(&["/log/a", "/log/x"])).unwrap();
         let got: Vec<(MatchKind, SessionId)> =
             matches.iter().map(|m| (m.kind, m.session.id)).collect();
         assert_eq!(

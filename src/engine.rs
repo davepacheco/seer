@@ -254,10 +254,7 @@ impl Engine {
     /// source file rather than being slotted by time.  The filter only
     /// applies to `Ok` items, so errors and warnings are always
     /// surfaced regardless of the filter.
-    pub fn query_events<'a>(
-        &'a self,
-        filter: &'a Filter,
-    ) -> EventStream<'a> {
+    pub fn query_events<'a>(&'a self, filter: &'a Filter) -> EventStream<'a> {
         let cursors = self
             .sources
             .iter()
@@ -679,8 +676,7 @@ mod tests {
         // from the denominator; a real progress bar driven by this
         // value would track only the sources that will actually be
         // scanned.
-        let path_filter: Filter =
-            "source_id!~b\\.log".parse().unwrap();
+        let path_filter: Filter = "source_id!~b\\.log".parse().unwrap();
         assert_eq!(engine.filtered_total_bytes(&path_filter), a_size);
 
         dir.cleanup();
@@ -1326,16 +1322,10 @@ mod tests {
         let cursor = engine.cursor_for_position(&pos_b).unwrap();
         let mut stepper = engine.stepper(Filter::default(), &cursor);
         // Forward: b (the anchored same-time second event).
-        assert_eq!(
-            stepper.step_forward().unwrap().event.unwrap().msg,
-            "b",
-        );
+        assert_eq!(stepper.step_forward().unwrap().event.unwrap().msg, "b",);
         let mut stepper = engine.stepper(Filter::default(), &cursor);
         // Backward: a (the same-time first event preceding b).
-        assert_eq!(
-            stepper.step_backward().unwrap().event.unwrap().msg,
-            "a",
-        );
+        assert_eq!(stepper.step_backward().unwrap().event.unwrap().msg, "a",);
         dir.cleanup();
     }
 

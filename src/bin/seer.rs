@@ -265,12 +265,8 @@ fn render_startup_dialog(frame: &mut Frame, dialog: &StartupDialog) {
     // Centered popup sized to fit the rows (plus borders and a
     // small horizontal margin).  Capped at the terminal size.
     let content_h = (rows.len() as u16) + 2; // + 2 for borders
-    let content_w = rows
-        .iter()
-        .map(|line| line.width() as u16)
-        .max()
-        .unwrap_or(40)
-        + 4; // + 4 for borders + margin
+    let content_w =
+        rows.iter().map(|line| line.width() as u16).max().unwrap_or(40) + 4; // + 4 for borders + margin
     let h = content_h.min(area.height);
     let w = content_w.min(area.width);
     let popup = Rect {
@@ -297,9 +293,7 @@ fn highlight_if_selected(text: String, selected: bool) -> Line<'static> {
     let line = Line::from(text);
     if selected {
         line.style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
         )
     } else {
         line
@@ -342,9 +336,7 @@ fn run_startup_dialog(
 /// error is silently dropped here for the same reason `find_matches`
 /// drops them: an unloadable session is not usefully listable
 /// either, and the file stays on disk for a human to investigate.
-fn load_all_sessions(
-    store: &SessionStore,
-) -> Result<Vec<Session>, StoreError> {
+fn load_all_sessions(store: &SessionStore) -> Result<Vec<Session>, StoreError> {
     let ids = store.list()?;
     let mut sessions = Vec::with_capacity(ids.len());
     for id in ids {
@@ -386,11 +378,8 @@ fn format_session_list(sessions: &[Session]) -> String {
         "ID        LAST SAVED (UTC)     STREAMS  SOURCES  FIRST SOURCE\n",
     );
     for s in sessions {
-        let first_source = s
-            .sources
-            .first()
-            .map(|src| src.path.as_str())
-            .unwrap_or("(none)");
+        let first_source =
+            s.sources.first().map(|src| src.path.as_str()).unwrap_or("(none)");
         let truncated = truncate_path_head(first_source, 60);
         out.push_str(&format!(
             "{}  {}  {:>7}  {:>7}  {}\n",
@@ -545,11 +534,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `required = true`; surface a friendly message rather than the
     // raw clap "missing argument" usage error.
     if args.files.is_empty() {
-        return Err(
-            "no files provided; use --list to see saved sessions or \
+        return Err("no files provided; use --list to see saved sessions or \
              --resume <id> to reopen one"
-                .into(),
-        );
+            .into());
     }
 
     // Register every CLI-supplied file with the engine and capture
@@ -812,10 +799,8 @@ fn materialize_streamview(view: &StreamView) -> RenderedRows {
                     formatted.push(line.clone());
                     event_for_line.push(event_idx);
                 }
-                events.push(Some(EngineEvent {
-                    position,
-                    event: event.clone(),
-                }));
+                events
+                    .push(Some(EngineEvent { position, event: event.clone() }));
             }
             Err(err) => {
                 formatted.push(err.to_string());
@@ -1477,12 +1462,8 @@ impl Tab {
     ) -> Self {
         let (streamview, rendered) = match kind {
             TabKind::Stream => {
-                let (view, rows) = render_rows(
-                    engine,
-                    filter,
-                    opts,
-                    INITIAL_VIEWPORT_HEIGHT,
-                );
+                let (view, rows) =
+                    render_rows(engine, filter, opts, INITIAL_VIEWPORT_HEIGHT);
                 (Some(view), rows)
             }
             // Summary tabs defer their build to a [`LongOp`] driven
@@ -1558,11 +1539,8 @@ impl Tab {
         // matching record (or its visible neighbor) when seeking to
         // `anchor`.  Read its flat-line index so the backward-fallback
         // case (anchor on `records.back()`) doesn't get pinned to 0.
-        self.viewport_top = self
-            .streamview
-            .as_ref()
-            .map(|v| v.anchor_flat_line())
-            .unwrap_or(0);
+        self.viewport_top =
+            self.streamview.as_ref().map(|v| v.anchor_flat_line()).unwrap_or(0);
         self.search = None;
         self.select = None;
     }
@@ -1575,12 +1553,7 @@ impl Tab {
     /// cleared because match indices are line-indexed and lines may have
     /// moved (when `show_extras` toggled); selection is preserved
     /// because it sits on a record index, which is still valid.
-    fn rerender(
-        &mut self,
-        engine: &Engine,
-        filter: &Filter,
-        opts: RenderOpts,
-    ) {
+    fn rerender(&mut self, engine: &Engine, filter: &Filter, opts: RenderOpts) {
         // Summary tabs don't honor RenderOpts — their histogram is
         // built from raw event counts, not from the per-record render
         // path — so a `rerender` triggered by `F`/`D`/field-display
@@ -2442,8 +2415,7 @@ impl App {
                         // search-to-end of a large file.
                     }
                     SearchOutcome::Cancelled => {
-                        self.notice =
-                            Some("search cancelled".to_string());
+                        self.notice = Some("search cancelled".to_string());
                     }
                     SearchOutcome::BudgetExhausted => {
                         // Budget exhaustion isn't a terminal outcome
@@ -2535,8 +2507,7 @@ impl App {
                 let tab_idx = s.tab_idx;
                 if let Some(tab) = self.tabs.get_mut(tab_idx) {
                     tab.formatted = vec![
-                        "summary cancelled — rerun with `f<enter>`"
-                            .to_string(),
+                        "summary cancelled — rerun with `f<enter>`".to_string(),
                     ];
                     tab.parse_stats = ParseStats::default();
                 }
@@ -2624,8 +2595,7 @@ impl App {
         // the simple synchronous max_top clamp.  The long-op chunking
         // only helps the engine-backed path.
         let Some(view) = self.tabs[active].streamview.as_mut() else {
-            self.tabs[active].viewport_top =
-                self.tabs[active].max_top(h, w);
+            self.tabs[active].viewport_top = self.tabs[active].max_top(h, w);
             return;
         };
         if let Err(e) = view.prepare_seek_to_end(&self.engine) {
@@ -2635,8 +2605,7 @@ impl App {
         let stats = view.parse_stats();
         let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
-        let total_bytes =
-            self.engine.filtered_total_bytes(view.filter());
+        let total_bytes = self.engine.filtered_total_bytes(view.filter());
         // Clear the prior tab content so the user sees an empty view
         // with a progress bar (rather than the stale records they
         // were looking at before `G`).
@@ -2670,8 +2639,7 @@ impl App {
         let stats = view.parse_stats();
         let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
-        let total_bytes =
-            self.engine.filtered_total_bytes(view.filter());
+        let total_bytes = self.engine.filtered_total_bytes(view.filter());
         self.tabs[active].resync_from_streamview(h, w);
         if self.long_op.is_some() {
             self.cancel_long_op();
@@ -2702,8 +2670,7 @@ impl App {
         let stats = view.parse_stats();
         let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
-        let total_bytes =
-            self.engine.filtered_total_bytes(view.filter());
+        let total_bytes = self.engine.filtered_total_bytes(view.filter());
         self.tabs[active].resync_from_streamview(h, w);
         if self.long_op.is_some() {
             self.cancel_long_op();
@@ -3207,11 +3174,8 @@ impl App {
     ) {
         let active = self.active;
         let matches = self.tabs[active].match_indices(&regex);
-        self.tabs[active].search = Some(TabSearch {
-            pattern: pattern.clone(),
-            regex,
-            matches,
-        });
+        self.tabs[active].search =
+            Some(TabSearch { pattern: pattern.clone(), regex, matches });
         self.last_search = Some(LastSearch { pattern, direction });
         self.jump_to_match(direction, /* exclusive = */ false);
     }
@@ -4951,9 +4915,8 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Re-clamp in case the viewport just shrank past the previous top.
-    let max_top = app
-        .active_tab()
-        .max_top(app.viewport_height, app.viewport_width);
+    let max_top =
+        app.active_tab().max_top(app.viewport_height, app.viewport_width);
     if app.active_tab().viewport_top > max_top {
         app.active_tab_mut().viewport_top = max_top;
     }
@@ -4970,8 +4933,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     let mut bottom = top;
     let mut visual_used: usize = 0;
     while bottom < total && visual_used < max_visual {
-        let rows =
-            visual_rows_for(&tab.formatted[bottom], content_area.width);
+        let rows = visual_rows_for(&tab.formatted[bottom], content_area.width);
         visual_used = visual_used.saturating_add(rows);
         bottom += 1;
     }
@@ -5367,11 +5329,9 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let [edit_area, error_area] = Layout::vertical([
-        Constraint::Length(edit_rows),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
+    let [edit_area, error_area] =
+        Layout::vertical([Constraint::Length(edit_rows), Constraint::Min(0)])
+            .areas(inner);
 
     if let Some(editor) = dialog.editor() {
         // Split the text into chunks of `inner_width` columns so the
@@ -5402,9 +5362,7 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
             .y
             .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX))
             .min(
-                edit_area
-                    .y
-                    .saturating_add(edit_area.height.saturating_sub(1)),
+                edit_area.y.saturating_add(edit_area.height.saturating_sub(1)),
             );
         let col = edit_area
             .x
@@ -5863,8 +5821,7 @@ mod tests {
         // bottom of the viewport is far from the last row.
         let backend = TestBackend::new(200, 5);
         let mut terminal = Terminal::new(backend).unwrap();
-        let rows: Vec<String> =
-            (0..6).map(|i| format!("row {i}")).collect();
+        let rows: Vec<String> = (0..6).map(|i| format!("row {i}")).collect();
         let mut a = App::with_rows(rows);
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
@@ -5881,8 +5838,7 @@ mod tests {
     fn render_eof_indicator_toggles_with_scroll() {
         let backend = TestBackend::new(300, 5);
         let mut terminal = Terminal::new(backend).unwrap();
-        let rows: Vec<String> =
-            (0..6).map(|i| format!("row {i}")).collect();
+        let rows: Vec<String> = (0..6).map(|i| format!("row {i}")).collect();
         let mut a = App::with_rows(rows);
         a.viewport_height = 2;
 
@@ -6273,10 +6229,7 @@ mod tests {
         );
         // pid and extras default off; name defaults on.
         assert!(dump.contains("[ ] pid"), "expected pid unchecked:\n{dump}");
-        assert!(
-            dump.contains("[x] name"),
-            "expected name checked:\n{dump}",
-        );
+        assert!(dump.contains("[x] name"), "expected name checked:\n{dump}",);
         assert!(
             dump.contains("[ ] show all other fields"),
             "expected extras unchecked:\n{dump}",
@@ -6503,8 +6456,7 @@ mod tests {
         // at a narrow viewport and asserting that the visual rows
         // are exactly the next N chars of the source, including
         // spaces that would otherwise have been the wrap point.
-        let (mut a, _dir) =
-            multi_line_app(&[(10, "first message", &[])]);
+        let (mut a, _dir) = multi_line_app(&[(10, "first message", &[])]);
         a.toggle_show_raw();
         // Wide enough to fit the JSON in a few rows of column wrap;
         // narrow enough that any whitespace inside it would be a
@@ -6533,16 +6485,10 @@ mod tests {
     #[test]
     fn column_chunks_handles_empty_and_unicode() {
         assert_eq!(column_chunks("", 4), vec![""]);
-        assert_eq!(
-            column_chunks("abcdefghij", 4),
-            vec!["abcd", "efgh", "ij"],
-        );
+        assert_eq!(column_chunks("abcdefghij", 4), vec!["abcd", "efgh", "ij"],);
         // Greek letters are 2 bytes each in UTF-8.  Char-based
         // counting must produce 4-char chunks regardless.
-        assert_eq!(
-            column_chunks("αβγδεζηθικ", 4),
-            vec!["αβγδ", "εζηθ", "ικ"],
-        );
+        assert_eq!(column_chunks("αβγδεζηθικ", 4), vec!["αβγδ", "εζηθ", "ικ"],);
         // Width 0 is degenerate; return the whole line so we don't
         // loop forever or divide by zero.
         assert_eq!(column_chunks("abc", 0), vec!["abc"]);
@@ -6829,7 +6775,8 @@ mod tests {
         // walk many on-disk records to find the last viewport_height
         // matching ones.  Without the long-op the keypress would
         // block the event loop until the synchronous walk completed.
-        let msgs: Vec<String> = (0..50).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..50).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -6855,7 +6802,8 @@ mod tests {
 
     #[test]
     fn g_installs_seek_long_op() {
-        let msgs: Vec<String> = (0..50).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..50).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -6885,7 +6833,8 @@ mod tests {
         // Filter changes on the active tab also defer the streamview
         // rebuild to a long op so the user sees a progress bar
         // instead of a freeze on selective filters.
-        let msgs: Vec<String> = (0..50).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..50).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -6970,10 +6919,7 @@ mod tests {
         // advance_long_op tick should *not* finish the op (it yields
         // after one frame's worth of work).
         let done = a.advance_long_op();
-        assert!(
-            !done,
-            "first long-op tick should yield rather than finish",
-        );
+        assert!(!done, "first long-op tick should yield rather than finish",);
         assert!(matches!(a.long_op, Some(LongOp::Seek(_))));
         // Drain the rest and confirm the op eventually completes.
         a.drain_long_op();
@@ -6986,7 +6932,8 @@ mod tests {
         // records fetched so far should be visible, with a notice
         // telling the user the op stopped early.  We can simulate
         // this by installing a seek and cancelling before drain.
-        let msgs: Vec<String> = (0..50).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..50).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -6998,9 +6945,7 @@ mod tests {
         a.cancel_long_op();
         assert!(a.long_op.is_none());
         assert!(
-            a.notice
-                .as_deref()
-                .is_some_and(|n| n.contains("cancelled")),
+            a.notice.as_deref().is_some_and(|n| n.contains("cancelled")),
             "expected a cancellation notice, got {:?}",
             a.notice,
         );
@@ -7018,7 +6963,8 @@ mod tests {
         // ~viewport_height presses).  Fix: when the anchor lands past
         // `max_top`, sync it back so the next `k` moves the visible
         // viewport on the first keystroke.
-        let msgs: Vec<String> = (0..300).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..300).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -7050,7 +6996,8 @@ mod tests {
         // `viewport_top` so the visible content doesn't move.  Verify
         // by searching to a record near the back of the initial fetch
         // and confirming j-keystrokes actually shift `viewport_top`.
-        let msgs: Vec<String> = (0..300).map(|i| format!("payload-m{i}")).collect();
+        let msgs: Vec<String> =
+            (0..300).map(|i| format!("payload-m{i}")).collect();
         let records: Vec<(i64, &str)> = msgs
             .iter()
             .enumerate()
@@ -7773,10 +7720,8 @@ mod tests {
 
     #[test]
     fn long_op_summary_cancel_leaves_placeholder_and_clears_queue() {
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "first", &[]),
-            (20, "second", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         assert!(matches!(a.long_op, Some(LongOp::BuildSummary(_))));
         a.cancel_long_op();
@@ -7794,10 +7739,8 @@ mod tests {
         // A second build for the same tab while the first is still
         // pending should drop the older request — only the newest
         // filter is honored.
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "alpha", &[]),
-            (20, "beta", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "alpha", &[]), (20, "beta", &[])]);
         a.handle_key(shift('S'));
         // Force a pending state by stalling the active op without
         // finishing it: spin a no-op LongOp::Search would be wrong;
@@ -7805,10 +7748,8 @@ mod tests {
         // current one is still in flight.  enqueue_summary_build
         // de-dupes pending entries for the same tab.
         let active_tab = a.active;
-        a.pending_summary_builds.push_back((
-            active_tab,
-            "msg=alpha".parse().unwrap(),
-        ));
+        a.pending_summary_builds
+            .push_back((active_tab, "msg=alpha".parse().unwrap()));
         a.enqueue_summary_build(active_tab, "msg=beta".parse().unwrap());
         assert_eq!(a.pending_summary_builds.len(), 1);
         let (_, last) = a.pending_summary_builds.front().unwrap();
@@ -7820,10 +7761,8 @@ mod tests {
         // Pressing `S` installs a placeholder + long op; the very
         // next frame should show the progress bar in place of the
         // parse-stats row.
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "first", &[]),
-            (20, "second", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         let backend = TestBackend::new(120, 6);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8398,10 +8337,7 @@ mod tests {
         // materialized view.
         assert_eq!(a.active_tab().viewport_top, 0);
         let line0 = &a.active_tab().formatted[0];
-        assert!(
-            line0.contains("third"),
-            "first formatted line was {line0:?}"
-        );
+        assert!(line0.contains("third"), "first formatted line was {line0:?}");
         // No filter mismatch, so no notice.
         assert!(a.notice.is_none());
     }
@@ -9209,10 +9145,8 @@ mod tests {
         // without prompting for a filter — the new tab inherits the
         // active tab's filter and the user adjusts it afterwards via
         // `f` if they want to.
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "first", &[]),
-            (20, "second", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         let initial_tabs = a.tabs.len();
         a.handle_key(shift('S'));
         assert_eq!(a.tabs.len(), initial_tabs + 1);
@@ -9227,10 +9161,8 @@ mod tests {
         // Summary tab should pick that up rather than default.  We
         // verify by making the filter accept zero events and then
         // observing that the summary reports zero events.
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "alpha", &[]),
-            (20, "beta", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "alpha", &[]), (20, "beta", &[])]);
         let f: Filter = "msg=alpha".parse().unwrap();
         a.apply_filter(f.clone());
         a.handle_key(shift('S'));
@@ -9295,10 +9227,8 @@ mod tests {
         // After landing on a Summary tab, the user can open the
         // filter dialog with `f` and apply a narrower filter; the
         // histogram should re-render against the new filter.
-        let (mut a, _dir) = multi_line_app(&[
-            (10, "first", &[]),
-            (20, "second", &[]),
-        ]);
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         a.drain_long_op();
         // Open the filter dialog with `f`, type a narrowing filter,
@@ -9375,9 +9305,11 @@ mod tests {
         std::fs::write(&b_path, b"").unwrap();
 
         let mut engine = Engine::new();
-        let sources =
-            build_session_sources(&[a_path.clone(), b_path.clone()], &mut engine)
-                .unwrap();
+        let sources = build_session_sources(
+            &[a_path.clone(), b_path.clone()],
+            &mut engine,
+        )
+        .unwrap();
 
         assert_eq!(sources.len(), 2);
         // Order is preserved.
@@ -9398,8 +9330,7 @@ mod tests {
         use camino_tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let store =
-            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let session_id = Session::new().id;
 
         let mut a = App::new(Engine::new());
@@ -9439,8 +9370,7 @@ mod tests {
     /// alive for the duration of the test.
     fn app_with_store_and_one_tab() -> (App, camino_tempfile::Utf8TempDir) {
         let dir = camino_tempfile::tempdir().unwrap();
-        let store =
-            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let mut a = App::new(Engine::new());
         a.store = Some(store);
         // The default `App::new` already pushed a tab; that push
@@ -9643,29 +9573,20 @@ mod tests {
         let stream = reloaded.streams.get(&stream_id).unwrap();
         // Filter doesn't implement Eq, so compare its display form —
         // round-trip via serde is the contract that matters anyway.
-        assert_eq!(
-            format!("{:?}", stream.filter),
-            format!("{new_filter:?}"),
-        );
+        assert_eq!(format!("{:?}", stream.filter), format!("{new_filter:?}"),);
     }
 
     #[test]
     fn toggle_show_extras_persists_inline() {
         let (mut a, _dir) = app_with_store_and_one_tab();
         let stream_id = a.tabs[a.active].stream;
-        let before = reload_session(&a)
-            .streams
-            .get(&stream_id)
-            .unwrap()
-            .show_extras;
+        let before =
+            reload_session(&a).streams.get(&stream_id).unwrap().show_extras;
 
         a.toggle_show_extras();
         assert!(!a.policy.dirty());
-        let after = reload_session(&a)
-            .streams
-            .get(&stream_id)
-            .unwrap()
-            .show_extras;
+        let after =
+            reload_session(&a).streams.get(&stream_id).unwrap().show_extras;
         assert_eq!(after, !before);
     }
 
@@ -9751,13 +9672,17 @@ mod tests {
         let mut s = Session::new();
         s.sources = vec![
             SessionSource {
-                id: SourceId::from(a.canonicalize_utf8().unwrap().as_str().to_string()),
+                id: SourceId::from(
+                    a.canonicalize_utf8().unwrap().as_str().to_string(),
+                ),
                 path: a.canonicalize_utf8().unwrap(),
                 mtime: chrono::Utc::now(),
                 size: 3,
             },
             SessionSource {
-                id: SourceId::from(b.canonicalize_utf8().unwrap().as_str().to_string()),
+                id: SourceId::from(
+                    b.canonicalize_utf8().unwrap().as_str().to_string(),
+                ),
                 path: b.canonicalize_utf8().unwrap(),
                 mtime: chrono::Utc::now(),
                 size: 0,
@@ -9771,19 +9696,15 @@ mod tests {
     #[test]
     fn load_all_sessions_sorts_newest_first_and_skips_corrupt() {
         let dir = camino_tempfile::tempdir().unwrap();
-        let store =
-            SessionStore::open_at(dir.path().join("sessions")).unwrap();
+        let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
 
         // Save three sessions with explicit timestamps.
         let make = |secs: i64| {
             let mut s = Session::new();
-            s.last_saved_at = chrono::TimeZone::timestamp_opt(
-                &chrono::Utc,
-                secs,
-                0,
-            )
-            .single()
-            .unwrap();
+            s.last_saved_at =
+                chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, 0)
+                    .single()
+                    .unwrap();
             s
         };
         let old = make(100);
@@ -9962,18 +9883,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let dialog = StartupDialog::new(Vec::new());
-        terminal
-            .draw(|frame| render_startup_dialog(frame, &dialog))
-            .unwrap();
+        terminal.draw(|frame| render_startup_dialog(frame, &dialog)).unwrap();
 
         let dialog = StartupDialog::new(vec![
             fake_match(MatchKind::Exact),
             fake_match(MatchKind::Superset),
             fake_match(MatchKind::Overlap),
         ]);
-        terminal
-            .draw(|frame| render_startup_dialog(frame, &dialog))
-            .unwrap();
+        terminal.draw(|frame| render_startup_dialog(frame, &dialog)).unwrap();
     }
 
     // ---------- debounced persistence (phase 7) ----------
@@ -9992,10 +9909,7 @@ mod tests {
         // The initial setup flushed the dirty bit.
         assert!(!a.policy.dirty());
         a.handle_key(key(KeyCode::Char('j')));
-        assert!(
-            a.policy.dirty(),
-            "j should have marked the policy dirty"
-        );
+        assert!(a.policy.dirty(), "j should have marked the policy dirty");
     }
 
     #[test]
@@ -10020,10 +9934,7 @@ mod tests {
             !a.policy.dirty(),
             "flush_if_due should have cleared the dirty bit"
         );
-        assert!(
-            a.notice.is_none(),
-            "successful flush should not set a notice"
-        );
+        assert!(a.notice.is_none(), "successful flush should not set a notice");
     }
 
     #[test]
@@ -10108,10 +10019,7 @@ mod tests {
 
         // Re-render at the same size: no resize, no record.
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
-        assert!(
-            !a.policy.dirty(),
-            "render at the same size must not record"
-        );
+        assert!(!a.policy.dirty(), "render at the same size must not record");
     }
 
     #[test]

@@ -341,12 +341,12 @@ fn parse_time_compare(
 }
 
 fn parse_time(s: &str) -> Result<DateTime<Utc>, FilterParseError> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| FilterParseError::BadTime {
+    DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)).map_err(
+        |e| FilterParseError::BadTime {
             value: s.to_string(),
             error: e.to_string(),
-        })
+        },
+    )
 }
 
 fn parse_regex_predicate(
@@ -646,12 +646,14 @@ mod tests {
             "disabled": false
         }"#);
 
-        let m = |name: &str, value: &str| Predicate::FieldEquals {
-            name: name.into(),
-            value: value.into(),
-            negated: false,
-        }
-        .matches(&e);
+        let m = |name: &str, value: &str| {
+            Predicate::FieldEquals {
+                name: name.into(),
+                value: value.into(),
+                negated: false,
+            }
+            .matches(&e)
+        };
 
         // Integer extras compare against the obvious decimal form.
         assert!(m("iteration", "1"));
@@ -1373,11 +1375,9 @@ mod tests {
     fn parse_bad_time_errors() {
         // Plain dates aren't accepted (RFC 3339 requires a time and
         // offset).  Missing offsets and arbitrary garbage also fail.
-        for src in [
-            "time>=2026-05-09",
-            "time>=2026-05-09T12:00:00",
-            "time>=tomorrow",
-        ] {
+        for src in
+            ["time>=2026-05-09", "time>=2026-05-09T12:00:00", "time>=tomorrow"]
+        {
             let err = src.parse::<Filter>().unwrap_err();
             assert!(
                 matches!(err, FilterParseError::BadTime { .. }),

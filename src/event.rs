@@ -50,10 +50,7 @@ impl<'de> Deserialize<'de> for Event {
         impl<'de> Visitor<'de> for EventVisitor {
             type Value = Event;
 
-            fn expecting(
-                &self,
-                f: &mut fmt::Formatter<'_>,
-            ) -> fmt::Result {
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a bunyan log record")
             }
 
@@ -121,9 +118,7 @@ impl<'de> Deserialize<'de> for Event {
                     msg: msg.ok_or_else(|| {
                         serde::de::Error::missing_field("msg")
                     })?,
-                    v: v.ok_or_else(|| {
-                        serde::de::Error::missing_field("v")
-                    })?,
+                    v: v.ok_or_else(|| serde::de::Error::missing_field("v"))?,
                     extra,
                 })
             }
@@ -237,9 +232,7 @@ impl schemars::JsonSchema for Level {
         _: &mut schemars::r#gen::SchemaGenerator,
     ) -> schemars::schema::Schema {
         schemars::schema::SchemaObject {
-            instance_type: Some(
-                schemars::schema::InstanceType::Integer.into(),
-            ),
+            instance_type: Some(schemars::schema::InstanceType::Integer.into()),
             enum_values: Some(vec![
                 serde_json::json!(10),
                 serde_json::json!(20),

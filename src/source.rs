@@ -525,8 +525,8 @@ fn scan_forward(
         walks += 1;
         let length = n as u64;
         let line = buf.trim_end_matches(['\r', '\n']);
-        let parsed = serde_json::from_str::<Event>(line)
-            .map_err(SourceError::from);
+        let parsed =
+            serde_json::from_str::<Event>(line).map_err(SourceError::from);
         push_if_accepted(
             results,
             ByteOffset(current_offset),
@@ -575,14 +575,13 @@ fn scan_backward(
         // copying the bytes — `serde_json::from_slice` handles UTF-8
         // validation for us, so this stays bytes-only until parse.
         let mut content_end = bytes.len();
-        while content_end > 0
-            && matches!(bytes[content_end - 1], b'\n' | b'\r')
+        while content_end > 0 && matches!(bytes[content_end - 1], b'\n' | b'\r')
         {
             content_end -= 1;
         }
         let content = &bytes[..content_end];
-        let parsed = serde_json::from_slice::<Event>(content)
-            .map_err(SourceError::from);
+        let parsed =
+            serde_json::from_slice::<Event>(content).map_err(SourceError::from);
         // Decode the trimmed bytes as UTF-8 for the raw view; lossy
         // conversion preserves the rest of the line when a stray byte
         // can't be decoded (rare in practice — JSON is UTF-8 by spec —
@@ -624,12 +623,7 @@ fn push_if_accepted(
             }
         }
         Err(e) => {
-            results.push(QueryRecord {
-                offset,
-                length,
-                event: Err(e),
-                raw,
-            });
+            results.push(QueryRecord { offset, length, event: Err(e), raw });
         }
     }
 }
@@ -787,9 +781,8 @@ fn read_last_line(
     file.seek(SeekFrom::Start(line_start))?;
     let mut buf = vec![0u8; line_len];
     file.read_exact(&mut buf)?;
-    let s = String::from_utf8(buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let s = String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(s))
 }
 
@@ -887,7 +880,10 @@ mod tests {
         let m = src.metadata();
         assert_eq!(m.earliest, Some(t(100)));
         assert_eq!(m.latest, Some(t(100)));
-        assert_eq!(m.name.as_ref().map(|n| n.to_string()), Some("Nexus".to_string()));
+        assert_eq!(
+            m.name.as_ref().map(|n| n.to_string()),
+            Some("Nexus".to_string())
+        );
         assert_eq!(
             m.hostname.as_ref().map(|h| h.to_string()),
             Some("test-host".to_string()),
@@ -906,7 +902,10 @@ mod tests {
         let m = src.metadata();
         assert_eq!(m.earliest, Some(t(10)));
         assert_eq!(m.latest, Some(t(30)));
-        assert_eq!(m.name.as_ref().map(|n| n.to_string()), Some("Nexus".to_string()));
+        assert_eq!(
+            m.name.as_ref().map(|n| n.to_string()),
+            Some("Nexus".to_string())
+        );
         dir.cleanup();
     }
 
@@ -1148,12 +1147,7 @@ mod tests {
         write_fixture(&p, "Nexus", &[10, 20, 30]);
         let src = FileSource::open(&p).unwrap();
         let out = src
-            .query(
-                ByteOffset::ZERO,
-                Direction::Forward,
-                10,
-                &Filter::default(),
-            )
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &Filter::default())
             .unwrap();
         let msgs: Vec<_> =
             out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
@@ -1314,12 +1308,7 @@ mod tests {
         std::fs::File::create(&p).unwrap();
         let src = FileSource::open(&p).unwrap();
         let fwd = src
-            .query(
-                ByteOffset::ZERO,
-                Direction::Forward,
-                10,
-                &Filter::default(),
-            )
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &Filter::default())
             .unwrap();
         let bwd = src
             .query(
@@ -1355,17 +1344,10 @@ mod tests {
         let src = FileSource::open(&p).unwrap();
 
         let fwd = src
-            .query(
-                ByteOffset::ZERO,
-                Direction::Forward,
-                10,
-                &Filter::default(),
-            )
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &Filter::default())
             .unwrap();
-        let fwd_msgs: Vec<_> = fwd
-            .iter()
-            .map(|r| r.event.as_ref().unwrap().msg.clone())
-            .collect();
+        let fwd_msgs: Vec<_> =
+            fwd.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
         assert_eq!(fwd_msgs, vec!["first", "last"]);
         // The two record lengths sum to file length, matching the
         // "offset + length is the next record's start" contract.
@@ -1380,10 +1362,8 @@ mod tests {
                 &Filter::default(),
             )
             .unwrap();
-        let bwd_msgs: Vec<_> = bwd
-            .iter()
-            .map(|r| r.event.as_ref().unwrap().msg.clone())
-            .collect();
+        let bwd_msgs: Vec<_> =
+            bwd.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
         assert_eq!(bwd_msgs, vec!["last", "first"]);
         dir.cleanup();
     }
@@ -1400,9 +1380,8 @@ mod tests {
         write_fixture(&p, "Nexus", &[10, 20, 30]);
         let src = FileSource::open(&p).unwrap();
         let f: Filter = "msg=m20".parse().unwrap();
-        let out = src
-            .query(ByteOffset::ZERO, Direction::Forward, 10, &f)
-            .unwrap();
+        let out =
+            src.query(ByteOffset::ZERO, Direction::Forward, 10, &f).unwrap();
         let msgs: Vec<_> =
             out.iter().map(|r| r.event.as_ref().unwrap().msg.clone()).collect();
         assert_eq!(msgs, vec!["m20"]);
@@ -1421,9 +1400,8 @@ mod tests {
         let src = FileSource::open(&p).unwrap();
         std::fs::remove_file(&p).unwrap();
         let f: Filter = "name=SledAgent".parse().unwrap();
-        let out = src
-            .query(ByteOffset::ZERO, Direction::Forward, 10, &f)
-            .unwrap();
+        let out =
+            src.query(ByteOffset::ZERO, Direction::Forward, 10, &f).unwrap();
         assert!(out.is_empty());
         dir.cleanup();
     }
@@ -1436,12 +1414,7 @@ mod tests {
         write_fixture(&p, "Nexus", &[10, 20]);
         let src = FileSource::open(&p).unwrap();
         let out = src
-            .query(
-                ByteOffset::ZERO,
-                Direction::Forward,
-                0,
-                &Filter::default(),
-            )
+            .query(ByteOffset::ZERO, Direction::Forward, 0, &Filter::default())
             .unwrap();
         assert!(out.is_empty());
         dir.cleanup();
@@ -1460,12 +1433,7 @@ mod tests {
         append_bunyan_at(&p, "Nexus", t(20), "b");
         let src = FileSource::open(&p).unwrap();
         let out = src
-            .query(
-                ByteOffset::ZERO,
-                Direction::Forward,
-                10,
-                &Filter::default(),
-            )
+            .query(ByteOffset::ZERO, Direction::Forward, 10, &Filter::default())
             .unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].event.as_ref().unwrap().msg, "a");

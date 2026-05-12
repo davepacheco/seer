@@ -169,7 +169,8 @@ impl SummaryBuilder {
         match self.time_range {
             None => self.time_range = Some((event.time, event.time)),
             Some((min, max)) => {
-                self.time_range = Some((min.min(event.time), max.max(event.time)));
+                self.time_range =
+                    Some((min.min(event.time), max.max(event.time)));
             }
         }
         let per_source =
@@ -218,8 +219,11 @@ impl SummaryBuilder {
         let fields = surviving
             .into_iter()
             .map(|name| {
-                let value_counts =
-                    self.field_value_counts.get(&name).cloned().unwrap_or_default();
+                let value_counts = self
+                    .field_value_counts
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
                 build_field_summary(name, value_counts, total_events)
             })
             .collect();
@@ -531,7 +535,10 @@ fn compute_label_width(
     }
     if let Some(time) = &summary.time {
         for (start, _) in &time.buckets {
-            w = w.max(display_width(&format_time_label(*start, time.bucket_label)));
+            w = w.max(display_width(&format_time_label(
+                *start,
+                time.bucket_label,
+            )));
         }
     }
     // Cap so a single very long label doesn't squeeze the bar: long
@@ -606,8 +613,8 @@ fn render_bar(count: u64, max: u64, width: usize) -> String {
     }
     let total_eighths = (width as u64) * 8;
     // Use u128 to avoid overflow on multi-billion-event histograms.
-    let scaled =
-        ((u128::from(count) * u128::from(total_eighths)) / u128::from(max)) as u64;
+    let scaled = ((u128::from(count) * u128::from(total_eighths))
+        / u128::from(max)) as u64;
     let full = (scaled / 8) as usize;
     let rem = (scaled % 8) as usize;
     let mut out = String::with_capacity(full + 1);

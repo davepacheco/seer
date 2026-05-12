@@ -94,8 +94,7 @@ pub fn short_hostname(hostname: &str) -> String {
         )
         .expect("static regex compiles")
     });
-    let head =
-        hostname.split_once('.').map(|(h, _)| h).unwrap_or(hostname);
+    let head = hostname.split_once('.').map(|(h, _)| h).unwrap_or(hostname);
     if let Some(caps) = UUID_TAIL.captures(head) {
         return caps[1].to_string();
     }
@@ -110,11 +109,8 @@ pub fn short_hostname(hostname: &str) -> String {
 /// suffix is preserved either way so the value is still unambiguously
 /// UTC when the user copies it out.
 pub fn format_time(time: &DateTime<Utc>, show_date: bool) -> String {
-    let pattern = if show_date {
-        "%Y-%m-%dT%H:%M:%S%.3fZ"
-    } else {
-        "%H:%M:%S%.3fZ"
-    };
+    let pattern =
+        if show_date { "%Y-%m-%dT%H:%M:%S%.3fZ" } else { "%H:%M:%S%.3fZ" };
     time.format(pattern).to_string()
 }
 
@@ -430,10 +426,7 @@ mod tests {
         );
         let header =
             &format_event(&e, &opts(false, true, HostnameDisplay::None))[0];
-        assert_eq!(
-            header,
-            "2026-05-07T00:00:00.000Z Nexus/100 ERROR kaboom",
-        );
+        assert_eq!(header, "2026-05-07T00:00:00.000Z Nexus/100 ERROR kaboom",);
     }
 
     #[test]
@@ -479,10 +472,7 @@ mod tests {
             ..RenderOpts::default()
         };
         let header = &format_event(&e, &opts)[0];
-        assert_eq!(
-            header,
-            "2026-05-07T00:00:00.000Z host-a 42 INFO  m",
-        );
+        assert_eq!(header, "2026-05-07T00:00:00.000Z host-a 42 INFO  m",);
     }
 
     #[test]
@@ -532,7 +522,8 @@ mod tests {
         let warn_line =
             &format_event(&warn, &opts(false, true, HostnameDisplay::Short))[0];
         let error_line =
-            &format_event(&error, &opts(false, true, HostnameDisplay::Short))[0];
+            &format_event(&error, &opts(false, true, HostnameDisplay::Short))
+                [0];
         // The two characters following the level are always "  m" for
         // 4-char levels (padded plus space plus msg) and " m" for the
         // 5-char ones.
@@ -595,25 +586,17 @@ mod tests {
 
     #[test]
     fn short_hostname_trims_dot_components() {
-        assert_eq!(
-            short_hostname("gimlet-01.oxide.test"),
-            "gimlet-01",
-        );
+        assert_eq!(short_hostname("gimlet-01.oxide.test"), "gimlet-01",);
         // Multiple dots: only the first component survives, the rest
         // are domain-like suffixes.
-        assert_eq!(
-            short_hostname("a.b.c.d"),
-            "a",
-        );
+        assert_eq!(short_hostname("a.b.c.d"), "a",);
     }
 
     #[test]
     fn short_hostname_collapses_uuid_suffix() {
         // Canonical example from the spec.
         assert_eq!(
-            short_hostname(
-                "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d",
-            ),
+            short_hostname("oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d",),
             "oxz_nexus_c53300fc",
         );
         // Bare UUID: collapses to its first 8-hex group.

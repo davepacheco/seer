@@ -47,7 +47,6 @@ fn opposite(d: Direction) -> Direction {
 /// chunk of walking and the UI stays responsive.
 const BATCH_SIZE: usize = 64;
 
-
 /// Maximum records held in either direction's buffer for a single
 /// source.  When a step would push beyond this, the oldest entry on
 /// the *opposite* end is dropped and that direction's EOF flag is
@@ -181,12 +180,7 @@ struct BufferedRecord {
 impl From<QueryRecord> for BufferedRecord {
     fn from(record: QueryRecord) -> Self {
         let QueryRecord { offset, length, event, raw } = record;
-        Self {
-            offset,
-            length,
-            event: event.map_err(MergeError::from),
-            raw,
-        }
+        Self { offset, length, event: event.map_err(MergeError::from), raw }
     }
 }
 
@@ -345,12 +339,9 @@ impl<'a> SourceWindow<'a> {
     /// opposite buffer so a subsequent step in the opposite direction
     /// replays it without I/O.  Caller must ensure the head exists.
     fn pop(&mut self, dir: Direction) -> MergeRecord {
-        let r =
-            self.buf_mut(dir).pop_front().expect("buf has a head");
+        let r = self.buf_mut(dir).pop_front().expect("buf has a head");
         self.position = match dir {
-            Direction::Forward => {
-                ByteOffset::from(r.offset.get() + r.length)
-            }
+            Direction::Forward => ByteOffset::from(r.offset.get() + r.length),
             Direction::Backward => r.offset,
         };
         let opp = opposite(dir);
@@ -598,10 +589,7 @@ impl<'a> Stepper<'a> {
 /// — so backward stepping over a run of equal-timestamped events from
 /// multiple sources retraces the forward emit order in reverse.  Among
 /// multiple error heads the same direction-aware tiebreak applies.
-fn pick(
-    sources: &[SourceWindow<'_>],
-    direction: Direction,
-) -> Option<usize> {
+fn pick(sources: &[SourceWindow<'_>], direction: Direction) -> Option<usize> {
     let mut best: Option<usize> = None;
     let mut best_is_err = false;
     let mut best_time: Option<DateTime<Utc>> = None;
@@ -667,9 +655,7 @@ mod tests {
     /// byte zero with the default filter.  Returned alongside the
     /// boxed sources so the borrow checker is happy: the stepper
     /// borrows from the slice we keep alive in the caller.
-    fn make_stepper<'a>(
-        sources: &'a [Box<dyn Source>],
-    ) -> Stepper<'a> {
+    fn make_stepper<'a>(sources: &'a [Box<dyn Source>]) -> Stepper<'a> {
         let refs: Vec<&dyn Source> =
             sources.iter().map(|s| s.as_ref()).collect();
         Stepper::new(refs, Filter::default(), &Cursor::new())
@@ -886,12 +872,8 @@ mod tests {
         // Build a brand-new stepper at that cursor.
         let refs: Vec<&dyn Source> =
             sources.iter().map(|s| s.as_ref()).collect();
-        let mut resumed =
-            Stepper::new(refs, Filter::default(), &snapshot);
-        assert_eq!(
-            forward_msgs(&mut resumed),
-            vec!["m40", "m50", "m60"],
-        );
+        let mut resumed = Stepper::new(refs, Filter::default(), &snapshot);
+        assert_eq!(forward_msgs(&mut resumed), vec!["m40", "m50", "m60"],);
         dir.cleanup();
     }
 
@@ -928,10 +910,7 @@ mod tests {
             sources.iter().map(|s| s.as_ref()).collect();
         let mut stepper = Stepper::new(refs, Filter::default(), &cursor);
         assert!(stepper.step_forward().is_none());
-        assert_eq!(
-            backward_msgs(&mut stepper),
-            vec!["m30", "m20", "m10"],
-        );
+        assert_eq!(backward_msgs(&mut stepper), vec!["m30", "m20", "m10"],);
         dir.cleanup();
     }
 
@@ -1039,8 +1018,7 @@ mod tests {
         // twice and taking the stepper's cursor.
         let refs: Vec<&dyn Source> =
             sources.iter().map(|s| s.as_ref()).collect();
-        let mut probe =
-            Stepper::new(refs, Filter::default(), &Cursor::new());
+        let mut probe = Stepper::new(refs, Filter::default(), &Cursor::new());
         probe.step_forward().unwrap(); // m10
         probe.step_forward().unwrap(); // m20
         let mid = probe.cursor();
@@ -1200,10 +1178,8 @@ mod tests {
         write_fixture(&p, "x", &secs);
         let inner = FileSource::open(&p).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        let src: Box<dyn Source> = Box::new(CountingSource {
-            inner,
-            count: counter.clone(),
-        });
+        let src: Box<dyn Source> =
+            Box::new(CountingSource { inner, count: counter.clone() });
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let msgs = forward_msgs(&mut stepper);

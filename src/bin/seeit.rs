@@ -477,7 +477,13 @@ fn emit_records_window(
             emit_record(&r, opts);
         }
     }
-    emit_forward_from_engine(engine, filter, &resolved.cursor, args.count, opts);
+    emit_forward_from_engine(
+        engine,
+        filter,
+        &resolved.cursor,
+        args.count,
+        opts,
+    );
 }
 
 /// Builds a [`Summary`] over `filter` and prints it.  Summary mode
@@ -580,9 +586,8 @@ mod tests {
 
     #[test]
     fn parses_session_mode_with_stream() {
-        let a =
-            parse(&["seeit", "--session", "deadbeef", "--stream", "Nexus"])
-                .unwrap();
+        let a = parse(&["seeit", "--session", "deadbeef", "--stream", "Nexus"])
+            .unwrap();
         assert_eq!(a.session.map(|s| s.to_string()), Some("deadbeef".into()));
         assert_eq!(a.stream.as_deref(), Some("Nexus"));
         assert!(a.tab.is_none());
@@ -658,7 +663,13 @@ mod tests {
     #[test]
     fn rejects_multiple_selectors() {
         parse(&[
-            "seeit", "--session", "deadbeef", "--stream", "x", "--tab", "y",
+            "seeit",
+            "--session",
+            "deadbeef",
+            "--stream",
+            "x",
+            "--tab",
+            "y",
         ])
         .unwrap_err();
         parse(&[
@@ -685,9 +696,8 @@ mod tests {
 
     #[test]
     fn rejects_and_filter_without_session() {
-        let a =
-            parse(&["seeit", "foo.log", "--and-filter", "level>=warn"])
-                .unwrap();
+        let a = parse(&["seeit", "foo.log", "--and-filter", "level>=warn"])
+            .unwrap();
         assert_eq!(
             a.validate(),
             Err(ArgValidateError::SessionRequired { flag: "--and-filter" })

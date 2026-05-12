@@ -19,7 +19,7 @@ use camino_tempfile::{Utf8TempDir, tempdir};
 use chrono::{DateTime, Utc};
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, Filter, LogStream,
-    Selector, Session, SessionId, SessionSource, SessionStore, STATE_DIR_ENV,
+    STATE_DIR_ENV, Selector, Session, SessionId, SessionSource, SessionStore,
     Tab, TabKind, build_seeit_command,
 };
 use std::fs;
@@ -170,10 +170,8 @@ fn count_caps_output() {
     let id = session.id;
     save_session(dir.path(), &session);
 
-    let stdout = run_seeit(
-        dir.path(),
-        &["--session", &id.to_string(), "--count", "3"],
-    );
+    let stdout =
+        run_seeit(dir.path(), &["--session", &id.to_string(), "--count", "3"]);
     assert_eq!(count_records(&stdout), 3);
 }
 
@@ -186,8 +184,7 @@ fn tab_at_saved_cursor_resumes_from_that_position() {
     // engine forward twice and snapshotting the cursor.
     let mut engine = Engine::new();
     engine.add_file_source(&staged.path).unwrap();
-    let mut stepper =
-        engine.stepper(Filter::default(), &Cursor::default());
+    let mut stepper = engine.stepper(Filter::default(), &Cursor::default());
     stepper.step_forward().unwrap();
     stepper.step_forward().unwrap();
     let mid_cursor = stepper.cursor();
@@ -220,8 +217,7 @@ fn bookmark_before_window_emits_pre_cursor_records() {
     // over the first two.
     let mut engine = Engine::new();
     engine.add_file_source(&staged.path).unwrap();
-    let mut stepper =
-        engine.stepper(Filter::default(), &Cursor::default());
+    let mut stepper = engine.stepper(Filter::default(), &Cursor::default());
     stepper.step_forward().unwrap();
     stepper.step_forward().unwrap();
     let cursor_at_third = stepper.cursor();
@@ -232,9 +228,7 @@ fn bookmark_before_window_emits_pre_cursor_records() {
         created_at: Utc::now(),
         cursor: cursor_at_third,
         name: Some(BookmarkName::from("here".to_string())),
-        display_source: seer::SourceId::from(
-            staged.path.as_str().to_string(),
-        ),
+        display_source: seer::SourceId::from(staged.path.as_str().to_string()),
         display_time: Utc::now(),
         display_msg: "msg".to_string(),
     };
@@ -550,8 +544,7 @@ fn printed_seeit_command_actually_reproduces_the_view() {
     let id = session.id;
     save_session(dir.path(), &session);
 
-    let cmd =
-        build_seeit_command(id, &Selector::Tab("Tab 1".to_string()));
+    let cmd = build_seeit_command(id, &Selector::Tab("Tab 1".to_string()));
     let mut argv = shlex::split(&cmd).expect("valid shell quoting");
     // The first token is "seeit" — drop it and feed the rest to the
     // real binary the test framework built for us.

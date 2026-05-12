@@ -124,15 +124,7 @@ pub struct Bookmark {
 /// the field/time histogram summary.  Persisted on each tab so a
 /// resumed session reopens both kinds in the right shape.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    JsonSchema,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub enum TabKind {
     /// Regular per-record log view.

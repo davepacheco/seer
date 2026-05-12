@@ -75,7 +75,10 @@ fn gen_single_source_with_time_regression(
     count: usize,
     regression_idx: usize,
 ) {
-    assert!(regression_idx > 0, "regression must come after at least one record");
+    assert!(
+        regression_idx > 0,
+        "regression must come after at least one record"
+    );
     assert!(regression_idx < count, "regression index out of range");
     let opts = GenOpts::default();
     let mut f = BufWriter::new(File::create(path).expect("create fixture"));
@@ -84,8 +87,8 @@ fn gen_single_source_with_time_regression(
             i32::try_from(i).expect("record index fits in i32 for fixtures");
         let time = if i == regression_idx {
             // One step earlier than i-1: that's i-2 records past base.
-            let prev_prev = i32::try_from(i - 2)
-                .expect("regression neighbor fits in i32");
+            let prev_prev =
+                i32::try_from(i - 2).expect("regression neighbor fits in i32");
             opts.base_time + opts.step * prev_prev
         } else {
             opts.base_time + opts.step * i_i32
@@ -129,8 +132,7 @@ fn streamview_forward_scrolls_through_large_record_count() {
 
     // Ground truth: every record key in forward order, via the
     // engine's stepper.
-    let mut stepper =
-        engine.stepper(Filter::default(), &Cursor::new());
+    let mut stepper = engine.stepper(Filter::default(), &Cursor::new());
     let mut expected: Vec<RecordKey> = Vec::with_capacity(LARGE_COUNT);
     while let Some(rec) = stepper.step_forward() {
         expected.push(RecordKey::from_record(&rec));
@@ -151,10 +153,7 @@ fn streamview_forward_scrolls_through_large_record_count() {
     );
     while !view.is_forward_eof()
         || view.anchor_position().map(|(_, l)| l).unwrap_or(0)
-            < view
-                .anchor_record()
-                .map(|_| 0)
-                .unwrap_or(0)
+            < view.anchor_record().map(|_| 0).unwrap_or(0)
     {
         let before = view
             .anchor_record()
@@ -227,15 +226,11 @@ fn streamview_backward_after_full_forward_replays_in_reverse() {
         view.anchor_record().map(RecordKey::from_record).expect("anchor"),
     );
     loop {
-        let before = view
-            .anchor_record()
-            .map(RecordKey::from_record)
-            .expect("anchor");
+        let before =
+            view.anchor_record().map(RecordKey::from_record).expect("anchor");
         view.scroll_lines(&engine, 1, viewport);
-        let after = view
-            .anchor_record()
-            .map(RecordKey::from_record)
-            .expect("anchor");
+        let after =
+            view.anchor_record().map(RecordKey::from_record).expect("anchor");
         if after == before {
             break;
         }
@@ -253,15 +248,11 @@ fn streamview_backward_after_full_forward_replays_in_reverse() {
         view.anchor_record().map(RecordKey::from_record).expect("anchor"),
     );
     loop {
-        let before = view
-            .anchor_record()
-            .map(RecordKey::from_record)
-            .expect("anchor");
+        let before =
+            view.anchor_record().map(RecordKey::from_record).expect("anchor");
         view.scroll_lines(&engine, -1, viewport);
-        let after = view
-            .anchor_record()
-            .map(RecordKey::from_record)
-            .expect("anchor");
+        let after =
+            view.anchor_record().map(RecordKey::from_record).expect("anchor");
         if after == before {
             break;
         }
@@ -291,16 +282,21 @@ fn set_filter_after_full_walk_drops_buffers_and_resets() {
     let dir = TestDir::new();
     let path = dir.path().join("filter.log");
     let count = 10_000;
-    let opts = GenOpts {
-        // Force `msg` to "rare" every 200 records, else "common".  A
-        // filter accepting only "rare" yields ~50 records out of 10K.
-        message_templates: (0..200)
-            .map(|i| {
-                if i == 0 { "rare".to_string() } else { "common".to_string() }
-            })
-            .collect(),
-        ..GenOpts::default()
-    };
+    let opts =
+        GenOpts {
+            // Force `msg` to "rare" every 200 records, else "common".  A
+            // filter accepting only "rare" yields ~50 records out of 10K.
+            message_templates: (0..200)
+                .map(|i| {
+                    if i == 0 {
+                        "rare".to_string()
+                    } else {
+                        "common".to_string()
+                    }
+                })
+                .collect(),
+            ..GenOpts::default()
+        };
     gen_single_source(&path, "filter", count, &opts);
 
     let mut engine = Engine::new();
@@ -342,8 +338,7 @@ fn set_filter_after_full_walk_drops_buffers_and_resets() {
     // parse_stats.records counts records appended *to the window*; on
     // a successful refill the value should equal record_count.
     assert_eq!(
-        stats.records as usize,
-        expected_matches,
+        stats.records as usize, expected_matches,
         "parse_stats should reset on set_filter and refill cleanly",
     );
     dir.cleanup();
@@ -418,7 +413,13 @@ fn multi_source_merge_under_selective_filter_walks_each_file() {
         let opts = GenOpts {
             base_time: base.base_time + stagger * idx_i32,
             message_templates: (0..200)
-                .map(|i| if i == 0 { "rare".to_string() } else { "common".to_string() })
+                .map(|i| {
+                    if i == 0 {
+                        "rare".to_string()
+                    } else {
+                        "common".to_string()
+                    }
+                })
                 .collect(),
             ..base.clone()
         };
@@ -514,8 +515,7 @@ fn search_step_forward_finds_match_near_end_with_resume() {
         "match near end with tight budget should hit BudgetExhausted first",
     );
 
-    let anchor =
-        view.anchor_record().expect("anchor must be set on Found");
+    let anchor = view.anchor_record().expect("anchor must be set on Found");
     let event = anchor.event.as_ref().expect("anchor is on a parsed event");
     assert_eq!(event.msg, marker, "anchor must be the marker record");
     dir.cleanup();
@@ -624,13 +624,11 @@ fn seek_to_cursor_under_selective_filter_yields_correct_anchor() {
     // The marker record's timestamp is deterministic from GenOpts'
     // base + step * target_idx.
     let opts = GenOpts::default();
-    let i_i32 =
-        i32::try_from(target_idx).expect("target index fits in i32");
+    let i_i32 = i32::try_from(target_idx).expect("target index fits in i32");
     let marker_time = opts.base_time + opts.step * i_i32;
     let pos = LogStreamPosition::new(source_id, marker_time, 0);
-    let cursor = engine
-        .cursor_for_position(&pos)
-        .expect("position must resolve");
+    let cursor =
+        engine.cursor_for_position(&pos).expect("position must resolve");
 
     // Filter out the marker record specifically.
     let filter = parse_filter(&format!("msg!={unique}"));
@@ -641,10 +639,7 @@ fn seek_to_cursor_under_selective_filter_yields_correct_anchor() {
     let anchor =
         view.anchor_record().expect("seek_to_cursor must land on a record");
     let ev = anchor.event.as_ref().expect("anchor on parsed event");
-    assert_ne!(
-        ev.msg, unique,
-        "anchor must not be the filtered-out record",
-    );
+    assert_ne!(ev.msg, unique, "anchor must not be the filtered-out record",);
     // Next visible record is index 30001 — "boring".
     assert_eq!(ev.msg, "boring", "anchor must be the next visible record");
     // Its timestamp is exactly one step after the marker.
@@ -687,8 +682,7 @@ fn cancel_seek_midstream_leaves_partial_window_in_consistent_state() {
 
     // Partial walk: prepare_seek_to_start then ensure_window_step
     // until either we've taken several steps or completion arrives.
-    let mut partial =
-        StreamView::new(Filter::default(), RenderOpts::default());
+    let mut partial = StreamView::new(Filter::default(), RenderOpts::default());
     partial.prepare_seek_to_start();
     let max_steps = 3;
     let mut step_count = 0;
@@ -699,10 +693,8 @@ fn cancel_seek_midstream_leaves_partial_window_in_consistent_state() {
             break;
         }
     }
-    let partial_keys: Vec<RecordKey> = partial
-        .records()
-        .map(|(rec, _)| RecordKey::from_record(rec))
-        .collect();
+    let partial_keys: Vec<RecordKey> =
+        partial.records().map(|(rec, _)| RecordKey::from_record(rec)).collect();
     assert!(
         !partial_keys.is_empty(),
         "partial window must have at least one record",
@@ -730,12 +722,7 @@ fn out_of_order_warning_emitted_once_across_a_full_pass() {
     let path = dir.path().join("ooo.log");
     let count = LARGE_COUNT;
     let regression_idx = count / 2;
-    gen_single_source_with_time_regression(
-        &path,
-        "ooo",
-        count,
-        regression_idx,
-    );
+    gen_single_source_with_time_regression(&path, "ooo", count, regression_idx);
 
     let mut engine = Engine::new();
     let source_id = engine.add_file_source(&path).expect("add source");
@@ -747,10 +734,7 @@ fn out_of_order_warning_emitted_once_across_a_full_pass() {
         match item {
             Ok(_) => {}
             Err(SourceError::OutOfOrder { source_id: sid, .. }) => {
-                assert_eq!(
-                    sid, source_id,
-                    "warning must reference our source",
-                );
+                assert_eq!(sid, source_id, "warning must reference our source",);
                 warnings += 1;
             }
             Err(other) => {
@@ -766,4 +750,3 @@ fn out_of_order_warning_emitted_once_across_a_full_pass() {
     assert_eq!(other_errors, 0, "expected no parse or IO errors");
     dir.cleanup();
 }
-
