@@ -93,9 +93,9 @@ This is a code-sharing exercise, not a re-implementation:
 
 ## Status
 
-**Current phase: Phase 2 — target-resolution library helper.**  Phase 1
-landed (CLI restructure committed).  Update the "Status" line and check
-the phase box as work lands.
+**Current phase: Phase 3 — `--before` emission.**  Phases 1 and 2
+landed (CLI restructure and resolver helper committed).  Update the
+"Status" line and check the phase box as work lands.
 
 ### Notes from Phase 1
 
@@ -104,6 +104,15 @@ the phase box as work lands.
   live in `Args::validate` instead.  Phase 5 should consider whether
   to convert this error type into a nicer Display in `main` (today it
   surfaces via `Debug`).
+
+### Notes from Phase 2
+
+- The optional refactor of `seer.rs::restore_tabs_or_default` to share
+  code with `seeit_target::resolve_in_session` was deferred — the
+  two paths agree on shape but the TUI version is interleaved with
+  engine/UI setup that does not belong in a non-TUI library helper.
+  A focused later pass can extract the name lookup + cursor seeding
+  if the duplication starts to bite.
 
 ## Phases
 
@@ -120,7 +129,7 @@ the phase box as work lands.
 - Tests: clap parse tests for every valid combination and the rejection
   cases.
 
-### [ ] Phase 2 — Library: target resolution
+### [x] Phase 2 — Library: target resolution
 
 - New module (likely `src/seeit_target.rs`, exposed from `lib.rs`)
   defining:
