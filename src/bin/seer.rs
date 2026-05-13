@@ -2866,7 +2866,7 @@ impl App {
 
     /// Replaces the active stream's [`RenderOpts`] with `opts`,
     /// persists it, and re-renders every tab targeting that stream.
-    /// Used by the `h` field-display dialog, which mutates several
+    /// Used by the `d` field-display dialog, which mutates several
     /// knobs at once.
     fn apply_render_opts(&mut self, opts: RenderOpts) {
         let stream_id = self.tabs[self.active].stream;
@@ -2880,7 +2880,7 @@ impl App {
 
     /// Re-inserts `stream` into the session and triggers a `rerender`
     /// on every tab targeting it.  Shared by the `F`/`D` toggles and
-    /// the `h` field-display dialog: each mutates one or more
+    /// the `d` field-display dialog: each mutates one or more
     /// rendering knobs and wants every tab to repaint with the new
     /// values.
     fn rerender_after_stream_mutation(
@@ -3466,6 +3466,15 @@ impl App {
                         Some(Dialog::confirm_delete_bookmark(bm.id, label));
                 }
             }
+            // `h`: open the help popup.  Matches `less` and keeps the
+            // binding consistent with the main-tab keymap.
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.dialog = Some(Dialog::help());
+            }
             _ => {}
         }
     }
@@ -3879,19 +3888,28 @@ impl App {
             {
                 self.toggle_show_raw();
             }
-            // `h`: open the field-display dialog (timestamp format,
-            // hostname mode, name/pid/extras visibility).  Replaces the
-            // single-purpose `H` cycle and folds the `F` extras toggle
-            // alongside the other knobs in one place — `F` keeps its
-            // shortcut for muscle memory.
+            // `d`: open the field-display dialog (timestamp format,
+            // hostname mode, name/pid/extras visibility).  Folds the
+            // `F` extras toggle alongside the other knobs in one place
+            // — `F` keeps its shortcut for muscle memory.  `h` is
+            // reserved for the help popup (matching `less`), so the
+            // display-fields dialog lives on `d`.
             KeyEvent {
-                code: KeyCode::Char('h'),
+                code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
                 self.dialog = Some(Dialog::display_fields(
                     self.active_stream().render_opts(),
                 ));
+            }
+            // `h`: open the keybindings help popup (matching `less`).
+            KeyEvent {
+                code: KeyCode::Char('h'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.dialog = Some(Dialog::help());
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -4313,6 +4331,11 @@ enum Dialog {
     /// reproduce the active view.  `Esc` or `Enter` close it.
     /// Opened by the `Y` binding.
     SeeitCommand { text: String },
+    /// Read-only keybindings summary, organized by section.  Opened by
+    /// the `h` binding (matching `less`).  `Esc`/`Enter` close it;
+    /// `j`/`k`/Up/Down scroll when the content exceeds the popup
+    /// height.  `scroll` is the index of the first body line drawn.
+    Help { scroll: u16 },
 }
 
 /// One row in the [`Dialog::DisplayFields`] list.  Items are either
@@ -4498,6 +4521,13 @@ impl Dialog {
         Self::SeeitCommand { text }
     }
 
+    /// Read-only keybindings summary.  The body is built from
+    /// [`HELP_SECTIONS`] at render time so adding a new section or
+    /// binding is a one-liner there, not a constructor change here.
+    fn help() -> Self {
+        Self::Help { scroll: 0 }
+    }
+
     fn editor(&self) -> Option<&LineEditor> {
         match self {
             Self::Filter { editor, .. }
@@ -4507,7 +4537,8 @@ impl Dialog {
             Self::ConfirmDeleteBookmark { .. }
             | Self::ConfirmQuit
             | Self::DisplayFields { .. }
-            | Self::SeeitCommand { .. } => None,
+            | Self::SeeitCommand { .. }
+            | Self::Help { .. } => None,
         }
     }
 
@@ -4520,7 +4551,8 @@ impl Dialog {
             | Self::ConfirmDeleteBookmark { .. }
             | Self::ConfirmQuit
             | Self::DisplayFields { .. }
-            | Self::SeeitCommand { .. } => None,
+            | Self::SeeitCommand { .. }
+            | Self::Help { .. } => None,
         }
     }
 
@@ -4555,6 +4587,9 @@ impl Dialog {
             }
             Self::SeeitCommand { .. } => {
                 "seeit reproduction (Esc/Enter close)".to_string()
+            }
+            Self::Help { .. } => {
+                "Keybindings (Esc/Enter close · j/k scroll)".to_string()
             }
         }
     }
@@ -4604,6 +4639,12 @@ impl Dialog {
         if let Self::DisplayFields { draft, cursor } = self {
             return handle_display_fields_key(draft, cursor, key);
         }
+        // The help popup is scrollable (j/k/Up/Down) but otherwise has
+        // no editor.  Same handle-it-before-the-editor-arm pattern as
+        // DisplayFields.
+        if let Self::Help { scroll } = self {
+            return handle_help_key(scroll, key);
+        }
         // Backspacing past the leading `/` (or `?`) of an empty search
         // prompt is treated as "I changed my mind" — the same as Esc.
         // The Filter, Rename, and BookmarkName dialogs deliberately
@@ -4630,7 +4671,9 @@ impl Dialog {
                 return DialogResult::Stay;
             }
             // Already handled above.
-            Self::DisplayFields { .. } => return DialogResult::Stay,
+            Self::DisplayFields { .. } | Self::Help { .. } => {
+                return DialogResult::Stay;
+            }
         };
         if let EditAction::Handled = editor_result {
             self.reparse_filter();
@@ -4697,6 +4740,8 @@ impl Dialog {
             // The seeit-command popup is read-only: Enter just
             // closes it, same as Esc.
             Self::SeeitCommand { .. } => DialogResult::Cancel,
+            // Same story for the help popup.
+            Self::Help { .. } => DialogResult::Cancel,
         }
     }
 }
@@ -4737,6 +4782,174 @@ fn handle_display_fields_key(
         _ => {}
     }
     DialogResult::Stay
+}
+
+/// One section in the help popup.  The whole list of sections drives
+/// both the rendered popup and the help-content tests, so adding a new
+/// binding only requires a one-line entry here.
+struct HelpSection {
+    /// Section heading rendered above its items (e.g., "Navigation").
+    title: &'static str,
+    /// `(keys, description)` pairs.  `keys` is the left column shown to
+    /// the user; multiple keys for the same action are joined with `,`.
+    items: &'static [(&'static str, &'static str)],
+}
+
+/// All keybindings displayed by the help popup, in display order.
+/// Bookmarks-pane bindings live in their own section since the active
+/// keymap depends on which pane is focused.
+const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "Navigation",
+        items: &[
+            ("j, Down", "scroll down one line"),
+            ("k, Up", "scroll up one line"),
+            ("Space", "page down"),
+            ("Ctrl-D", "half-page down"),
+            ("Ctrl-U", "half-page up"),
+            ("g, Home", "go to first record"),
+            ("G, End", "go to last record"),
+            ("<", "step back by current time step"),
+            (">", "step forward by current time step"),
+            ("-", "shrink time step"),
+            ("=, +", "grow time step"),
+        ],
+    },
+    HelpSection {
+        title: "Search",
+        items: &[
+            ("/", "forward search"),
+            ("?", "backward search"),
+            ("n", "repeat last search"),
+            ("N", "repeat last search, reversed"),
+        ],
+    },
+    HelpSection {
+        title: "Filtering & selection",
+        items: &[
+            ("f", "edit filter"),
+            ("x", "exclude rows matching the selected message"),
+            ("X", "include only rows matching the selected message"),
+            ("b", "bookmark a row"),
+        ],
+    },
+    HelpSection {
+        title: "Display",
+        items: &[
+            ("d", "display-fields dialog (timestamp, hostname, pid, …)"),
+            ("F", "toggle structured-fields visibility"),
+            ("D", "toggle date in timestamp"),
+            ("R", "toggle raw rendering"),
+        ],
+    },
+    HelpSection {
+        title: "Tabs",
+        items: &[
+            ("Tab", "next tab"),
+            ("Shift-Tab", "previous tab"),
+            ("Ctrl-T", "new tab (clone current filter)"),
+            ("S", "new summary tab"),
+            ("Ctrl-W", "close active tab"),
+            ("r", "rename active tab"),
+        ],
+    },
+    HelpSection {
+        title: "Other",
+        items: &[
+            ("Y", "show seeit reproduction command"),
+            ("h", "show this help"),
+            ("q", "quit"),
+        ],
+    },
+    HelpSection {
+        title: "Bookmarks pane",
+        items: &[
+            ("j, k", "move cursor"),
+            ("Enter", "open bookmark"),
+            ("x", "delete bookmark (with confirmation)"),
+            ("Tab, Shift-Tab", "cycle panes"),
+            ("h", "show this help"),
+            ("q", "quit"),
+        ],
+    },
+];
+
+/// Routes a keystroke inside the help popup.  Scrolls with
+/// `j`/`k`/Up/Down (one line) and Space/Ctrl-D/Ctrl-U/PageDown/PageUp
+/// (page-ish jumps).  Anything else is dropped; Esc/Enter are handled
+/// by [`Dialog::handle_key`] before reaching here.
+///
+/// We don't know the popup height here, so we don't clamp `scroll`
+/// against the end of the body — the renderer does that on each frame
+/// and skips drawing past the last line.  An overshoot here is
+/// harmless and self-corrects on the next scroll-up.
+fn handle_help_key(scroll: &mut u16, key: KeyEvent) -> DialogResult {
+    let page = 10u16;
+    match key {
+        KeyEvent {
+            code: KeyCode::Char('j') | KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => *scroll = scroll.saturating_add(1),
+        KeyEvent {
+            code: KeyCode::Char('k') | KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => *scroll = scroll.saturating_sub(1),
+        KeyEvent {
+            code: KeyCode::Char(' ') | KeyCode::PageDown,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => *scroll = scroll.saturating_add(page),
+        KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => *scroll = scroll.saturating_add(page / 2),
+        KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => *scroll = scroll.saturating_sub(page / 2),
+        KeyEvent {
+            code: KeyCode::PageUp,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => *scroll = scroll.saturating_sub(page),
+        _ => {}
+    }
+    DialogResult::Stay
+}
+
+/// Builds the body of the help popup as a flat sequence of [`Line`]s
+/// from [`HELP_SECTIONS`].  Section titles are emphasized; each item
+/// is rendered as `<keys padded>  <description>` so the descriptions
+/// line up.  A blank row separates sections.
+///
+/// The key-column width is computed from the longest key string across
+/// every section so all descriptions line up consistently.
+fn build_help_lines() -> Vec<Line<'static>> {
+    let key_width = HELP_SECTIONS
+        .iter()
+        .flat_map(|s| s.items.iter())
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, section) in HELP_SECTIONS.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (keys, desc) in section.items {
+            let row = format!("  {:width$}  {}", keys, desc, width = key_width);
+            lines.push(Line::raw(row));
+        }
+    }
+    lines
 }
 
 /// First slice of a log message, suitable for the Bookmarks-tab row
@@ -5038,13 +5251,13 @@ fn render(frame: &mut Frame, app: &mut App) {
                 // footer to avoid teaching the user actions that don't
                 // apply.
                 if total == 0 {
-                    "q quit · f filter · / search · ^T new · S summary · \
-                     ^W close · r rename · 0/0"
+                    "q quit · h help · f filter · / search · ^T new · \
+                     S summary · ^W close · r rename · 0/0"
                         .to_string()
                 } else {
                     format!(
-                        "q quit · f filter · / search · ^T new · S summary · \
-                         ^W close · r rename · {}-{} of {}",
+                        "q quit · h help · f filter · / search · ^T new · \
+                         S summary · ^W close · r rename · {}-{} of {}",
                         top + 1,
                         bottom,
                         total,
@@ -5052,8 +5265,8 @@ fn render(frame: &mut Frame, app: &mut App) {
                 }
             } else if total == 0 {
                 format!(
-                    "q quit · f filter · F fields={} · D date={} · \
-                     R raw={} · h host={} · / search · </> step={} · \
+                    "q quit · h help · f filter · F fields={} · D date={} · \
+                     R raw={} · d host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · 0/0",
                     if app.active_stream().show_extras { "on" } else { "off" },
@@ -5066,8 +5279,8 @@ fn render(frame: &mut Frame, app: &mut App) {
                 )
             } else {
                 format!(
-                    "q quit · f filter · F fields={} · D date={} · \
-                     R raw={} · h host={} · / search · </> step={} · \
+                    "q quit · h help · f filter · F fields={} · D date={} · \
+                     R raw={} · d host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · {}-{} of {}",
                     if app.active_stream().show_extras { "on" } else { "off" },
@@ -5088,8 +5301,8 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     // Centered popups (Filter, Rename, BookmarkName,
     // ConfirmDeleteBookmark, ConfirmQuit, DisplayFields,
-    // SeeitCommand) draw on top of the rest.  The Search prompt is
-    // laid out inline above and is skipped here.
+    // SeeitCommand, Help) draw on top of the rest.  The Search prompt
+    // is laid out inline above and is skipped here.
     if let Some(
         dialog @ (Dialog::Filter { .. }
         | Dialog::Rename { .. }
@@ -5097,7 +5310,8 @@ fn render(frame: &mut Frame, app: &mut App) {
         | Dialog::ConfirmDeleteBookmark { .. }
         | Dialog::ConfirmQuit
         | Dialog::DisplayFields { .. }
-        | Dialog::SeeitCommand { .. }),
+        | Dialog::SeeitCommand { .. }
+        | Dialog::Help { .. }),
     ) = app.dialog.as_ref()
     {
         render_dialog(frame, dialog, area);
@@ -5164,7 +5378,7 @@ fn render_bookmarks_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(
             "q quit · j/k select · Enter open · x delete · \
-             Tab cycle · {count} bookmark{}",
+             Tab cycle · h help · {count} bookmark{}",
             if count == 1 { "" } else { "s" },
         )
     };
@@ -5262,6 +5476,10 @@ fn render_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect) {
     }
     if let Dialog::SeeitCommand { text } = dialog {
         render_seeit_command_dialog(frame, dialog, text, area);
+        return;
+    }
+    if let Dialog::Help { scroll } = dialog {
+        render_help_dialog(frame, dialog, *scroll, area);
         return;
     }
 
@@ -5444,6 +5662,62 @@ fn render_seeit_command_dialog(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(wrapped), inner);
+}
+
+/// Renders the read-only help popup.  The body comes from
+/// [`build_help_lines`] and is sliced by `scroll` so long content can
+/// be paged with `j`/`k`/Space.
+///
+/// The popup width is the longest body line (or the title, whichever
+/// is wider) plus the 2-cell border, clamped to the available area —
+/// so descriptions don't clip on an 80-column terminal but the popup
+/// doesn't sprawl wider than the content needs.
+fn render_help_dialog(
+    frame: &mut Frame,
+    dialog: &Dialog,
+    scroll: u16,
+    area: Rect,
+) {
+    let lines = build_help_lines();
+    let total_rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+
+    let title = dialog.title();
+    let widest = lines.iter().map(line_width).max().unwrap_or(0);
+    let needed = widest.max(title.chars().count()).saturating_add(2);
+    let popup_width = u16::try_from(needed).unwrap_or(u16::MAX);
+    let preferred_height = total_rows.saturating_add(2);
+    let popup_height = preferred_height.min(area.height);
+    let popup = popup_area_with_width(area, popup_width, popup_height);
+
+    let block = Block::bordered().title(title);
+    let inner_height = popup.height.saturating_sub(2);
+    let max_scroll = total_rows.saturating_sub(inner_height);
+    let scroll = scroll.min(max_scroll);
+    let start = scroll as usize;
+    let end = (start + inner_height as usize).min(lines.len());
+    let visible: Vec<Line<'static>> = lines[start..end].to_vec();
+
+    frame.render_widget(Clear, popup);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+/// Sum of every span's column width on `line`.  The help-popup
+/// content is ASCII, so chars equal columns.
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Like [`popup_area`] but takes the width in cells rather than a
+/// percentage.  Used by [`render_help_dialog`] where the width is
+/// derived (80%) but we want to share the centering logic.
+fn popup_area_with_width(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
 }
 
 fn popup_area(area: Rect, percent_width: u16, height: u16) -> Rect {
@@ -6163,7 +6437,7 @@ mod tests {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec!["row".to_string()]);
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(dump.contains("Display fields"), "dump:\n{dump}");
@@ -6195,6 +6469,132 @@ mod tests {
             dump.contains("[ ] show all other fields"),
             "expected extras unchecked:\n{dump}",
         );
+    }
+
+    // ---------- help popup ----------
+
+    #[test]
+    fn h_opens_help_dialog() {
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        assert!(
+            matches!(a.dialog, Some(Dialog::Help { scroll: 0 })),
+            "expected Help dialog, got {:?}",
+            a.dialog.as_ref().map(|_| "<other>"),
+        );
+    }
+
+    #[test]
+    fn help_dialog_esc_closes() {
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Esc));
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn help_dialog_enter_closes() {
+        // Enter is bound to "close" (same as Esc) on the read-only help
+        // popup; matches the SeeitCommand popup's behavior.
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Enter));
+        assert!(a.dialog.is_none());
+    }
+
+    #[test]
+    fn help_dialog_j_and_k_scroll() {
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('j')));
+        a.handle_key(key(KeyCode::Char('j')));
+        match a.dialog {
+            Some(Dialog::Help { scroll }) => assert_eq!(scroll, 2),
+            _ => panic!("expected Help dialog after j×2"),
+        }
+        a.handle_key(key(KeyCode::Char('k')));
+        match a.dialog {
+            Some(Dialog::Help { scroll }) => assert_eq!(scroll, 1),
+            _ => panic!("expected Help dialog after k"),
+        }
+        // k past 0 saturates rather than wrapping; otherwise scrolling
+        // back up from line 0 would jump to the end of the body, which
+        // would be jarring.
+        a.handle_key(key(KeyCode::Char('k')));
+        a.handle_key(key(KeyCode::Char('k')));
+        match a.dialog {
+            Some(Dialog::Help { scroll }) => assert_eq!(scroll, 0),
+            _ => panic!("expected Help dialog after k saturate"),
+        }
+    }
+
+    #[test]
+    fn help_dialog_does_not_quit_on_q() {
+        // While the help popup is open, `q` is dropped (not routed to
+        // the underlying app's quit prompt).  Same protection the other
+        // editor-less dialogs have, so a stray keystroke can't tear
+        // down the user's session by accident.
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('q')));
+        assert!(matches!(a.dialog, Some(Dialog::Help { .. })));
+    }
+
+    #[test]
+    fn help_sections_contain_expected_bindings() {
+        // Anchor the section taxonomy and the few bindings most likely
+        // to drift (`h` for help itself, `d` for the display dialog —
+        // historically lived on `h`, easy to revert by accident).
+        let titles: Vec<&str> = HELP_SECTIONS.iter().map(|s| s.title).collect();
+        assert!(titles.contains(&"Navigation"), "got {titles:?}");
+        assert!(titles.contains(&"Display"), "got {titles:?}");
+        assert!(titles.contains(&"Other"), "got {titles:?}");
+        assert!(titles.contains(&"Bookmarks pane"), "got {titles:?}");
+
+        let all: Vec<(&str, &str)> = HELP_SECTIONS
+            .iter()
+            .flat_map(|s| s.items.iter().copied())
+            .collect();
+        assert!(
+            all.iter().any(|(k, _)| *k == "h"),
+            "expected `h` binding in help, got {all:?}",
+        );
+        assert!(
+            all.iter().any(|(k, v)| *k == "d" && v.contains("display")),
+            "expected `d` → display in help, got {all:?}",
+        );
+    }
+
+    #[test]
+    fn render_draws_help_dialog() {
+        // Opening the help popup and rendering one frame should put
+        // the dialog title and the first section's heading and items
+        // on screen.  Use a tall backend so the body isn't truncated
+        // by the popup height clamp.
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.handle_key(key(KeyCode::Char('h')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("Keybindings"), "missing title:\n{dump}");
+        for section in ["Navigation", "Display", "Other", "Bookmarks pane"] {
+            assert!(dump.contains(section), "missing {section}:\n{dump}");
+        }
+        // A representative binding from each of those sections — anchors
+        // the description column so a change to `build_help_lines`
+        // formatting would be caught here.
+        for desc in [
+            "scroll down one line",  // Navigation
+            "display-fields dialog", // Display
+            "show this help",        // Other
+            "delete bookmark",       // Bookmarks pane
+        ] {
+            assert!(
+                dump.contains(desc),
+                "missing description {desc:?}:\n{dump}"
+            );
+        }
     }
 
     // ---------- tabs ----------
@@ -8120,6 +8520,18 @@ mod tests {
     }
 
     #[test]
+    fn bookmarks_tab_h_opens_help() {
+        // The help popup should be reachable from the Bookmarks pane,
+        // not just from regular tabs — `h` is the cross-pane help key.
+        let mut a = select_app(5, 5);
+        create_bookmark(&mut a, 0, None);
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        a.handle_key(key(KeyCode::Char('h')));
+        assert!(matches!(a.dialog, Some(Dialog::Help { .. })));
+    }
+
+    #[test]
     fn bookmarks_tab_ignores_ctrl_w() {
         // Ctrl-W cannot close the synthetic Bookmarks tab.
         let mut a = select_app(5, 5);
@@ -8877,9 +9289,9 @@ mod tests {
     }
 
     #[test]
-    fn h_opens_display_fields_dialog_with_active_opts() {
+    fn d_opens_display_fields_dialog_with_active_opts() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         match &a.dialog {
             Some(Dialog::DisplayFields { draft, cursor }) => {
                 assert_eq!(*cursor, 0);
@@ -8892,7 +9304,7 @@ mod tests {
     #[test]
     fn display_fields_dialog_jk_navigates_with_wrap() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         // j once → cursor 1.
         a.handle_key(key(KeyCode::Char('j')));
         match &a.dialog {
@@ -8925,7 +9337,7 @@ mod tests {
         // BackTab should retreat it like `k` — for users who'd rather
         // use Tab/Shift-Tab than vim keys.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         a.handle_key(key(KeyCode::Tab));
         match &a.dialog {
             Some(Dialog::DisplayFields { cursor, .. }) => {
@@ -8949,7 +9361,7 @@ mod tests {
         // until Enter.  Then Enter applies and the stream picks up
         // Full.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
         a.handle_key(key(KeyCode::Char(' ')));
         match &a.dialog {
@@ -8970,7 +9382,7 @@ mod tests {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
         let before = a.active_stream().render_opts();
         assert!(!before.show_pid, "default is pid hidden");
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::Pid);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
@@ -8981,7 +9393,7 @@ mod tests {
     fn display_fields_dialog_esc_discards_draft() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
         let before = a.active_stream().render_opts();
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameNone);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Esc));
@@ -9004,8 +9416,8 @@ mod tests {
             "expected short hostname (and no pid by default), got \
              {short_line:?}",
         );
-        // h → focus HostnameFull → space → Enter.
-        a.handle_key(key(KeyCode::Char('h')));
+        // d → focus HostnameFull → space → Enter.
+        a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
@@ -9042,7 +9454,7 @@ mod tests {
         a.handle_key(shift('R')); // raw on
         a.handle_key(shift('D')); // date off
         // Dialog handles the rest: pid on, name off, hostname Full.
-        a.handle_key(key(KeyCode::Char('h')));
+        a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::Pid);
         a.handle_key(key(KeyCode::Char(' ')));
         focus_display_field(&mut a, DisplayFieldItem::Name);
