@@ -310,4 +310,3 @@ New tabs should still open with this dialog.
 - hide the line showing parse details by default (some binding should show it again)
   - it should also say "fetched"
   - EOF marker should still be present, maybe with progress marker through the overall stream
-- more editline shortcuts in dialogs: up/down for previous/next line, ^a, ^e

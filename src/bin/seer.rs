@@ -4164,17 +4164,42 @@ impl LineEditor {
                 self.cursor = self.text.len();
                 EditAction::Handled
             }
-            // Readline-style line editing.  ^U kills to BOL, ^W kills
-            // the previous whitespace-delimited word (matching shell
-            // behaviour, so a whole `name=Nexus` token disappears at
-            // once), and Alt-B/Alt-F move by alphanumeric word so the
-            // cursor can step inside a token like `level>=warn`.
+            // Readline-style line editing.  ^A/^E mirror Home/End,
+            // ^U kills to BOL, ^K kills to EOL, ^W kills the previous
+            // whitespace-delimited word (matching shell behaviour, so a
+            // whole `name=Nexus` token disappears at once), and Alt-B/
+            // Alt-F move by alphanumeric word so the cursor can step
+            // inside a token like `level>=warn`.
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.cursor = 0;
+                EditAction::Handled
+            }
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.cursor = self.text.len();
+                EditAction::Handled
+            }
             KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 self.kill_to_start();
+                EditAction::Handled
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                self.kill_to_end();
                 EditAction::Handled
             }
             KeyEvent {
@@ -4222,6 +4247,13 @@ impl LineEditor {
         }
         self.text.replace_range(0..self.cursor, "");
         self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        self.text.truncate(self.cursor);
     }
 
     fn kill_word_backward(&mut self) {
@@ -6140,6 +6172,40 @@ mod tests {
         e.handle_edit(key(KeyCode::Delete));
         assert_eq!(e.text, "bc");
         assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn line_editor_ctrl_a_and_ctrl_e_jump_to_line_ends() {
+        // ^A and ^E mirror Home and End for readline-trained users.
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(ctrl('a'));
+        assert_eq!(e.cursor, 0);
+        e.handle_edit(ctrl('e'));
+        assert_eq!(e.cursor, 3);
+    }
+
+    #[test]
+    fn line_editor_ctrl_k_kills_to_end_of_line() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "level>=warn name=Nexus");
+        // Position cursor at the space between predicates.
+        e.handle_edit(ctrl('a'));
+        for _ in 0.."level>=warn".len() {
+            e.handle_edit(key(KeyCode::Right));
+        }
+        e.handle_edit(ctrl('k'));
+        assert_eq!(e.text, "level>=warn");
+        assert_eq!(e.cursor, "level>=warn".len());
+    }
+
+    #[test]
+    fn line_editor_ctrl_k_at_end_is_noop() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(ctrl('k'));
+        assert_eq!(e.text, "abc");
+        assert_eq!(e.cursor, 3);
     }
 
     #[test]
