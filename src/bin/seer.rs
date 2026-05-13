@@ -27,13 +27,13 @@ use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, Cursor, Direction,
-    Engine, EventIdx, EventPredicate, Filter, Form, HostnameDisplay, LineIdx,
-    LogStream, LogStreamId, MatchKind, Materialized, ParseStats, RenderOpts,
-    Row, SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector, Session,
-    SessionId, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
-    StreamView, SummaryBuilder, TabKind, WindowFillStatus, build_seeit_command,
-    format_summary,
+    Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, CoreField, Cursor,
+    Direction, Engine, EventIdx, EventPredicate, FieldName, Filter, Form,
+    HostnameDisplay, LineIdx, LogStream, LogStreamId, MatchKind, Materialized,
+    ParseStats, RenderOpts, Row, SavePolicy, SearchAnchor, SearchDir,
+    SearchOutcome, Selector, Session, SessionId, SessionMatch, SessionSource,
+    SessionStore, SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
+    WindowFillStatus, build_seeit_command, format_summary,
 };
 #[cfg(test)]
 use seer::{EngineEvent, LogStreamPosition};
@@ -3543,7 +3543,7 @@ impl App {
                     Form::Affirmed
                 };
                 let new_pred = EventPredicate::FieldEquals {
-                    name: "msg".to_string(),
+                    name: FieldName::Core(CoreField::Msg),
                     value: ee.event.msg.clone(),
                     form,
                 }

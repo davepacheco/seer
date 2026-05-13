@@ -124,6 +124,104 @@ impl Form {
     }
 }
 
+/// Name of a field a `field=value` predicate matches against.
+///
+/// Bunyan core fields are typed by [`CoreField`]; anything else lives
+/// in the event's `extra` map and is carried as the raw key string.
+/// The DSL parser converts a token's left-hand side via the
+/// `From<&str>` impl, which routes the known core names into
+/// [`Self::Core`] and everything else into [`Self::Extra`].
+///
+/// Serializes / deserializes as a bare DSL spelling string (`"name"`,
+/// `"hostname"`, `"build"`, ...) via the
+/// `#[serde(into = ..., from = ...)]` round-trip, so the on-disk
+/// form mirrors what a user would type into the filter dialog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(into = "String", from = "String")]
+#[schemars(with = "String")]
+pub enum FieldName {
+    Core(CoreField),
+    Extra(String),
+}
+
+impl From<FieldName> for String {
+    fn from(name: FieldName) -> String {
+        name.to_string()
+    }
+}
+
+/// One of the bunyan log record's structured top-level fields.
+///
+/// Enumerated rather than carried as a string so that
+/// [`crate::source::SourceMetadata::excludes_all`] (and the per-record
+/// [`field_matches`] helper) can match exhaustively — adding a new
+/// core field is a compile error in those methods until threaded
+/// through.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub enum CoreField {
+    Name,
+    Hostname,
+    Pid,
+    Msg,
+    /// Bunyan version field (`v`).  Not usually filtered on but
+    /// modeled for consistency with the other core fields.
+    V,
+}
+
+impl CoreField {
+    /// Returns the DSL spelling for this core field.  Round-trips
+    /// through [`FieldName::from`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoreField::Name => "name",
+            CoreField::Hostname => "hostname",
+            CoreField::Pid => "pid",
+            CoreField::Msg => "msg",
+            CoreField::V => "v",
+        }
+    }
+}
+
+impl fmt::Display for CoreField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for FieldName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldName::Core(c) => c.fmt(f),
+            FieldName::Extra(name) => f.write_str(name),
+        }
+    }
+}
+
+impl From<&str> for FieldName {
+    fn from(s: &str) -> Self {
+        match s {
+            "name" => FieldName::Core(CoreField::Name),
+            "hostname" => FieldName::Core(CoreField::Hostname),
+            "pid" => FieldName::Core(CoreField::Pid),
+            "msg" => FieldName::Core(CoreField::Msg),
+            "v" => FieldName::Core(CoreField::V),
+            other => FieldName::Extra(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for FieldName {
+    fn from(s: String) -> Self {
+        // Going through `&str` keeps the core-name lookup in one
+        // place; the bookkeeping cost of allocating a temporary
+        // `String` for the `Extra` arm is negligible against the
+        // rest of the parse path.
+        FieldName::from(s.as_str())
+    }
+}
+
 /// A single predicate in a [`Filter`].
 ///
 /// Split into two domains so that per-event matching and per-source
@@ -172,9 +270,10 @@ pub enum EventPredicate {
     /// Named field has (or, when `form` is `Negated`, does not have)
     /// the given exact-string value.
     ///
-    /// Matches the bunyan core fields (`name`, `hostname`, `pid`, `msg`)
-    /// or any key in `event.extra`.
-    FieldEquals { name: String, value: String, form: Form },
+    /// `name` is either a typed bunyan core field
+    /// ([`FieldName::Core`]) or a free-form `extra` key
+    /// ([`FieldName::Extra`]).
+    FieldEquals { name: FieldName, value: String, form: Form },
     /// `event.msg` matches (or, when `form` is `Negated`, does not
     /// match) the regex.
     MsgMatches {
@@ -270,21 +369,24 @@ impl SourcePredicate {
     }
 }
 
-fn field_matches(event: &Event, name: &str, value: &str) -> bool {
+fn field_matches(event: &Event, name: &FieldName, value: &str) -> bool {
     match name {
-        "name" => event.name.to_string() == value,
-        "hostname" => event.hostname.to_string() == value,
-        "pid" => event.pid.to_string() == value,
-        "msg" => event.msg == value,
-        // Bunyan version isn't usually filtered, but it's a core field
-        // so handle it consistently.
-        "v" => event.v.to_string() == value,
-        // Anything else is in `extra`.  Strings compare directly; bools
-        // and numbers compare against the obvious lexical form the user
-        // would type after seeing the JSON (`true`/`false`, `1`,
-        // `1.5`); null gets a literal `"null"` shorthand.  Arrays and
-        // objects don't have a useful lexical equality and never match.
-        other => match event.extra.get(other) {
+        FieldName::Core(CoreField::Name) => event.name.to_string() == value,
+        FieldName::Core(CoreField::Hostname) => {
+            event.hostname.to_string() == value
+        }
+        FieldName::Core(CoreField::Pid) => event.pid.to_string() == value,
+        FieldName::Core(CoreField::Msg) => event.msg == value,
+        // Bunyan version isn't usually filtered, but it's a core
+        // field so handle it consistently.
+        FieldName::Core(CoreField::V) => event.v.to_string() == value,
+        // Anything else is in `extra`.  Strings compare directly;
+        // bools and numbers compare against the obvious lexical form
+        // the user would type after seeing the JSON
+        // (`true`/`false`, `1`, `1.5`); null gets a literal `"null"`
+        // shorthand.  Arrays and objects don't have a useful lexical
+        // equality and never match.
+        FieldName::Extra(key) => match event.extra.get(key) {
             Some(serde_json::Value::Null) => value == "null",
             Some(serde_json::Value::String(s)) => s == value,
             Some(serde_json::Value::Bool(b)) => {
@@ -450,7 +552,7 @@ fn field_or_level(
         })
     } else {
         Ok(EventPredicate::FieldEquals {
-            name: lhs.to_string(),
+            name: FieldName::from(lhs),
             value: rhs.to_string(),
             form,
         }
@@ -946,7 +1048,7 @@ mod tests {
                 value,
                 form,
             }) => {
-                assert_eq!(name, "name");
+                assert_eq!(*name, FieldName::Core(CoreField::Name));
                 assert_eq!(value, "Nexus");
                 assert_eq!(*form, Form::Affirmed);
             }
@@ -1071,7 +1173,7 @@ mod tests {
                 value,
                 form,
             }) => {
-                assert_eq!(name, "name");
+                assert_eq!(*name, FieldName::Core(CoreField::Name));
                 assert_eq!(value, "Nexus");
                 assert_eq!(*form, Form::Negated);
             }

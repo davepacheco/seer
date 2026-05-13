@@ -17,7 +17,7 @@
 //! ever opening them for reading.
 
 use crate::event::{Event, Hostname, LoggerName};
-use crate::filter::{EventPredicate, Filter, Predicate};
+use crate::filter::{CoreField, EventPredicate, FieldName, Filter, Predicate};
 use crate::position::{ByteLen, ByteOffset, SourceId};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
@@ -268,16 +268,23 @@ impl SourceMetadata {
             else {
                 continue;
             };
-            let known_value: &str = match name.as_str() {
-                "name" => match &self.name {
+            // Only metadata-backed core fields can prune; everything
+            // else (other core fields, all `Extra` keys) falls through
+            // to the per-record scan.  Exhaustive match keeps a future
+            // addition to `CoreField` from quietly going unhandled.
+            let known_value: &str = match name {
+                FieldName::Core(CoreField::Name) => match &self.name {
                     Some(n) => n.as_ref(),
                     None => continue,
                 },
-                "hostname" => match &self.hostname {
+                FieldName::Core(CoreField::Hostname) => match &self.hostname {
                     Some(h) => h.as_ref(),
                     None => continue,
                 },
-                _ => continue,
+                FieldName::Core(
+                    CoreField::Pid | CoreField::Msg | CoreField::V,
+                )
+                | FieldName::Extra(_) => continue,
             };
             let predicate_passes = form.applied_to(known_value == value);
             if !predicate_passes {

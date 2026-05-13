@@ -26,8 +26,8 @@ pub use engine::{
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{
-    EventPredicate, Filter, FilterParseError, Form, Predicate, SourcePredicate,
-    TimeOp,
+    CoreField, EventPredicate, FieldName, Filter, FilterParseError, Form,
+    Predicate, SourcePredicate, TimeOp,
 };
 pub use position::{ByteLen, ByteOffset, LogStreamPosition, SourceId};
 pub use render::{
