@@ -1229,16 +1229,6 @@ fn compute_matches(rows: &[String], regex: &Regex) -> Vec<usize> {
         .collect()
 }
 
-/// Footer label for [`HostnameDisplay`]: matches the user-facing key
-/// names that show up next to the `H` hint.
-fn hostname_display_label(mode: HostnameDisplay) -> &'static str {
-    match mode {
-        HostnameDisplay::Short => "short",
-        HostnameDisplay::Full => "full",
-        HostnameDisplay::None => "off",
-    }
-}
-
 /// Direction of a `less`-style search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchDirection {
@@ -5248,13 +5238,10 @@ fn render(frame: &mut Frame, app: &mut App) {
                 // footer to avoid teaching the user actions that don't
                 // apply.
                 if total == 0 {
-                    "q quit · h help · f filter · / search · ^T new · \
-                     S summary · ^W close · r rename · 0/0"
-                        .to_string()
+                    "q quit · h help · 0/0".to_string()
                 } else {
                     format!(
-                        "q quit · h help · f filter · / search · ^T new · \
-                         S summary · ^W close · r rename · {}-{} of {}",
+                        "q quit · h help · {}-{} of {}",
                         top + 1,
                         bottom,
                         total,
@@ -5262,34 +5249,20 @@ fn render(frame: &mut Frame, app: &mut App) {
                 }
             } else if total == 0 {
                 format!(
-                    "q quit · h help · f filter · F fields={} · D date={} · \
-                     R raw={} · d host={} · / search · </> step={} · \
+                    "q quit · h help · f filter · F fields={} · \
+                     d display options · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
-                     S summary · ^W close · r rename · 0/0",
+                     S summary · ^W close · r rename",
                     if app.active_stream().show_extras { "on" } else { "off" },
-                    if app.active_stream().show_date { "on" } else { "off" },
-                    if app.active_stream().show_raw { "on" } else { "off" },
-                    hostname_display_label(
-                        app.active_stream().hostname_display
-                    ),
                     app.current_step_label(),
                 )
             } else {
                 format!(
-                    "q quit · h help · f filter · F fields={} · D date={} · \
-                     R raw={} · d host={} · / search · </> step={} · \
-                     x/X exclude/include · b bookmark · ^T new · \
-                     S summary · ^W close · r rename · {}-{} of {}",
+                    "q quit · h help · f filter · F fields={} · \
+                     d display options · </> step={} · \
+                     ^T new · ^W close",
                     if app.active_stream().show_extras { "on" } else { "off" },
-                    if app.active_stream().show_date { "on" } else { "off" },
-                    if app.active_stream().show_raw { "on" } else { "off" },
-                    hostname_display_label(
-                        app.active_stream().hostname_display
-                    ),
                     app.current_step_label(),
-                    top + 1,
-                    bottom,
-                    total,
                 )
             };
             frame.render_widget(Paragraph::new(footer), bottom_area);
@@ -5999,11 +5972,10 @@ mod tests {
 
     #[test]
     fn render_paints_rows_and_footer() {
-        // Wide enough to hold the entire footer including the trailing
-        // dynamic info (step indicator, fields/date/host toggles,
-        // "1-3 of 3" counter) without truncation; the live footer is
-        // sized to be legible at 80 cols even when terminals truncate
-        // it.
+        // Wide enough to hold the entire footer (step indicator,
+        // fields toggle, ^T/^W chips) without truncation; the live
+        // footer is sized to be legible at 80 cols even when terminals
+        // truncate it.
         let backend = TestBackend::new(200, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
@@ -6015,7 +5987,9 @@ mod tests {
         let dump = buffer_text(terminal.backend().buffer());
         assert!(dump.contains("alpha line"), "dump:\n{dump}");
         assert!(dump.contains("gamma line"), "dump:\n{dump}");
-        assert!(dump.contains("1-3 of 3"), "dump:\n{dump}");
+        // The keybindings strip is the populated stream-tab footer;
+        // `h help` is a stable chip that's always present.
+        assert!(dump.contains("h help"), "dump:\n{dump}");
     }
 
     /// When the viewport reaches the last row and no more records can
@@ -6044,7 +6018,6 @@ mod tests {
             dump.contains("(at end of stream)"),
             "expected EOF indicator when viewport reaches last row:\n{dump}",
         );
-        assert!(dump.contains("1-4 of 4"), "dump:\n{dump}");
     }
 
     /// Symmetric to the above: when the viewport doesn't reach the last
@@ -9631,8 +9604,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
-        // Summary footer should still mention quit, filter, search, S.
-        assert!(dump.contains("S summary"), "dump:\n{dump}");
+        // Summary footer should still mention quit and help — the
+        // always-on chips that every footer carries.
+        assert!(dump.contains("q quit"), "dump:\n{dump}");
+        assert!(dump.contains("h help"), "dump:\n{dump}");
         // ...but not the record-oriented bindings.
         assert!(!dump.contains("x/X exclude"), "dump:\n{dump}");
         assert!(!dump.contains("F fields="), "dump:\n{dump}");
