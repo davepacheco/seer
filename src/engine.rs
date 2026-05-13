@@ -24,7 +24,9 @@ use std::collections::VecDeque;
 mod merge;
 
 pub use crate::position::Cursor;
-pub use merge::{FETCH_BATCH_SIZE, MergeError, MergeRecord, Stepper};
+pub use merge::{
+    FETCH_BATCH_SIZE, MergeError, MergeRecord, Stepper, StepperOptions,
+};
 
 /// An [`Event`] paired with the [`LogStreamPosition`] identifying which
 /// source it came from and its position within that source.
@@ -76,28 +78,22 @@ impl Engine {
     /// requires building a fresh stepper, since the source set is
     /// fixed at construction.
     pub fn stepper(&self, filter: Filter, cursor: &Cursor) -> Stepper<'_> {
-        let sources: Vec<&dyn Source> = self
-            .sources
-            .iter()
-            .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| s.as_ref())
-            .collect();
-        Stepper::new(sources, filter, cursor)
+        self.stepper_with(filter, cursor, StepperOptions::default())
     }
 
-    /// Like [`Self::stepper`] but lets the caller override the
-    /// per-fill batch size that the stepper hands to the storage
-    /// layer.  The TUI's long-op driver passes a small value (one
-    /// match per call, paired with a `max_walks_per_fill` budget — see
-    /// [`crate::StreamView::ensure_window_step`]) so each `query`
-    /// walks only a bounded number of records before yielding —
-    /// without it, a single fill under a selective filter can freeze
-    /// the UI for hundreds of milliseconds at a time.
-    pub fn stepper_with_batch(
+    /// Like [`Self::stepper`] but lets the caller customize the
+    /// per-fill batch size and an optional per-fill records-walked
+    /// budget via [`StepperOptions`].  The TUI's long-op driver uses
+    /// this to keep each tick responsive under selective filters
+    /// (one match per call, paired with a `max_walks_per_fill`
+    /// budget — see [`crate::StreamView::ensure_window_step`]).
+    /// Without the budget, a single fill under a selective filter can
+    /// freeze the UI for hundreds of milliseconds at a time.
+    pub fn stepper_with(
         &self,
         filter: Filter,
         cursor: &Cursor,
-        batch_size: usize,
+        options: StepperOptions,
     ) -> Stepper<'_> {
         let sources: Vec<&dyn Source> = self
             .sources
@@ -105,34 +101,7 @@ impl Engine {
             .filter(|s| filter.matches_source_id(s.id()))
             .map(|s| s.as_ref())
             .collect();
-        Stepper::with_batch_size(sources, filter, cursor, batch_size)
-    }
-
-    /// Like [`Self::stepper_with_batch`] but also lets the caller
-    /// impose a per-fill records-walked budget.  The long-op driver
-    /// uses this to cap the wall time spent inside a single
-    /// `stepper.step` call under selective filters that have to walk
-    /// many on-disk records per match.
-    pub fn stepper_with_bounds(
-        &self,
-        filter: Filter,
-        cursor: &Cursor,
-        batch_size: usize,
-        max_walks_per_fill: usize,
-    ) -> Stepper<'_> {
-        let sources: Vec<&dyn Source> = self
-            .sources
-            .iter()
-            .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| s.as_ref())
-            .collect();
-        Stepper::with_bounds(
-            sources,
-            filter,
-            cursor,
-            batch_size,
-            Some(max_walks_per_fill),
-        )
+        Stepper::with_options(sources, filter, cursor, options)
     }
 
     /// Sum of `byte_len()` over every source whose id is accepted by

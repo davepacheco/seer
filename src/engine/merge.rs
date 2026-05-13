@@ -331,6 +331,33 @@ impl<'a> SourceWindow<'a> {
     }
 }
 
+/// Optional knobs for [`Stepper`] construction.
+///
+/// The default value (used by [`super::Engine::stepper`] and
+/// [`Stepper::new`]) matches every common navigation path: the storage
+/// layer's [`FETCH_BATCH_SIZE`] batch, no per-fill walks budget.
+/// The TUI's long-op driver passes a customized value through
+/// [`super::Engine::stepper_with`] to bound the wall time per
+/// `stepper.step` call under selective filters.
+#[derive(Debug, Clone)]
+pub struct StepperOptions {
+    /// Per-fill batch size handed to the storage layer's `query`.
+    /// Defaults to [`FETCH_BATCH_SIZE`].
+    pub batch_size: usize,
+    /// When `Some(n)`, each per-source fill examines at most `n`
+    /// records (matching *or* filter-rejected) before returning.  The
+    /// long-op driver passes a small value here so each `step` call
+    /// yields after a bounded amount of walking even when the filter
+    /// rejects almost everything.
+    pub max_walks_per_fill: Option<usize>,
+}
+
+impl Default for StepperOptions {
+    fn default() -> Self {
+        Self { batch_size: FETCH_BATCH_SIZE, max_walks_per_fill: None }
+    }
+}
+
 /// Forward/backward k-way merge over the engine's sources with per-source
 /// lookahead and lookbehind buffers.
 ///
@@ -358,38 +385,26 @@ pub struct Stepper<'a> {
 }
 
 impl<'a> Stepper<'a> {
-    /// Internal constructor.  Public callers go through
-    /// [`super::Engine::stepper`].
+    /// Internal constructor with default [`StepperOptions`].  Public
+    /// callers go through [`super::Engine::stepper`].
     pub(super) fn new(
         sources: Vec<&'a dyn Source>,
         filter: Filter,
         cursor: &Cursor,
     ) -> Self {
-        Self::with_bounds(sources, filter, cursor, FETCH_BATCH_SIZE, None)
+        Self::with_options(sources, filter, cursor, StepperOptions::default())
     }
 
-    /// Internal constructor that lets the caller override the per-fill
-    /// batch size.  Public callers go through
-    /// [`super::Engine::stepper_with_batch`].
-    pub(super) fn with_batch_size(
+    /// Internal constructor that lets the caller customize the
+    /// per-fill batch size and walks budget.  Public callers go
+    /// through [`super::Engine::stepper_with`].
+    pub(super) fn with_options(
         sources: Vec<&'a dyn Source>,
         filter: Filter,
         cursor: &Cursor,
-        batch_size: usize,
+        options: StepperOptions,
     ) -> Self {
-        Self::with_bounds(sources, filter, cursor, batch_size, None)
-    }
-
-    /// Internal constructor that lets the caller override both the
-    /// per-fill batch size and a per-fill walks budget.  Public
-    /// callers go through [`super::Engine::stepper_with_bounds`].
-    pub(super) fn with_bounds(
-        sources: Vec<&'a dyn Source>,
-        filter: Filter,
-        cursor: &Cursor,
-        batch_size: usize,
-        max_walks_per_fill: Option<usize>,
-    ) -> Self {
+        let StepperOptions { batch_size, max_walks_per_fill } = options;
         let windows = sources
             .into_iter()
             .map(|s| {

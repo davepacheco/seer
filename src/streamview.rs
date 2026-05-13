@@ -23,7 +23,9 @@
 //! full-pass model since their output is bounded by the histogram
 //! shape, not by the file size.
 
-use crate::engine::{Cursor, Engine, FETCH_BATCH_SIZE, MergeRecord};
+use crate::engine::{
+    Cursor, Engine, FETCH_BATCH_SIZE, MergeRecord, StepperOptions,
+};
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::render::{RenderOpts, format_event};
@@ -847,11 +849,13 @@ impl StreamView {
             return 0;
         }
         let started = Instant::now();
-        let mut stepper = engine.stepper_with_bounds(
+        let mut stepper = engine.stepper_with(
             self.filter.clone(),
             &self.back_cursor,
-            batch_size,
-            max_walks_per_fill,
+            StepperOptions {
+                batch_size,
+                max_walks_per_fill: Some(max_walks_per_fill),
+            },
         );
         let mut fetched = 0;
         let mut bytes = ByteLen::ZERO;
@@ -903,11 +907,13 @@ impl StreamView {
             return 0;
         }
         let started = Instant::now();
-        let mut stepper = engine.stepper_with_bounds(
+        let mut stepper = engine.stepper_with(
             self.filter.clone(),
             &self.front_cursor,
-            batch_size,
-            max_walks_per_fill,
+            StepperOptions {
+                batch_size,
+                max_walks_per_fill: Some(max_walks_per_fill),
+            },
         );
         let mut fetched = 0;
         let mut bytes = ByteLen::ZERO;
@@ -949,10 +955,10 @@ impl StreamView {
             return 0;
         }
         let started = Instant::now();
-        let mut stepper = engine.stepper_with_batch(
+        let mut stepper = engine.stepper_with(
             self.filter.clone(),
             &self.front_cursor,
-            stepper_batch,
+            StepperOptions { batch_size: stepper_batch, ..Default::default() },
         );
         let mut fetched = 0;
         let mut bytes = ByteLen::ZERO;
