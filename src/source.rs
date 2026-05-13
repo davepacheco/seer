@@ -329,8 +329,7 @@ impl SourceMetadata {
     /// the per-record scan.
     pub fn excludes_all(&self, filter: &Filter) -> bool {
         for predicate in filter.predicates() {
-            let Predicate::FieldEquals { name, value, negated } = predicate
-            else {
+            let Predicate::FieldEquals { name, value, form } = predicate else {
                 continue;
             };
             let known_value: &str = match name.as_str() {
@@ -344,7 +343,7 @@ impl SourceMetadata {
                 },
                 _ => continue,
             };
-            let predicate_passes = (known_value == value) ^ *negated;
+            let predicate_passes = form.applied_to(known_value == value);
             if !predicate_passes {
                 return true;
             }

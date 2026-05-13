@@ -38,7 +38,7 @@ use uuid::Uuid;
 /// shape of a [`Session`] changes — the `schemars`-derived schema
 /// fixture test will fail and prompt the author to refresh both
 /// this constant and the checked-in fixture.
-pub const CURRENT_SESSION_VERSION: u32 = 4;
+pub const CURRENT_SESSION_VERSION: u32 = 5;
 
 /// Short, user-typeable session id.
 ///

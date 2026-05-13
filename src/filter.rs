@@ -89,44 +89,65 @@ impl Filter {
     }
 }
 
+/// Whether a predicate is satisfied when its underlying condition
+/// holds (the affirmed form, e.g. `name=Nexus`) or when it doesn't
+/// (the negated form, e.g. `name!=Nexus`).  Replaces a bare `bool` so
+/// every match site has to enumerate both variants and the DSL parser
+/// no longer has `/* negated = */ false` comments at each call.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
+pub enum Form {
+    /// The predicate accepts events for which the condition is true
+    /// (e.g. `name=Nexus`, `msg=~"oh no"`).
+    Affirmed,
+    /// The predicate accepts events for which the condition is false
+    /// (e.g. `name!=Nexus`, `msg!~"oh no"`).
+    Negated,
+}
+
+impl Form {
+    /// Combines a raw condition outcome with this form: `Affirmed`
+    /// returns it as-is; `Negated` inverts it.  Used by every match
+    /// site that previously XOR'd a `negated` bool with the
+    /// condition.
+    pub fn applied_to(self, condition: bool) -> bool {
+        match self {
+            Form::Affirmed => condition,
+            Form::Negated => !condition,
+        }
+    }
+}
+
 /// A single predicate over an [`Event`].
 ///
-/// The equality and regex variants carry a `negated` flag so that
+/// The equality and regex variants carry a [`Form`] so that
 /// `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`)
-/// are the same variant differing only in polarity.  `LevelAtLeast` has
+/// are the same variant differing only in form.  `LevelAtLeast` has
 /// no useful negation (the user can write `level>=` at the threshold
 /// they want), so it is left as a single variant.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Predicate {
     /// `event.level >= threshold`
     LevelAtLeast(Level),
-    /// `event.level == level` (or `!=` when `negated`)
-    LevelEquals {
-        level: Level,
-        #[serde(default)]
-        negated: bool,
-    },
-    /// Named field has (or, when `negated`, does not have) the given
-    /// exact-string value.
+    /// `event.level == level` (or `!=` when `form` is `Negated`)
+    LevelEquals { level: Level, form: Form },
+    /// Named field has (or, when `form` is `Negated`, does not have)
+    /// the given exact-string value.
     ///
     /// Matches the bunyan core fields (`name`, `hostname`, `pid`, `msg`)
     /// or any key in `event.extra`.
-    FieldEquals {
-        name: String,
-        value: String,
-        #[serde(default)]
-        negated: bool,
-    },
-    /// `event.msg` matches (or, when `negated`, does not match) the regex.
+    FieldEquals { name: String, value: String, form: Form },
+    /// `event.msg` matches (or, when `form` is `Negated`, does not
+    /// match) the regex.
     MsgMatches {
         #[serde(with = "regex_serde")]
         #[schemars(with = "String")]
         regex: Regex,
-        #[serde(default)]
-        negated: bool,
+        form: Form,
     },
     /// The source the event came from has an id that matches (or, when
-    /// `negated`, does not match) the regex.  Evaluated against
+    /// `form` is `Negated`, does not match) the regex.  Evaluated against
     /// [`crate::source::SourceId`] at source-selection time, not against
     /// the event itself; the engine skips entire sources whose ids fail
     /// rather than iterating their contents.
@@ -134,12 +155,11 @@ pub enum Predicate {
         #[serde(with = "regex_serde")]
         #[schemars(with = "String")]
         regex: Regex,
-        #[serde(default)]
-        negated: bool,
+        form: Form,
     },
     /// `event.time` compared against `value` using `op`.  Negation is
     /// expressed by flipping the operator (e.g. `!(time >= X)` is
-    /// `time < X`), so there is no separate `negated` flag.
+    /// `time < X`), so there is no separate [`Form`].
     TimeBound { op: TimeOp, value: DateTime<Utc> },
 }
 
@@ -174,14 +194,14 @@ impl Predicate {
     pub fn matches(&self, event: &Event) -> bool {
         match self {
             Self::LevelAtLeast(threshold) => event.level >= *threshold,
-            Self::LevelEquals { level, negated } => {
-                (event.level == *level) ^ *negated
+            Self::LevelEquals { level, form } => {
+                form.applied_to(event.level == *level)
             }
-            Self::FieldEquals { name, value, negated } => {
-                field_matches(event, name, value) ^ *negated
+            Self::FieldEquals { name, value, form } => {
+                form.applied_to(field_matches(event, name, value))
             }
-            Self::MsgMatches { regex, negated } => {
-                regex.is_match(&event.msg) ^ *negated
+            Self::MsgMatches { regex, form } => {
+                form.applied_to(regex.is_match(&event.msg))
             }
             // Source-id is not carried on the bare event; the engine
             // filters whole sources before iterating them, so a source
@@ -205,8 +225,8 @@ impl Predicate {
     /// can return `false`.
     pub fn matches_source_id(&self, source_id: &SourceId) -> bool {
         match self {
-            Self::SourceIdMatches { regex, negated } => {
-                regex.is_match(source_id.as_ref()) ^ *negated
+            Self::SourceIdMatches { regex, form } => {
+                form.applied_to(regex.is_match(source_id.as_ref()))
             }
             Self::LevelAtLeast(_)
             | Self::LevelEquals { .. }
@@ -286,12 +306,10 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
     // `>=`, and `<=` likewise; bare `>` and `<` come after their `=`-
     // suffixed forms.
     if let Some((lhs, rhs)) = tok.split_once("=~") {
-        return parse_regex_predicate(
-            tok, lhs, rhs, /* negated = */ false,
-        );
+        return parse_regex_predicate(tok, lhs, rhs, Form::Affirmed);
     }
     if let Some((lhs, rhs)) = tok.split_once("!~") {
-        return parse_regex_predicate(tok, lhs, rhs, /* negated = */ true);
+        return parse_regex_predicate(tok, lhs, rhs, Form::Negated);
     }
     if let Some((lhs, rhs)) = tok.split_once(">=") {
         require_nonempty_name(tok, lhs)?;
@@ -306,10 +324,10 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
         return parse_time_compare(lhs, rhs, TimeOp::AtMost);
     }
     if let Some((lhs, rhs)) = tok.split_once("==") {
-        return field_or_level(tok, lhs, rhs, /* negated = */ false);
+        return field_or_level(tok, lhs, rhs, Form::Affirmed);
     }
     if let Some((lhs, rhs)) = tok.split_once("!=") {
-        return field_or_level(tok, lhs, rhs, /* negated = */ true);
+        return field_or_level(tok, lhs, rhs, Form::Negated);
     }
     if let Some((lhs, rhs)) = tok.split_once('>') {
         require_nonempty_name(tok, lhs)?;
@@ -320,7 +338,7 @@ fn parse_predicate(tok: &str) -> Result<Predicate, FilterParseError> {
         return parse_time_compare(lhs, rhs, TimeOp::Before);
     }
     if let Some((lhs, rhs)) = tok.split_once('=') {
-        return field_or_level(tok, lhs, rhs, /* negated = */ false);
+        return field_or_level(tok, lhs, rhs, Form::Affirmed);
     }
     Err(FilterParseError::NoOperator { token: tok.to_string() })
 }
@@ -353,17 +371,21 @@ fn parse_regex_predicate(
     tok: &str,
     lhs: &str,
     rhs: &str,
-    negated: bool,
+    form: Form,
 ) -> Result<Predicate, FilterParseError> {
     require_nonempty_name(tok, lhs)?;
     let regex = Regex::new(rhs)
         .map_err(|e| FilterParseError::BadRegex(e.to_string()))?;
     match lhs {
-        "msg" => Ok(Predicate::MsgMatches { regex, negated }),
-        "source_id" => Ok(Predicate::SourceIdMatches { regex, negated }),
+        "msg" => Ok(Predicate::MsgMatches { regex, form }),
+        "source_id" => Ok(Predicate::SourceIdMatches { regex, form }),
         _ => Err(FilterParseError::UnsupportedFieldOp {
             name: lhs.to_string(),
-            op: if negated { "!~" } else { "=~" }.to_string(),
+            op: match form {
+                Form::Affirmed => "=~",
+                Form::Negated => "!~",
+            }
+            .to_string(),
         }),
     }
 }
@@ -372,11 +394,11 @@ fn field_or_level(
     tok: &str,
     lhs: &str,
     rhs: &str,
-    negated: bool,
+    form: Form,
 ) -> Result<Predicate, FilterParseError> {
     require_nonempty_name(tok, lhs)?;
     if lhs == "level" {
-        Ok(Predicate::LevelEquals { level: parse_level(rhs)?, negated })
+        Ok(Predicate::LevelEquals { level: parse_level(rhs)?, form })
     } else if lhs == "source_id" {
         // Source ids only support regex; equality of canonical paths
         // is rarely what you want, and silently routing the token to
@@ -384,13 +406,17 @@ fn field_or_level(
         // match.  Fail loudly with a hint at the supported operator.
         Err(FilterParseError::UnsupportedFieldOp {
             name: lhs.to_string(),
-            op: if negated { "!=" } else { "=" }.to_string(),
+            op: match form {
+                Form::Affirmed => "=",
+                Form::Negated => "!=",
+            }
+            .to_string(),
         })
     } else {
         Ok(Predicate::FieldEquals {
             name: lhs.to_string(),
             value: rhs.to_string(),
-            negated,
+            form,
         })
     }
 }
@@ -435,20 +461,32 @@ impl fmt::Display for Predicate {
             Self::LevelAtLeast(l) => {
                 write!(f, "level>={}", level_token(*l))
             }
-            Self::LevelEquals { level, negated } => {
-                let op = if *negated { "!=" } else { "=" };
+            Self::LevelEquals { level, form } => {
+                let op = match form {
+                    Form::Affirmed => "=",
+                    Form::Negated => "!=",
+                };
                 write!(f, "level{}{}", op, level_token(*level))
             }
-            Self::FieldEquals { name, value, negated } => {
-                let op = if *negated { "!=" } else { "=" };
+            Self::FieldEquals { name, value, form } => {
+                let op = match form {
+                    Form::Affirmed => "=",
+                    Form::Negated => "!=",
+                };
                 write!(f, "{}{}{}", name, op, quote(value))
             }
-            Self::MsgMatches { regex, negated } => {
-                let op = if *negated { "!~" } else { "=~" };
+            Self::MsgMatches { regex, form } => {
+                let op = match form {
+                    Form::Affirmed => "=~",
+                    Form::Negated => "!~",
+                };
                 write!(f, "msg{}{}", op, quote(regex.as_str()))
             }
-            Self::SourceIdMatches { regex, negated } => {
-                let op = if *negated { "!~" } else { "=~" };
+            Self::SourceIdMatches { regex, form } => {
+                let op = match form {
+                    Form::Affirmed => "=~",
+                    Form::Negated => "!~",
+                };
                 write!(f, "source_id{}{}", op, quote(regex.as_str()))
             }
             Self::TimeBound { op, value } => {
@@ -558,12 +596,15 @@ mod tests {
     fn level_equals_only_exact() {
         let e = base_event(); // info
         assert!(
-            Predicate::LevelEquals { level: Level::Info, negated: false }
+            Predicate::LevelEquals { level: Level::Info, form: Form::Affirmed }
                 .matches(&e)
         );
         assert!(
-            !Predicate::LevelEquals { level: Level::Warn, negated: false }
-                .matches(&e)
+            !Predicate::LevelEquals {
+                level: Level::Warn,
+                form: Form::Affirmed
+            }
+            .matches(&e)
         );
     }
 
@@ -574,7 +615,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "name".into(),
                 value: "Nexus".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -582,7 +623,7 @@ mod tests {
             !Predicate::FieldEquals {
                 name: "name".into(),
                 value: "SledAgent".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -590,7 +631,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "hostname".into(),
                 value: "sled-01".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -598,7 +639,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "pid".into(),
                 value: "1234".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -611,7 +652,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "component".into(),
                 value: "nexus".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -619,7 +660,7 @@ mod tests {
             !Predicate::FieldEquals {
                 name: "component".into(),
                 value: "sled-agent".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -650,7 +691,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: name.into(),
                 value: value.into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         };
@@ -694,7 +735,7 @@ mod tests {
                 !Predicate::FieldEquals {
                     name: "tags".into(),
                     value: value.into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 }
                 .matches(&e),
                 "tags should not match {value:?}",
@@ -705,7 +746,7 @@ mod tests {
                 !Predicate::FieldEquals {
                     name: "context".into(),
                     value: value.into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 }
                 .matches(&e),
                 "context should not match {value:?}",
@@ -720,7 +761,7 @@ mod tests {
             !Predicate::FieldEquals {
                 name: "nope".into(),
                 value: "anything".into(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -732,21 +773,21 @@ mod tests {
         assert!(
             Predicate::MsgMatches {
                 regex: Regex::new("blueprint").unwrap(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
         assert!(
             Predicate::MsgMatches {
                 regex: Regex::new("^blueprint exec").unwrap(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
         assert!(
             !Predicate::MsgMatches {
                 regex: Regex::new("nope").unwrap(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -767,7 +808,7 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
             ],
         };
@@ -779,7 +820,7 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Other".into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
             ],
         };
@@ -819,7 +860,10 @@ mod tests {
             let f = parse(src);
             assert!(matches!(
                 f.predicates()[0],
-                Predicate::LevelEquals { level: Level::Error, negated: false },
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    form: Form::Affirmed
+                },
             ));
         }
     }
@@ -839,10 +883,10 @@ mod tests {
     fn parse_field_equals() {
         let f = parse("name=Nexus");
         match &f.predicates()[0] {
-            Predicate::FieldEquals { name, value, negated } => {
+            Predicate::FieldEquals { name, value, form } => {
                 assert_eq!(name, "name");
                 assert_eq!(value, "Nexus");
-                assert!(!negated);
+                assert_eq!(*form, Form::Affirmed);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -852,9 +896,9 @@ mod tests {
     fn parse_msg_regex() {
         let f = parse("msg=~oh.*no");
         match &f.predicates()[0] {
-            Predicate::MsgMatches { regex, negated } => {
+            Predicate::MsgMatches { regex, form } => {
                 assert_eq!(regex.as_str(), "oh.*no");
-                assert!(!negated);
+                assert_eq!(*form, Form::Affirmed);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -864,9 +908,9 @@ mod tests {
     fn parse_quoted_value_preserves_spaces() {
         let f = parse(r#"msg=~"oh no""#);
         match &f.predicates()[0] {
-            Predicate::MsgMatches { regex, negated } => {
+            Predicate::MsgMatches { regex, form } => {
                 assert_eq!(regex.as_str(), "oh no");
-                assert!(!negated);
+                assert_eq!(*form, Form::Affirmed);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -884,11 +928,11 @@ mod tests {
     fn level_equals_negated_inverts() {
         let e = base_event(); // info
         assert!(
-            !Predicate::LevelEquals { level: Level::Info, negated: true }
+            !Predicate::LevelEquals { level: Level::Info, form: Form::Negated }
                 .matches(&e)
         );
         assert!(
-            Predicate::LevelEquals { level: Level::Warn, negated: true }
+            Predicate::LevelEquals { level: Level::Warn, form: Form::Negated }
                 .matches(&e)
         );
     }
@@ -900,7 +944,7 @@ mod tests {
             !Predicate::FieldEquals {
                 name: "name".into(),
                 value: "Nexus".into(),
-                negated: true,
+                form: Form::Negated,
             }
             .matches(&e)
         );
@@ -908,7 +952,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "name".into(),
                 value: "Other".into(),
-                negated: true,
+                form: Form::Negated,
             }
             .matches(&e)
         );
@@ -925,7 +969,7 @@ mod tests {
             Predicate::FieldEquals {
                 name: "nope".into(),
                 value: "anything".into(),
-                negated: true,
+                form: Form::Negated,
             }
             .matches(&e)
         );
@@ -937,14 +981,14 @@ mod tests {
         assert!(
             !Predicate::MsgMatches {
                 regex: Regex::new("blueprint").unwrap(),
-                negated: true,
+                form: Form::Negated,
             }
             .matches(&e)
         );
         assert!(
             Predicate::MsgMatches {
                 regex: Regex::new("nope").unwrap(),
-                negated: true,
+                form: Form::Negated,
             }
             .matches(&e)
         );
@@ -954,10 +998,10 @@ mod tests {
     fn parse_field_not_equals() {
         let f = parse("name!=Nexus");
         match &f.predicates()[0] {
-            Predicate::FieldEquals { name, value, negated } => {
+            Predicate::FieldEquals { name, value, form } => {
                 assert_eq!(name, "name");
                 assert_eq!(value, "Nexus");
-                assert!(negated);
+                assert_eq!(*form, Form::Negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -967,9 +1011,9 @@ mod tests {
     fn parse_level_not_equals() {
         let f = parse("level!=warn");
         match &f.predicates()[0] {
-            Predicate::LevelEquals { level, negated } => {
+            Predicate::LevelEquals { level, form } => {
                 assert_eq!(*level, Level::Warn);
-                assert!(negated);
+                assert_eq!(*form, Form::Negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -979,9 +1023,9 @@ mod tests {
     fn parse_msg_not_matches() {
         let f = parse("msg!~oh.*no");
         match &f.predicates()[0] {
-            Predicate::MsgMatches { regex, negated } => {
+            Predicate::MsgMatches { regex, form } => {
                 assert_eq!(regex.as_str(), "oh.*no");
-                assert!(negated);
+                assert_eq!(*form, Form::Negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1001,15 +1045,18 @@ mod tests {
     fn display_negated_forms() {
         let f = Filter {
             predicates: vec![
-                Predicate::LevelEquals { level: Level::Error, negated: true },
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    form: Form::Negated,
+                },
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
-                    negated: true,
+                    form: Form::Negated,
                 },
                 Predicate::MsgMatches {
                     regex: Regex::new("foo.*").unwrap(),
-                    negated: true,
+                    form: Form::Negated,
                 },
             ],
         };
@@ -1028,33 +1075,6 @@ mod tests {
                 reparsed.to_string(),
                 "round-trip drifted for {src:?}",
             );
-        }
-    }
-
-    #[test]
-    fn serde_payload_without_negated_field_defaults_false() {
-        // `#[serde(default)]` lets payloads omit `negated`; it reads as
-        // false.  Useful so a future predicate-schema bump that adds
-        // another flag can be made backward-compatible the same way.
-        let json = r#"{
-            "predicates": [
-                { "FieldEquals": { "name": "name", "value": "Nexus" } },
-                { "MsgMatches": { "regex": "boom" } },
-                { "LevelEquals": { "level": 40 } }
-            ]
-        }"#;
-        let f: Filter = serde_json::from_str(json).unwrap();
-        match &f.predicates()[0] {
-            Predicate::FieldEquals { negated, .. } => assert!(!negated),
-            other => panic!("unexpected: {other:?}"),
-        }
-        match &f.predicates()[1] {
-            Predicate::MsgMatches { negated, .. } => assert!(!negated),
-            other => panic!("unexpected: {other:?}"),
-        }
-        match &f.predicates()[2] {
-            Predicate::LevelEquals { negated, .. } => assert!(!negated),
-            other => panic!("unexpected: {other:?}"),
         }
     }
 
@@ -1113,15 +1133,18 @@ mod tests {
         let f = Filter {
             predicates: vec![
                 Predicate::LevelAtLeast(Level::Warn),
-                Predicate::LevelEquals { level: Level::Error, negated: false },
+                Predicate::LevelEquals {
+                    level: Level::Error,
+                    form: Form::Affirmed,
+                },
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
                 Predicate::MsgMatches {
                     regex: Regex::new("foo.*").unwrap(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
             ],
         };
@@ -1137,7 +1160,7 @@ mod tests {
             predicates: vec![Predicate::FieldEquals {
                 name: "msg".into(),
                 value: "oh no".into(),
-                negated: false,
+                form: Form::Affirmed,
             }],
         };
         // Some shlex versions emit single quotes, some emit double; we
@@ -1191,9 +1214,9 @@ mod tests {
     fn parse_source_id_regex() {
         let f = parse("source_id=~nexus");
         match &f.predicates()[0] {
-            Predicate::SourceIdMatches { regex, negated } => {
+            Predicate::SourceIdMatches { regex, form } => {
                 assert_eq!(regex.as_str(), "nexus");
-                assert!(!negated);
+                assert_eq!(*form, Form::Affirmed);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1203,9 +1226,9 @@ mod tests {
     fn parse_source_id_negated_regex() {
         let f = parse("source_id!~debug");
         match &f.predicates()[0] {
-            Predicate::SourceIdMatches { regex, negated } => {
+            Predicate::SourceIdMatches { regex, form } => {
                 assert_eq!(regex.as_str(), "debug");
-                assert!(negated);
+                assert_eq!(*form, Form::Negated);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1230,7 +1253,7 @@ mod tests {
     fn source_id_matches_against_canonical_path() {
         let p = Predicate::SourceIdMatches {
             regex: Regex::new("nexus").unwrap(),
-            negated: false,
+            form: Form::Affirmed,
         };
         assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
         assert!(!p.matches_source_id(&sid("/var/log/sled-agent.log")));
@@ -1240,7 +1263,7 @@ mod tests {
     fn source_id_negated_inverts() {
         let p = Predicate::SourceIdMatches {
             regex: Regex::new("debug").unwrap(),
-            negated: true,
+            form: Form::Negated,
         };
         assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
         assert!(!p.matches_source_id(&sid("/var/log/debug.log")));
@@ -1255,7 +1278,7 @@ mod tests {
         assert!(
             Predicate::SourceIdMatches {
                 regex: Regex::new("nope").unwrap(),
-                negated: false,
+                form: Form::Affirmed,
             }
             .matches(&e)
         );
@@ -1453,11 +1476,11 @@ mod tests {
                 Predicate::FieldEquals {
                     name: "name".into(),
                     value: "Nexus".into(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
                 Predicate::MsgMatches {
                     regex: Regex::new("boom").unwrap(),
-                    negated: false,
+                    form: Form::Affirmed,
                 },
             ],
         };

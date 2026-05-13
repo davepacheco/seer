@@ -141,6 +141,25 @@
         }
       }
     },
+    "Form": {
+      "description": "Whether a predicate is satisfied when its underlying condition holds (the affirmed form, e.g. `name=Nexus`) or when it doesn't (the negated form, e.g. `name!=Nexus`).  Replaces a bare `bool` so every match site has to enumerate both variants and the DSL parser no longer has `/* negated = */ false` comments at each call.",
+      "oneOf": [
+        {
+          "description": "The predicate accepts events for which the condition is true (e.g. `name=Nexus`, `msg=~\"oh no\"`).",
+          "type": "string",
+          "enum": [
+            "Affirmed"
+          ]
+        },
+        {
+          "description": "The predicate accepts events for which the condition is false (e.g. `name!=Nexus`, `msg!~\"oh no\"`).",
+          "type": "string",
+          "enum": [
+            "Negated"
+          ]
+        }
+      ]
+    },
     "HostnameDisplay": {
       "description": "How [`format_event`] should render the bunyan `hostname` field.\n\nSelected via the `h` field-display dialog in the TUI and persisted on the host [`crate::stream::LogStream`] so the choice outlives a session.",
       "oneOf": [
@@ -240,7 +259,7 @@
       }
     },
     "Predicate": {
-      "description": "A single predicate over an [`Event`].\n\nThe equality and regex variants carry a `negated` flag so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in polarity.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
+      "description": "A single predicate over an [`Event`].\n\nThe equality and regex variants carry a [`Form`] so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in form.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
       "oneOf": [
         {
           "description": "`event.level >= threshold`",
@@ -256,7 +275,7 @@
           "additionalProperties": false
         },
         {
-          "description": "`event.level == level` (or `!=` when `negated`)",
+          "description": "`event.level == level` (or `!=` when `form` is `Negated`)",
           "type": "object",
           "required": [
             "LevelEquals"
@@ -265,15 +284,15 @@
             "LevelEquals": {
               "type": "object",
               "required": [
+                "form",
                 "level"
               ],
               "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
                 "level": {
                   "$ref": "#/definitions/Level"
-                },
-                "negated": {
-                  "default": false,
-                  "type": "boolean"
                 }
               }
             }
@@ -281,7 +300,7 @@
           "additionalProperties": false
         },
         {
-          "description": "Named field has (or, when `negated`, does not have) the given exact-string value.\n\nMatches the bunyan core fields (`name`, `hostname`, `pid`, `msg`) or any key in `event.extra`.",
+          "description": "Named field has (or, when `form` is `Negated`, does not have) the given exact-string value.\n\nMatches the bunyan core fields (`name`, `hostname`, `pid`, `msg`) or any key in `event.extra`.",
           "type": "object",
           "required": [
             "FieldEquals"
@@ -290,16 +309,16 @@
             "FieldEquals": {
               "type": "object",
               "required": [
+                "form",
                 "name",
                 "value"
               ],
               "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
                 "name": {
                   "type": "string"
-                },
-                "negated": {
-                  "default": false,
-                  "type": "boolean"
                 },
                 "value": {
                   "type": "string"
@@ -310,7 +329,7 @@
           "additionalProperties": false
         },
         {
-          "description": "`event.msg` matches (or, when `negated`, does not match) the regex.",
+          "description": "`event.msg` matches (or, when `form` is `Negated`, does not match) the regex.",
           "type": "object",
           "required": [
             "MsgMatches"
@@ -319,12 +338,12 @@
             "MsgMatches": {
               "type": "object",
               "required": [
+                "form",
                 "regex"
               ],
               "properties": {
-                "negated": {
-                  "default": false,
-                  "type": "boolean"
+                "form": {
+                  "$ref": "#/definitions/Form"
                 },
                 "regex": {
                   "type": "string"
@@ -335,7 +354,7 @@
           "additionalProperties": false
         },
         {
-          "description": "The source the event came from has an id that matches (or, when `negated`, does not match) the regex.  Evaluated against [`crate::source::SourceId`] at source-selection time, not against the event itself; the engine skips entire sources whose ids fail rather than iterating their contents.",
+          "description": "The source the event came from has an id that matches (or, when `form` is `Negated`, does not match) the regex.  Evaluated against [`crate::source::SourceId`] at source-selection time, not against the event itself; the engine skips entire sources whose ids fail rather than iterating their contents.",
           "type": "object",
           "required": [
             "SourceIdMatches"
@@ -344,12 +363,12 @@
             "SourceIdMatches": {
               "type": "object",
               "required": [
+                "form",
                 "regex"
               ],
               "properties": {
-                "negated": {
-                  "default": false,
-                  "type": "boolean"
+                "form": {
+                  "$ref": "#/definitions/Form"
                 },
                 "regex": {
                   "type": "string"
@@ -360,7 +379,7 @@
           "additionalProperties": false
         },
         {
-          "description": "`event.time` compared against `value` using `op`.  Negation is expressed by flipping the operator (e.g. `!(time >= X)` is `time < X`), so there is no separate `negated` flag.",
+          "description": "`event.time` compared against `value` using `op`.  Negation is expressed by flipping the operator (e.g. `!(time >= X)` is `time < X`), so there is no separate [`Form`].",
           "type": "object",
           "required": [
             "TimeBound"

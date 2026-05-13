@@ -24,7 +24,7 @@ pub use engine::{
     Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
-pub use filter::{Filter, FilterParseError, Predicate, TimeOp};
+pub use filter::{Filter, FilterParseError, Form, Predicate, TimeOp};
 pub use render::{
     HostnameDisplay, RenderOpts, format_event, format_time, short_hostname,
 };

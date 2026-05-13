@@ -28,7 +28,7 @@ use regex::Regex;
 use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
-    Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
+    Filter, Form, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
     MatchKind, ParseStats, Predicate, RenderOpts, SavePolicy, SearchDir,
     SearchOutcome, Selector, Session, SessionId, SessionMatch, SessionSource,
     SessionStore, SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
@@ -3542,11 +3542,17 @@ impl App {
         };
         match sel.action {
             SelectionAction::Exclude | SelectionAction::Include => {
-                let negated = matches!(sel.action, SelectionAction::Exclude);
+                // Outer arm guarantees `sel.action` is one of these two;
+                // `Exclude` → `Form::Negated`, `Include` → `Form::Affirmed`.
+                let form = if matches!(sel.action, SelectionAction::Exclude) {
+                    Form::Negated
+                } else {
+                    Form::Affirmed
+                };
                 let new_pred = Predicate::FieldEquals {
                     name: "msg".to_string(),
                     value: ee.event.msg.clone(),
-                    negated,
+                    form,
                 };
                 let mut new_filter = self.active_stream().filter.clone();
                 new_filter.add_predicate(new_pred);
@@ -9524,7 +9530,7 @@ mod tests {
         let mut new_filter = Filter::default();
         new_filter.add_predicate(Predicate::MsgMatches {
             regex: regex::Regex::new("hello").unwrap(),
-            negated: false,
+            form: Form::Affirmed,
         });
 
         a.apply_filter(new_filter.clone());
