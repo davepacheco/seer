@@ -29,9 +29,9 @@ use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
     Filter, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
-    MatchKind, Predicate, RenderOpts, SavePolicy, SearchDir, SearchOutcome,
-    Selector, Session, SessionId, SessionMatch, SessionSource, SessionStore,
-    SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
+    MatchKind, ParseStats, Predicate, RenderOpts, SavePolicy, SearchDir,
+    SearchOutcome, Selector, Session, SessionId, SessionMatch, SessionSource,
+    SessionStore, SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
     WindowFillStatus, build_seeit_command, format_summary,
 };
 use std::collections::HashMap;
@@ -660,19 +660,6 @@ struct RenderedRows {
     parse_stats: ParseStats,
 }
 
-/// Snapshot of one render-driven parse pass: how many records came off
-/// disk, how many bytes those records totaled, and how long the whole
-/// thing took.  Drives the per-tab parse-rate status line.  Counts all
-/// successfully-parsed records, regardless of whether the active
-/// event-level filter accepted them — the user is asking "how fast
-/// did we read and parse?", not "how fast did we render?".
-#[derive(Clone, Debug, Default)]
-struct ParseStats {
-    records: u64,
-    bytes: u64,
-    elapsed: Duration,
-}
-
 /// Default viewport height used when constructing a [`Tab`] before
 /// the actual terminal size is known.  The first render call replaces
 /// this with the real height via [`Tab::maintain_window`].  Set high
@@ -809,18 +796,12 @@ fn materialize_streamview(view: &StreamView) -> RenderedRows {
             }
         }
     }
-    let stats = view.parse_stats();
-    let parse_stats = ParseStats {
-        records: stats.records,
-        bytes: stats.bytes,
-        elapsed: stats.elapsed,
-    };
     RenderedRows {
         events,
         formatted,
         event_for_line,
         first_line_for_event,
-        parse_stats,
+        parse_stats: view.parse_stats().clone(),
     }
 }
 
@@ -1055,9 +1036,17 @@ impl SummaryOp {
         let elapsed = self.started.elapsed();
         let summary = self.builder.finish();
         let formatted = format_summary(&summary);
+        // `bytes_read` counts every byte stepped through, including
+        // those from filter-rejected records, so it really belongs in
+        // `walked_bytes`.  Summary builds don't track a separate
+        // filter-matching byte total; setting `bytes` to the same
+        // value preserves what the status line has always shown here.
+        // Followup item 45 considers narrowing `bytes` to the
+        // filter-matching subset.
         let parse_stats = ParseStats {
             records: self.records,
             bytes: self.bytes_read,
+            walked_bytes: self.bytes_read,
             elapsed,
         };
         let rows = RenderedRows {
@@ -7572,6 +7561,7 @@ mod tests {
         let stats = ParseStats {
             records: 1023,
             bytes: 2013,
+            walked_bytes: 2013,
             elapsed: Duration::from_millis(15_231),
         };
         let s = format_parse_stats(&stats);
@@ -7590,6 +7580,7 @@ mod tests {
         let stats = ParseStats {
             records: 0,
             bytes: 0,
+            walked_bytes: 0,
             elapsed: Duration::from_millis(0),
         };
         let s = format_parse_stats(&stats);
@@ -7610,6 +7601,7 @@ mod tests {
         a.active_tab_mut().parse_stats = ParseStats {
             records: 42,
             bytes: 4096,
+            walked_bytes: 4096,
             elapsed: Duration::from_millis(100),
         };
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
@@ -7827,6 +7819,7 @@ mod tests {
         a.tabs[0].parse_stats = ParseStats {
             records: 9999,
             bytes: 1024 * 1024,
+            walked_bytes: 1024 * 1024,
             elapsed: Duration::from_millis(1234),
         };
         let backend = TestBackend::new(120, 5);

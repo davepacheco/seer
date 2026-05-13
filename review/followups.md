@@ -14,10 +14,10 @@ listed once with all references gathered.
 
 | Field          | Value                                              |
 |----------------|----------------------------------------------------|
-| Items closed   | 4 / 44                                             |
+| Items closed   | 5 / 45                                             |
 | Current item   | —  (pick the first unchecked below)                |
 | Last updated   | 2026-05-12                                         |
-| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live.  Item 2: each of the three sites restructured to avoid the unwrap entirely — `try_save_now` collapses the redundant `is_none` check into a single `if let`; `push_tab` computes `render_opts` before the insert takes ownership; bookmark navigation fuses the bookmark→stream and stream→filter lookups into one `find_map` so only a single `.expect` (for the joint invariant) remains.  Item 3: `render_opts` destructures `self` (binding render-related fields, `_`-ing `id`/`name`/`filter`) and `set_render_opts` destructures `opts`; adding a new `RenderOpts` field now fails to compile in both directions until propagated.  Item 4: `SessionId` and `SessionIdParseError` moved from `session_store` to `session`; `session_store` now imports them from `session` (cycle broken).  `schema_id` updated from `seer::session_store::SessionId` to `seer::session::SessionId`; schema-fixture test still passes since the fixture doesn't `$ref` it.  `seeit_target` and `lib.rs` re-exports adjusted; `session_store` lost its unused `serde`/`fmt`/`FromStr`/`uuid` imports. |
+| Notes          | Item 1: renamed to `FETCH_BATCH_SIZE` and re-exported through `engine`; dead `LONG_OP_BATCH_SIZE` doc link replaced with a pointer to `StreamView::ensure_window_step` where the small-batch values actually live.  Item 2: each of the three sites restructured to avoid the unwrap entirely — `try_save_now` collapses the redundant `is_none` check into a single `if let`; `push_tab` computes `render_opts` before the insert takes ownership; bookmark navigation fuses the bookmark→stream and stream→filter lookups into one `find_map` so only a single `.expect` (for the joint invariant) remains.  Item 3: `render_opts` destructures `self` (binding render-related fields, `_`-ing `id`/`name`/`filter`) and `set_render_opts` destructures `opts`; adding a new `RenderOpts` field now fails to compile in both directions until propagated.  Item 4: `SessionId` and `SessionIdParseError` moved from `session_store` to `session`; `session_store` now imports them from `session` (cycle broken).  `schema_id` updated from `seer::session_store::SessionId` to `seer::session::SessionId`; schema-fixture test still passes since the fixture doesn't `$ref` it.  `seeit_target` and `lib.rs` re-exports adjusted; `session_store` lost its unused `serde`/`fmt`/`FromStr`/`uuid` imports.  Item 5: local `ParseStats` deleted; `streamview::ParseStats` now flows through both the streamview-rendered and summary-finalize paths.  Lib re-export renamed from `StreamViewParseStats` to plain `ParseStats` (defensive alias no longer needed).  Summary path sets `bytes = walked_bytes = bytes_read` (option A — preserves today's status-line numbers); item 45 added at the end of the list to consider tracking filter-matching bytes separately later (option B). |
 
 ### How this state works
 
@@ -58,7 +58,7 @@ genuine design choice to make.
       *Refs:* P2 §F2, P4 §B3.  *Affects:* `src/session_store.rs`,
       `src/session.rs`.
 
-- [ ] **5. Drop `bin/seer.rs`'s local `ParseStats` in favor of
+- [x] **5. Drop `bin/seer.rs`'s local `ParseStats` in favor of
       `streamview::ParseStats`.**  The streamview type is a strict
       superset (it carries `walked_bytes`).  *Refs:* P2 §F6, P4 §A3,
       P5 §A3.  *Affects:* `src/bin/seer.rs:683` and call sites.
@@ -291,6 +291,23 @@ Mostly automatic consequences of the type-safety changes above.
       `SourceMetadata::excludes_all` and per-line filter.**  Worth
       adding once SMF / CockroachDB formats land, per the CLAUDE.md
       callout.  *Refs:* P5 §D3.
+
+## Surfaced during follow-up work
+
+- [ ] **45. Decide whether summary-build parse stats should report
+      filter-matching bytes (option B from item 5's discussion).**
+      Today, `SummaryOp` sums `rec.length` unconditionally into
+      `bytes_read`, so the status line's "bytes" number for a summary
+      tab under a selective filter reports walked bytes — closer to
+      `walked_bytes` semantics than `bytes` in `streamview::ParseStats`
+      terms.  Item 5 mechanically merged the two `ParseStats` types
+      without fixing this (set `bytes = walked_bytes = bytes_read` in
+      the summary path).  Doing it properly means tracking a separate
+      filter-matching byte counter in `SummaryOp::advance` and
+      installing it as `bytes` at finalize; the visible effect is the
+      summary tab's status-line "bytes" number gets smaller for
+      selective filters.  *Surfaced by:* item 5 discussion.
+      *Affects:* `src/bin/seer.rs:1029-1071`.
 
 ---
 
