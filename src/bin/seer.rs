@@ -38,6 +38,135 @@ use seer::{
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Position of a tab in [`App::tabs`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct TabIdx(usize);
+
+impl TabIdx {
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::fmt::Display for TabIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<usize> for TabIdx {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<usize> for TabIdx {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+/// Index of a record within a tab's `events` vector.
+///
+/// Distinct from [`LineIdx`] (a position in `formatted`).  Keeping them
+/// as separate types makes accidental swaps between the two index
+/// domains — most importantly the `event_for_line` /
+/// `first_line_for_event` translation tables — a compile error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct EventIdx(usize);
+
+impl EventIdx {
+    const ZERO: Self = Self(0);
+
+    fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::ops::Add<usize> for EventIdx {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::fmt::Display for EventIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<usize> for EventIdx {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<usize> for EventIdx {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+/// Index of a display row within a tab's `formatted` vector.
+///
+/// See [`EventIdx`] for the type-safety rationale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct LineIdx(usize);
+
+impl LineIdx {
+    const ZERO: Self = Self(0);
+
+    fn get(self) -> usize {
+        self.0
+    }
+
+    fn saturating_sub(self, n: usize) -> Self {
+        Self(self.0.saturating_sub(n))
+    }
+}
+
+impl std::ops::Add<usize> for LineIdx {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::ops::AddAssign<usize> for LineIdx {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl std::ops::Sub<LineIdx> for LineIdx {
+    type Output = usize;
+
+    fn sub(self, rhs: LineIdx) -> usize {
+        self.0 - rhs.0
+    }
+}
+
+impl std::fmt::Display for LineIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<usize> for LineIdx {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<usize> for LineIdx {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
 #[derive(Parser)]
 #[command(about = "interactive log explorer")]
 struct Args {
@@ -656,8 +785,8 @@ impl Drop for TerminalGuard {
 struct RenderedRows {
     events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
-    event_for_line: Vec<usize>,
-    first_line_for_event: Vec<usize>,
+    event_for_line: Vec<EventIdx>,
+    first_line_for_event: Vec<LineIdx>,
     parse_stats: ParseStats,
 }
 
@@ -771,8 +900,8 @@ fn materialize_streamview(view: &StreamView) -> RenderedRows {
         u64,
     > = HashMap::new();
     for (record, lines) in view.records() {
-        let event_idx = events.len();
-        first_line_for_event.push(formatted.len());
+        let event_idx = EventIdx(events.len());
+        first_line_for_event.push(LineIdx(formatted.len()));
         match &record.event {
             Ok(event) => {
                 let key = (record.source_id.clone(), event.time);
@@ -816,8 +945,8 @@ fn summary_placeholder_rows() -> RenderedRows {
     RenderedRows {
         events: Vec::new(),
         formatted: vec!["Computing summary...".to_string()],
-        event_for_line: vec![0],
-        first_line_for_event: vec![0],
+        event_for_line: vec![EventIdx::ZERO],
+        first_line_for_event: vec![LineIdx::ZERO],
         parse_stats: ParseStats::default(),
     }
 }
@@ -960,7 +1089,7 @@ impl LongOp {
     /// True iff this op writes its result back to the tab at
     /// `tab_idx`.  Used by the renderer to decide whether to swap the
     /// progress bar in for the active tab's parse-stats line.
-    fn targets_tab(&self, tab_idx: usize) -> bool {
+    fn targets_tab(&self, tab_idx: TabIdx) -> bool {
         match self {
             LongOp::BuildSummary(op) => op.tab_idx == tab_idx,
             LongOp::Search(op) => op.tab_idx == tab_idx,
@@ -978,7 +1107,7 @@ struct SummaryOp {
     /// Index in `App.tabs` of the Summary tab being built.  Captured at
     /// creation; the tab itself is left with empty `formatted` until
     /// `finalize` runs.
-    tab_idx: usize,
+    tab_idx: TabIdx,
     filter: Filter,
     builder: SummaryBuilder,
     cursor: Cursor,
@@ -990,7 +1119,7 @@ struct SummaryOp {
 }
 
 impl SummaryOp {
-    fn new(tab_idx: usize, filter: Filter, total_bytes: ByteLen) -> Self {
+    fn new(tab_idx: TabIdx, filter: Filter, total_bytes: ByteLen) -> Self {
         Self {
             tab_idx,
             filter,
@@ -1069,7 +1198,7 @@ impl SummaryOp {
 /// taken from the streamview's own parse-stats counters by diffing
 /// against a snapshot captured at op start.
 struct SearchOp {
-    tab_idx: usize,
+    tab_idx: TabIdx,
     regex: Regex,
     direction: SearchDir,
     /// Whether the very first chunk skips the anchor row so `n` after
@@ -1097,7 +1226,7 @@ struct SearchOp {
 
 impl SearchOp {
     fn new(
-        tab_idx: usize,
+        tab_idx: TabIdx,
         regex: Regex,
         direction: SearchDir,
         anchor: SearchAnchor,
@@ -1150,7 +1279,7 @@ enum SeekFinalize {
 /// [`StreamView::ensure_window_step`] once, fetching one batch, then
 /// yields so the renderer can update the progress bar.
 struct SeekOp {
-    tab_idx: usize,
+    tab_idx: TabIdx,
     /// What kind of finalize work to do once the window-fill is done.
     finalize: SeekFinalize,
     /// Verb shown in the progress bar.  Owned `String` rather than a
@@ -1177,7 +1306,7 @@ struct SeekOp {
 
 impl SeekOp {
     fn new(
-        tab_idx: usize,
+        tab_idx: TabIdx,
         finalize: SeekFinalize,
         label: impl Into<String>,
         walked_bytes_at_start: ByteLen,
@@ -1390,15 +1519,15 @@ struct Tab {
     events: Vec<Option<EngineEvent>>,
     formatted: Vec<String>,
     /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
-    event_for_line: Vec<usize>,
+    event_for_line: Vec<EventIdx>,
     /// `first_line_for_event[event] = line`.  `events.len()` long.
     /// Maintained so the (event_idx → line_idx) translation is O(1) on
     /// every selection move and bookmark navigation.
-    first_line_for_event: Vec<usize>,
+    first_line_for_event: Vec<LineIdx>,
     /// Index of the *display line* at the top of the viewport.  The
     /// viewport scrolls in line steps so users can see (and search) the
     /// extra-field rows independently from their headers.
-    viewport_top: usize,
+    viewport_top: LineIdx,
     /// Active highlighted search, if any.  Match indices are line
     /// indices into `formatted`; cleared when the rows are re-queried
     /// (filter change), because the indices would otherwise dangle.
@@ -1437,7 +1566,7 @@ enum SelectionAction {
 /// display line).  `action` is what Enter will do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
-    event_idx: usize,
+    event_idx: EventIdx,
     action: SelectionAction,
 }
 
@@ -1473,7 +1602,7 @@ impl Tab {
             formatted: rendered.formatted,
             event_for_line: rendered.event_for_line,
             first_line_for_event: rendered.first_line_for_event,
-            viewport_top: 0,
+            viewport_top: LineIdx::ZERO,
             search: None,
             select: None,
             parse_stats: rendered.parse_stats,
@@ -1530,8 +1659,11 @@ impl Tab {
         // matching record (or its visible neighbor) when seeking to
         // `anchor`.  Read its flat-line index so the backward-fallback
         // case (anchor on `records.back()`) doesn't get pinned to 0.
-        self.viewport_top =
-            self.streamview.as_ref().map(|v| v.anchor_flat_line()).unwrap_or(0);
+        self.viewport_top = self
+            .streamview
+            .as_ref()
+            .map(|v| LineIdx(v.anchor_flat_line()))
+            .unwrap_or(LineIdx::ZERO);
         self.search = None;
         self.select = None;
     }
@@ -1553,7 +1685,8 @@ impl Tab {
         if self.kind == TabKind::Summary {
             return;
         }
-        let anchor_event = self.event_for_line.get(self.viewport_top).copied();
+        let anchor_event =
+            self.event_for_line.get(self.viewport_top.get()).copied();
         let rendered = if let Some(view) = self.streamview.as_mut() {
             view.set_render_opts(opts);
             materialize_streamview(view)
@@ -1569,8 +1702,8 @@ impl Tab {
         self.first_line_for_event = rendered.first_line_for_event;
         self.parse_stats = rendered.parse_stats;
         self.viewport_top = anchor_event
-            .and_then(|i| self.first_line_for_event.get(i).copied())
-            .unwrap_or(0);
+            .and_then(|i| self.first_line_for_event.get(i.get()).copied())
+            .unwrap_or(LineIdx::ZERO);
         self.search = None;
     }
 
@@ -1599,7 +1732,7 @@ impl Tab {
         let Some(view) = self.streamview.as_ref() else {
             return;
         };
-        let anchor = view.anchor_flat_line();
+        let anchor = LineIdx(view.anchor_flat_line());
         let rendered = materialize_streamview(view);
         self.events = rendered.events;
         self.formatted = rendered.formatted;
@@ -1620,23 +1753,23 @@ impl Tab {
         if anchor > max
             && let Some(view) = self.streamview.as_mut()
         {
-            view.set_anchor_to_flat_line(max);
+            view.set_anchor_to_flat_line(max.get());
         }
     }
 
     /// Last *display line* index belonging to record `event_idx`,
     /// inclusive.  A header-only record has its first and last on the
     /// same line.
-    fn last_line_for_event(&self, event_idx: usize) -> usize {
+    fn last_line_for_event(&self, event_idx: EventIdx) -> LineIdx {
         let next_first = self
             .first_line_for_event
-            .get(event_idx + 1)
+            .get(event_idx.get() + 1)
             .copied()
-            .unwrap_or(self.formatted.len());
+            .unwrap_or(LineIdx(self.formatted.len()));
         // `next_first` is exclusive; the last line for this event is
         // one before it.  Records always contribute at least one line
         // so the subtraction never underflows.
-        next_first - 1
+        next_first.saturating_sub(1)
     }
 
     /// Largest valid `viewport_top`: the smallest logical-line index
@@ -1653,9 +1786,9 @@ impl Tab {
     /// fixtures), `visual_rows_for` collapses to one row per line and
     /// the result matches the original `formatted.len() -
     /// viewport_height` formula.
-    fn max_top(&self, viewport_height: u16, viewport_width: u16) -> usize {
+    fn max_top(&self, viewport_height: u16, viewport_width: u16) -> LineIdx {
         if self.formatted.is_empty() {
-            return 0;
+            return LineIdx::ZERO;
         }
         let viewport_height = viewport_height as usize;
         let last_idx = self.formatted.len() - 1;
@@ -1664,10 +1797,10 @@ impl Tab {
             let rows = visual_rows_for(&self.formatted[i], viewport_width);
             visual_used = visual_used.saturating_add(rows);
             if visual_used > viewport_height {
-                return (i + 1).min(last_idx);
+                return LineIdx((i + 1).min(last_idx));
             }
         }
-        0
+        LineIdx::ZERO
     }
 
     /// Scrolls `n` display lines forward.  For streamview-backed tabs
@@ -1728,20 +1861,24 @@ impl Tab {
             return;
         }
         let last = self.events.len() - 1;
-        let new_idx =
-            (sel.event_idx as isize + delta).clamp(0, last as isize) as usize;
+        let new_idx = EventIdx(
+            (sel.event_idx.get() as isize + delta).clamp(0, last as isize)
+                as usize,
+        );
         self.select = Some(Selection { event_idx: new_idx, ..sel });
-        let first = self.first_line_for_event[new_idx];
+        let first = self.first_line_for_event[new_idx.get()];
         let last_line = self.last_line_for_event(new_idx);
         let height = viewport_height as usize;
         if first < self.viewport_top {
             self.viewport_top = first;
-        } else if height > 0 && last_line >= self.viewport_top + height {
+        } else if height > 0
+            && last_line.get() >= self.viewport_top.get() + height
+        {
             let event_height = last_line - first + 1;
             self.viewport_top = if event_height >= height {
                 first
             } else {
-                last_line + 1 - height
+                last_line.saturating_sub(height - 1)
             };
         }
     }
@@ -1752,15 +1889,15 @@ impl Tab {
     /// an anchor; returns `None` only when there are no parsed events
     /// at all.  Used by [`Self::advance_time`] to decide what timestamp
     /// to add the step to.
-    fn time_anchor_idx(&self, prefer: Direction) -> Option<usize> {
+    fn time_anchor_idx(&self, prefer: Direction) -> Option<EventIdx> {
         // Translate the line-indexed viewport_top to its enclosing
         // record so the search range matches the user's visual
         // position.  When the viewport is parked past the last line
         // (only possible if `formatted` is empty, in which case events
         // is too) `event_for_line` would index out of range — check
         // length first.
-        let pivot = if self.viewport_top < self.event_for_line.len() {
-            self.event_for_line[self.viewport_top]
+        let pivot = if self.viewport_top.get() < self.event_for_line.len() {
+            self.event_for_line[self.viewport_top.get()].get()
         } else {
             self.events.len()
         };
@@ -1769,7 +1906,7 @@ impl Tab {
             .iter()
             .enumerate()
             .skip(pivot)
-            .find_map(|(i, e)| e.as_ref().map(|_| i));
+            .find_map(|(i, e)| e.as_ref().map(|_| EventIdx(i)));
         let backward_take = pivot.saturating_add(1).min(self.events.len());
         let backward = self
             .events
@@ -1777,7 +1914,7 @@ impl Tab {
             .enumerate()
             .take(backward_take)
             .rev()
-            .find_map(|(i, e)| e.as_ref().map(|_| i));
+            .find_map(|(i, e)| e.as_ref().map(|_| EventIdx(i)));
         match prefer {
             Direction::Forward => forward.or(backward),
             Direction::Backward => backward.or(forward),
@@ -1819,7 +1956,7 @@ impl Tab {
         let Some(anchor_idx) = self.time_anchor_idx(dir) else {
             return;
         };
-        let anchor_time = self.events[anchor_idx]
+        let anchor_time = self.events[anchor_idx.get()]
             .as_ref()
             .expect("time_anchor_idx returns indices of real events")
             .event
@@ -1827,28 +1964,31 @@ impl Tab {
         let target = anchor_time + delta;
         let max = self.max_top(viewport_height, viewport_width);
         let new_event = match dir {
-            Direction::Forward => self
-                .events
-                .iter()
-                .enumerate()
-                .skip(anchor_idx)
-                .find_map(|(i, e)| {
-                    e.as_ref().filter(|ee| ee.event.time >= target).map(|_| i)
-                }),
+            Direction::Forward => {
+                self.events.iter().enumerate().skip(anchor_idx.get()).find_map(
+                    |(i, e)| {
+                        e.as_ref()
+                            .filter(|ee| ee.event.time >= target)
+                            .map(|_| EventIdx(i))
+                    },
+                )
+            }
             Direction::Backward => self
                 .events
                 .iter()
                 .enumerate()
-                .take(anchor_idx + 1)
+                .take(anchor_idx.get() + 1)
                 .rev()
                 .find_map(|(i, e)| {
-                    e.as_ref().filter(|ee| ee.event.time <= target).map(|_| i)
+                    e.as_ref()
+                        .filter(|ee| ee.event.time <= target)
+                        .map(|_| EventIdx(i))
                 }),
         };
         let new_top = match new_event {
-            Some(idx) => self.first_line_for_event[idx],
+            Some(idx) => self.first_line_for_event[idx.get()],
             None if dir == Direction::Forward => max,
-            None => 0,
+            None => LineIdx::ZERO,
         };
         self.viewport_top = new_top.min(max);
     }
@@ -1944,7 +2084,7 @@ struct App {
     /// in flight.  Drained FIFO as the active op finalizes — only one
     /// build runs at a time, so a filter change that would dirty
     /// several Summary tabs queues each tab's rebuild here.
-    pending_summary_builds: std::collections::VecDeque<(usize, Filter)>,
+    pending_summary_builds: std::collections::VecDeque<(TabIdx, Filter)>,
     /// On-disk store backing this session, or `None` for a transient
     /// session that should never be written to disk.  Test
     /// constructors leave this `None`.
@@ -2079,7 +2219,7 @@ impl App {
                 );
                 tab.resync_from_streamview(0, 0);
             }
-            let tab_idx = self.tabs.len();
+            let tab_idx = TabIdx(self.tabs.len());
             self.tabs.push(tab);
             // Summary tabs need their long-op build queued, same as
             // when the user opens one interactively.
@@ -2207,7 +2347,10 @@ impl App {
         // build runs as a [`LongOp`] so the user sees a progress bar
         // while the histogram is computed.
         if kind == TabKind::Summary {
-            self.enqueue_summary_build(self.tabs.len() - 1, pushed_filter);
+            self.enqueue_summary_build(
+                TabIdx(self.tabs.len() - 1),
+                pushed_filter,
+            );
         }
         self.save_after_inline_mutation();
     }
@@ -2219,7 +2362,7 @@ impl App {
     /// already-pending build for the same tab keeps the queue
     /// monotonic — only the most recent filter for a given tab is
     /// honored, since older requests would compute against stale data.
-    fn enqueue_summary_build(&mut self, tab_idx: usize, filter: Filter) {
+    fn enqueue_summary_build(&mut self, tab_idx: TabIdx, filter: Filter) {
         // Drop any earlier pending request for the same tab — a fresh
         // request supersedes it.
         self.pending_summary_builds.retain(|(idx, _)| *idx != tab_idx);
@@ -2233,16 +2376,16 @@ impl App {
     /// Resets the destination tab to the placeholder shape and
     /// installs a fresh [`SummaryOp`] in [`Self::long_op`].  Caller is
     /// responsible for ensuring no other [`LongOp`] is in flight.
-    fn start_summary_build(&mut self, tab_idx: usize, filter: Filter) {
+    fn start_summary_build(&mut self, tab_idx: TabIdx, filter: Filter) {
         debug_assert!(self.long_op.is_none());
-        if let Some(tab) = self.tabs.get_mut(tab_idx) {
+        if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
             let placeholder = summary_placeholder_rows();
             tab.events = placeholder.events;
             tab.formatted = placeholder.formatted;
             tab.event_for_line = placeholder.event_for_line;
             tab.first_line_for_event = placeholder.first_line_for_event;
             tab.parse_stats = placeholder.parse_stats;
-            tab.viewport_top = 0;
+            tab.viewport_top = LineIdx::ZERO;
             tab.search = None;
         }
         let total_bytes = self.engine.filtered_total_bytes(&filter);
@@ -2294,7 +2437,7 @@ impl App {
         let tab_idx = s.tab_idx;
         let App { tabs, engine, .. } = self;
         let Some(view) =
-            tabs.get_mut(tab_idx).and_then(|t| t.streamview.as_mut())
+            tabs.get_mut(tab_idx.get()).and_then(|t| t.streamview.as_mut())
         else {
             // Tab vanished (closed under us) or never had a
             // streamview to begin with.  Nothing left to fill.
@@ -2335,7 +2478,7 @@ impl App {
         // borrows independent in the borrow checker's eyes.
         let App { tabs, engine, .. } = self;
         let Some(view) =
-            tabs.get_mut(tab_idx).and_then(|t| t.streamview.as_mut())
+            tabs.get_mut(tab_idx.get()).and_then(|t| t.streamview.as_mut())
         else {
             // The tab disappeared (closed under us) or never had a
             // streamview to begin with.  Treat as terminal — nothing
@@ -2383,13 +2526,13 @@ impl App {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
                 let (rendered, stats) = s.finalize();
-                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
                     tab.events = rendered.events;
                     tab.formatted = rendered.formatted;
                     tab.event_for_line = rendered.event_for_line;
                     tab.first_line_for_event = rendered.first_line_for_event;
                     tab.parse_stats = stats;
-                    tab.viewport_top = 0;
+                    tab.viewport_top = LineIdx::ZERO;
                 }
                 // Drain a queued Summary build so a filter change
                 // that dirtied multiple Summary tabs progresses
@@ -2407,8 +2550,9 @@ impl App {
                 let w = self.viewport_width;
                 match outcome {
                     SearchOutcome::Found => {
-                        if tab_idx < self.tabs.len() {
-                            self.tabs[tab_idx].resync_from_streamview(h, w);
+                        if tab_idx.get() < self.tabs.len() {
+                            self.tabs[tab_idx.get()]
+                                .resync_from_streamview(h, w);
                         }
                     }
                     SearchOutcome::NotFound => {
@@ -2443,7 +2587,7 @@ impl App {
     /// [`Self::finalize_long_op`].
     fn finalize_seek_op(&mut self, s: SeekOp) {
         let tab_idx = s.tab_idx;
-        if tab_idx >= self.tabs.len() {
+        if tab_idx.get() >= self.tabs.len() {
             // Tab vanished while the op was running.  Drain any
             // queued Summary build so the rest of the filter-rebuild
             // chain still makes progress.
@@ -2454,7 +2598,7 @@ impl App {
         let w = self.viewport_width;
         // Apply the finalize step to the streamview before we resync,
         // so the materialized rows reflect the resolved anchor.
-        if let Some(view) = self.tabs[tab_idx].streamview.as_mut() {
+        if let Some(view) = self.tabs[tab_idx.get()].streamview.as_mut() {
             match s.finalize {
                 SeekFinalize::Front | SeekFinalize::Back => {
                     // `ensure_window_step` already resolved PinFront/
@@ -2474,7 +2618,7 @@ impl App {
                 }
             }
         }
-        self.tabs[tab_idx].resync_from_streamview(h, w);
+        self.tabs[tab_idx.get()].resync_from_streamview(h, w);
         // Filter rebuild may have queued a Summary build behind this
         // seek (via `apply_filter`'s active-tab-first ordering); kick
         // it off now that our long op slot is free.
@@ -2507,7 +2651,7 @@ impl App {
         match op {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
-                if let Some(tab) = self.tabs.get_mut(tab_idx) {
+                if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
                     tab.formatted = vec![
                         "summary cancelled — rerun with `f<enter>`".to_string(),
                     ];
@@ -2616,7 +2760,7 @@ impl App {
             self.cancel_long_op();
         }
         self.long_op = Some(LongOp::Seek(SeekOp::new(
-            active,
+            TabIdx(active),
             SeekFinalize::Back,
             "Seeking to end",
             walked_bytes_at_start,
@@ -2634,7 +2778,7 @@ impl App {
         let w = self.viewport_width;
         let active = self.active;
         let Some(view) = self.tabs[active].streamview.as_mut() else {
-            self.tabs[active].viewport_top = 0;
+            self.tabs[active].viewport_top = LineIdx::ZERO;
             return;
         };
         view.prepare_seek_to_start();
@@ -2647,7 +2791,7 @@ impl App {
             self.cancel_long_op();
         }
         self.long_op = Some(LongOp::Seek(SeekOp::new(
-            active,
+            TabIdx(active),
             SeekFinalize::Front,
             "Seeking to start",
             walked_bytes_at_start,
@@ -2678,7 +2822,7 @@ impl App {
             self.cancel_long_op();
         }
         self.long_op = Some(LongOp::Seek(SeekOp::new(
-            active,
+            TabIdx(active),
             SeekFinalize::FrontOrBackFallback,
             "Loading view",
             walked_bytes_at_start,
@@ -2758,7 +2902,7 @@ impl App {
                 .as_ref()
                 .and_then(|v| v.cursor_at_anchor());
             self.refresh_tab_with_long_op(
-                active,
+                TabIdx(active),
                 &new_filter,
                 opts,
                 anchor,
@@ -2788,7 +2932,7 @@ impl App {
                     );
                 }
                 TabKind::Summary => {
-                    self.enqueue_summary_build(i, new_filter.clone());
+                    self.enqueue_summary_build(TabIdx(i), new_filter.clone());
                 }
             }
         }
@@ -2805,7 +2949,7 @@ impl App {
     /// were); `None` starts at the top.
     fn refresh_tab_with_long_op(
         &mut self,
-        tab_idx: usize,
+        tab_idx: TabIdx,
         filter: &Filter,
         opts: RenderOpts,
         anchor: Option<Cursor>,
@@ -2832,15 +2976,15 @@ impl App {
         let walked_bytes_at_start = view.parse_stats().walked_bytes;
         let records_at_start = view.parse_stats().records;
         let total_bytes = self.engine.filtered_total_bytes(view.filter());
-        self.tabs[tab_idx].streamview = Some(view);
-        self.tabs[tab_idx].search = None;
-        self.tabs[tab_idx].select = None;
+        self.tabs[tab_idx.get()].streamview = Some(view);
+        self.tabs[tab_idx.get()].search = None;
+        self.tabs[tab_idx.get()].select = None;
         // Materialize the (empty) view so the tab's formatted lines
         // reflect the new state — without this the user would see
         // stale content from before the filter change.
         let h = self.viewport_height;
         let w = self.viewport_width;
-        self.tabs[tab_idx].resync_from_streamview(h, w);
+        self.tabs[tab_idx.get()].resync_from_streamview(h, w);
         self.long_op = Some(LongOp::Seek(SeekOp::new(
             tab_idx,
             finalize,
@@ -3254,7 +3398,7 @@ impl App {
             self.cancel_long_op();
         }
         self.long_op = Some(LongOp::Search(SearchOp::new(
-            active,
+            TabIdx(active),
             regex,
             dir,
             anchor,
@@ -3273,7 +3417,7 @@ impl App {
         let Some(search) = &tab.search else {
             return;
         };
-        let cur = tab.viewport_top;
+        let cur = tab.viewport_top.get();
         let target = match (direction, anchor) {
             (SearchDirection::Forward, SearchAnchor::Skip) => {
                 search.matches.iter().copied().find(|&m| m > cur)
@@ -3289,7 +3433,7 @@ impl App {
             }
         };
         if let Some(t) = target {
-            self.tabs[self.active].viewport_top = t;
+            self.tabs[self.active].viewport_top = LineIdx(t);
         }
     }
 
@@ -3378,26 +3522,30 @@ impl App {
     /// to follow the shift in `self.tabs`.  Same renumbering applies
     /// to queued Summary builds.
     fn adjust_long_op_state_for_closed_tab(&mut self, closed: usize) {
+        let closed = TabIdx(closed);
+        let shift_down = |idx: &mut TabIdx| {
+            *idx = TabIdx(idx.get() - 1);
+        };
         match self.long_op.as_mut() {
             Some(LongOp::BuildSummary(s)) => {
                 if s.tab_idx == closed {
                     self.long_op = None;
                 } else if s.tab_idx > closed {
-                    s.tab_idx -= 1;
+                    shift_down(&mut s.tab_idx);
                 }
             }
             Some(LongOp::Search(s)) => {
                 if s.tab_idx == closed {
                     self.long_op = None;
                 } else if s.tab_idx > closed {
-                    s.tab_idx -= 1;
+                    shift_down(&mut s.tab_idx);
                 }
             }
             Some(LongOp::Seek(s)) => {
                 if s.tab_idx == closed {
                     self.long_op = None;
                 } else if s.tab_idx > closed {
-                    s.tab_idx -= 1;
+                    shift_down(&mut s.tab_idx);
                 }
             }
             None => {}
@@ -3405,7 +3553,7 @@ impl App {
         self.pending_summary_builds.retain(|(idx, _)| *idx != closed);
         for (idx, _) in self.pending_summary_builds.iter_mut() {
             if *idx > closed {
-                *idx -= 1;
+                shift_down(idx);
             }
         }
     }
@@ -3425,9 +3573,9 @@ impl App {
         // against a viewport_top set out of range by a future caller.
         let event_idx = tab
             .event_for_line
-            .get(tab.viewport_top)
+            .get(tab.viewport_top.get())
             .copied()
-            .unwrap_or(tab.events.len() - 1);
+            .unwrap_or(EventIdx(tab.events.len() - 1));
         tab.select = Some(Selection { event_idx, action });
     }
 
@@ -3557,7 +3705,7 @@ impl App {
         let Some(sel) = tab.select else {
             return;
         };
-        let Some(Some(ee)) = tab.events.get(sel.event_idx) else {
+        let Some(Some(ee)) = tab.events.get(sel.event_idx.get()) else {
             return;
         };
         match sel.action {
@@ -3594,7 +3742,7 @@ impl App {
                 let cursor = tab
                     .streamview
                     .as_ref()
-                    .and_then(|v| v.cursor_before_record(sel.event_idx))
+                    .and_then(|v| v.cursor_before_record(sel.event_idx.get()))
                     .unwrap_or_default();
                 let draft = BookmarkDraft {
                     cursor,
@@ -3677,9 +3825,10 @@ impl App {
                 })
             })
             .collect();
-        let event_for_line: Vec<usize> = (0..formatted.len()).collect();
-        let first_line_for_event: Vec<usize> =
-            (0..engine_events.len()).collect();
+        let event_for_line: Vec<EventIdx> =
+            (0..formatted.len()).map(EventIdx).collect();
+        let first_line_for_event: Vec<LineIdx> =
+            (0..engine_events.len()).map(LineIdx).collect();
         a.tabs.push(Tab {
             name: format!("Tab {}", a.next_tab_number),
             stream: stream_id,
@@ -3693,7 +3842,7 @@ impl App {
             formatted,
             event_for_line,
             first_line_for_event,
-            viewport_top: 0,
+            viewport_top: LineIdx::ZERO,
             search: None,
             select: None,
             parse_stats: ParseStats::default(),
@@ -4901,7 +5050,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     let tab = app.active_tab();
     let total = tab.formatted.len();
-    let top = tab.viewport_top;
+    let top = tab.viewport_top.get();
     // Walk forward from `top`, accumulating each line's wrapped row
     // count until we've covered the content area.  The result is the
     // first logical line index that no longer fits — the slice
@@ -4936,7 +5085,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     // op is by definition not "done", so the marker would be
     // misleading there.
     let stats_text = match app.long_op.as_ref() {
-        Some(op) if op.targets_tab(app.active) => {
+        Some(op) if op.targets_tab(TabIdx(app.active)) => {
             format_long_op_progress(op, stats_area.width.into())
         }
         _ => {
@@ -5596,7 +5745,7 @@ mod tests {
     #[test]
     fn k_and_up_scroll_up_one() {
         let mut a = app(10, 5);
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         a.handle_key(key(KeyCode::Char('k')));
         assert_eq!(a.active_tab().viewport_top, 2);
         a.handle_key(key(KeyCode::Up));
@@ -5656,7 +5805,7 @@ mod tests {
         for _ in 0..50 {
             a.handle_key(key(KeyCode::Char(' ')));
         }
-        let top = a.active_tab().viewport_top;
+        let top = a.active_tab().viewport_top.get();
         assert!(
             top > initial_len,
             "viewport_top {top} stuck at or below initial cache \
@@ -5667,7 +5816,7 @@ mod tests {
     #[test]
     fn ctrl_u_scrolls_half_page_up() {
         let mut a = app(100, 10);
-        a.active_tab_mut().viewport_top = 20;
+        a.active_tab_mut().viewport_top = LineIdx(20);
         a.handle_key(ctrl('u'));
         assert_eq!(a.active_tab().viewport_top, 15);
     }
@@ -5675,7 +5824,7 @@ mod tests {
     #[test]
     fn g_jumps_top() {
         let mut a = app(100, 10);
-        a.active_tab_mut().viewport_top = 50;
+        a.active_tab_mut().viewport_top = LineIdx(50);
         a.handle_key(key(KeyCode::Char('g')));
         assert_eq!(a.active_tab().viewport_top, 0);
     }
@@ -5683,7 +5832,7 @@ mod tests {
     #[test]
     fn home_jumps_top() {
         let mut a = app(100, 10);
-        a.active_tab_mut().viewport_top = 50;
+        a.active_tab_mut().viewport_top = LineIdx(50);
         a.handle_key(key(KeyCode::Home));
         assert_eq!(a.active_tab().viewport_top, 0);
     }
@@ -5714,7 +5863,7 @@ mod tests {
     #[test]
     fn cant_scroll_below_bottom() {
         let mut a = app(10, 5);
-        a.active_tab_mut().viewport_top = 5; // == max_top
+        a.active_tab_mut().viewport_top = LineIdx(5); // == max_top
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(a.active_tab().viewport_top, 5);
         a.handle_key(ctrl('d'));
@@ -6100,7 +6249,7 @@ mod tests {
         engine.add_file_source(&path).unwrap();
         let mut a = App::new(engine);
         a.viewport_height = 2;
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         assert_eq!(a.active_tab().formatted.len(), 6);
 
         a.handle_key(key(KeyCode::Char('f')));
@@ -6330,11 +6479,11 @@ mod tests {
     #[test]
     fn each_tab_keeps_its_own_viewport_top() {
         let mut a = app(100, 10);
-        a.active_tab_mut().viewport_top = 30;
+        a.active_tab_mut().viewport_top = LineIdx(30);
         a.handle_key(ctrl('t'));
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.active_tab().viewport_top, 0);
-        a.active_tab_mut().viewport_top = 50;
+        a.active_tab_mut().viewport_top = LineIdx(50);
         a.handle_key(back_tab());
         assert_eq!(a.active_tab().viewport_top, 30);
         a.handle_key(key(KeyCode::Tab));
@@ -6680,7 +6829,7 @@ mod tests {
         let mut a = search_app();
         // Start mid-file so "first match at or after viewport_top" is
         // visible.
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         a.handle_key(key(KeyCode::Char('/')));
         type_into(a.dialog.as_mut().unwrap(), "alpha");
         a.handle_key(key(KeyCode::Enter));
@@ -6705,7 +6854,7 @@ mod tests {
     #[test]
     fn backward_search_jumps_to_previous_match() {
         let mut a = search_app();
-        a.active_tab_mut().viewport_top = 5;
+        a.active_tab_mut().viewport_top = LineIdx(5);
         a.handle_key(key(KeyCode::Char('?')));
         type_into(a.dialog.as_mut().unwrap(), "alpha");
         a.handle_key(key(KeyCode::Enter));
@@ -7009,7 +7158,7 @@ mod tests {
     fn slash_enter_repeats_last_search_forward() {
         let mut a = search_app();
         // Initial backward search.
-        a.active_tab_mut().viewport_top = 5;
+        a.active_tab_mut().viewport_top = LineIdx(5);
         a.handle_key(key(KeyCode::Char('?')));
         type_into(a.dialog.as_mut().unwrap(), "alpha");
         a.handle_key(key(KeyCode::Enter));
@@ -7124,7 +7273,7 @@ mod tests {
             })
             .collect();
         a.active_tab_mut().search = None;
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
 
         a.handle_key(key(KeyCode::Char('n')));
         // Re-derives search; nearest match strictly past row 3 is 4.
@@ -7267,21 +7416,30 @@ mod tests {
     }
 
     fn excl_sel(event_idx: usize) -> Selection {
-        Selection { event_idx, action: SelectionAction::Exclude }
+        Selection {
+            event_idx: EventIdx(event_idx),
+            action: SelectionAction::Exclude,
+        }
     }
 
     fn incl_sel(event_idx: usize) -> Selection {
-        Selection { event_idx, action: SelectionAction::Include }
+        Selection {
+            event_idx: EventIdx(event_idx),
+            action: SelectionAction::Include,
+        }
     }
 
     fn bm_sel(event_idx: usize) -> Selection {
-        Selection { event_idx, action: SelectionAction::Bookmark }
+        Selection {
+            event_idx: EventIdx(event_idx),
+            action: SelectionAction::Bookmark,
+        }
     }
 
     #[test]
     fn x_enters_exclude_mode_at_viewport_top() {
         let mut a = select_app(10, 5);
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         a.handle_key(key(KeyCode::Char('x')));
         assert_eq!(a.active_tab().select, Some(excl_sel(3)));
     }
@@ -7297,7 +7455,7 @@ mod tests {
     #[test]
     fn shift_x_enters_include_mode_at_viewport_top() {
         let mut a = select_app(10, 5);
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         a.handle_key(shift('X'));
         assert_eq!(a.active_tab().select, Some(incl_sel(3)));
     }
@@ -7359,7 +7517,7 @@ mod tests {
     #[test]
     fn select_k_above_viewport_top_scrolls() {
         let mut a = select_app(10, 3);
-        a.active_tab_mut().viewport_top = 5;
+        a.active_tab_mut().viewport_top = LineIdx(5);
         a.handle_key(key(KeyCode::Char('x')));
         // Selection starts at viewport_top (5), one `k` puts it at 4
         // which is above the current viewport — viewport_top should
@@ -7630,7 +7788,8 @@ mod tests {
         // Build a SummaryOp whose state is set up by hand so the
         // formatted output is deterministic — we don't drive a real
         // engine here.
-        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(1024));
+        let mut s =
+            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(1024));
         s.bytes_read = ByteLen::from(256);
         s.records = 42;
         let op = LongOp::BuildSummary(Box::new(s));
@@ -7651,7 +7810,8 @@ mod tests {
         // At 30 cells there isn't room for a useful bar plus the
         // numbers; the bar is dropped rather than truncating the
         // numbers.
-        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(1024));
+        let mut s =
+            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(1024));
         s.bytes_read = ByteLen::from(256);
         s.records = 42;
         let op = LongOp::BuildSummary(Box::new(s));
@@ -7666,7 +7826,8 @@ mod tests {
         // Search ops can overshoot total_bytes when the streamview
         // had already pulled bytes for back-fetch that we count
         // against the same denominator; the bar should clamp to 100%.
-        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(100));
+        let mut s =
+            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(100));
         s.bytes_read = ByteLen::from(200);
         s.records = 1;
         let op = LongOp::BuildSummary(Box::new(s));
@@ -7732,7 +7893,7 @@ mod tests {
         // just enqueue another build for the same tab while the
         // current one is still in flight.  enqueue_summary_build
         // de-dupes pending entries for the same tab.
-        let active_tab = a.active;
+        let active_tab = TabIdx(a.active);
         a.pending_summary_builds
             .push_back((active_tab, "msg=alpha".parse().unwrap()));
         a.enqueue_summary_build(active_tab, "msg=beta".parse().unwrap());
@@ -7781,7 +7942,7 @@ mod tests {
         a.drain_long_op();
         assert!(a.long_op.is_none());
         // Viewport should sit on the matching record.
-        let top = a.active_tab().viewport_top;
+        let top = a.active_tab().viewport_top.get();
         let line = &a.active_tab().formatted[top];
         assert!(
             line.contains("match-here"),
@@ -7928,7 +8089,7 @@ mod tests {
     fn lt_rewinds_by_current_step() {
         // Start at row 90 (t=90s); -1m lands at t=30s → row 30.
         let mut a = time_app(120, 10);
-        a.active_tab_mut().viewport_top = 90;
+        a.active_tab_mut().viewport_top = LineIdx(90);
         a.handle_key(shift('<'));
         assert_eq!(a.active_tab().viewport_top, 30);
         // Another `<` from t=30 → t=-30, no event satisfies → top.
@@ -7971,7 +8132,7 @@ mod tests {
         let formatted = vec!["err 0".into(), "err 1".into(), "err 2".into()];
         let mut a = App::with_events(events, formatted);
         a.viewport_height = 5;
-        a.active_tab_mut().viewport_top = 1;
+        a.active_tab_mut().viewport_top = LineIdx(1);
         a.handle_key(shift('>'));
         a.handle_key(shift('<'));
         assert_eq!(a.active_tab().viewport_top, 1);
@@ -7988,7 +8149,7 @@ mod tests {
         let formatted = vec!["a".into(), "err".into(), "b".into()];
         let mut a = App::with_events(events, formatted);
         a.viewport_height = 5;
-        a.active_tab_mut().viewport_top = 1;
+        a.active_tab_mut().viewport_top = LineIdx(1);
         a.handle_key(shift('>'));
         let max = a.active_tab().max_top(a.viewport_height, a.viewport_width);
         assert_eq!(a.active_tab().viewport_top, max);
@@ -8051,7 +8212,7 @@ mod tests {
     #[test]
     fn b_enters_bookmark_mode_at_viewport_top() {
         let mut a = select_app(10, 5);
-        a.active_tab_mut().viewport_top = 3;
+        a.active_tab_mut().viewport_top = LineIdx(3);
         a.handle_key(key(KeyCode::Char('b')));
         assert_eq!(a.active_tab().select, Some(bm_sel(3)));
     }
@@ -8334,8 +8495,8 @@ mod tests {
     /// at the top after a filter change.
     fn viewport_top_msg(a: &App) -> Option<String> {
         let tab = a.active_tab();
-        let event_idx = *tab.event_for_line.get(tab.viewport_top)?;
-        tab.events.get(event_idx)?.as_ref().map(|ee| ee.event.msg.clone())
+        let event_idx = *tab.event_for_line.get(tab.viewport_top.get())?;
+        tab.events.get(event_idx.get())?.as_ref().map(|ee| ee.event.msg.clone())
     }
 
     /// Builds a 5-record multi-line app with a viewport short enough
@@ -8639,7 +8800,7 @@ mod tests {
             (110, "filler", &[]),         // line 5
         ]);
         a.viewport_height = 2;
-        a.active_tab_mut().viewport_top = 1; // an extras row of event 0
+        a.active_tab_mut().viewport_top = LineIdx(1); // an extras row of event 0
         a.handle_key(shift('>'));
         // step is 1m; from t=10 + 60s = 70 → next event at t=80 wins.
         // Its first display line is line 2; max_top with 6 lines and
@@ -8735,7 +8896,7 @@ mod tests {
             (30, "third", &[]),
         ]);
         // With extras: lines = [first, second, a-row, b-row, third].
-        a.active_tab_mut().viewport_top = 1; // second event's header
+        a.active_tab_mut().viewport_top = LineIdx(1); // second event's header
         a.handle_key(shift('F')); // hide
         // Without extras: lines = [first, second, third].  The same
         // record's first line is now index 1.
@@ -8865,7 +9026,7 @@ mod tests {
         // Hide extras so the buffer is exactly one line per event;
         // that way `viewport_top` indexes records 1:1.
         a.handle_key(shift('F'));
-        a.active_tab_mut().viewport_top = 1;
+        a.active_tab_mut().viewport_top = LineIdx(1);
         let lines_before = a.active_tab().formatted.len();
         a.handle_key(shift('D'));
         assert_eq!(a.active_tab().viewport_top, 1);
