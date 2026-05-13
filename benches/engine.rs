@@ -287,6 +287,44 @@ fn bench_summarize(c: &mut Criterion) {
     });
 }
 
+/// Mimics `SummaryOp` in the TUI: walks the engine via `Stepper`
+/// (not `EventStream`, which is what `summarize()` uses), folding each
+/// record into a `SummaryBuilder`.  Rebuilds the stepper from the
+/// saved cursor every `LONG_OP_CHUNK_RECORDS` records to exercise the
+/// long-op driver's per-chunk reconstruction cost.
+fn bench_summarize_via_stepper(c: &mut Criterion) {
+    use seer::SummaryBuilder;
+    const CHUNK: usize = 4_000;
+    let (_dir, source) = build_single_source(&GenOpts {
+        extras_every: 50,
+        ..GenOpts::default()
+    });
+    let mut engine = Engine::new();
+    engine.add_file_source(source.path()).expect("add source");
+    let filter = Filter::default();
+    c.bench_function("summarize_via_stepper_50k_unfiltered", |b| {
+        b.iter(|| {
+            let mut builder = SummaryBuilder::default();
+            let mut cursor = Cursor::new();
+            'outer: loop {
+                let mut stepper = engine.stepper(filter.clone(), &cursor);
+                let mut count = 0;
+                while count < CHUNK {
+                    let Some(rec) = stepper.step_forward() else {
+                        builder.finish();
+                        break 'outer;
+                    };
+                    if let Ok(event) = rec.event {
+                        builder.observe(&rec.source_id, &event);
+                    }
+                    count += 1;
+                }
+                cursor = stepper.cursor();
+            }
+        });
+    });
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default()
@@ -304,5 +342,6 @@ criterion_group!(
         bench_streamview_ensure_window,
         bench_streamview_scroll_past_edge,
         bench_summarize,
+        bench_summarize_via_stepper,
 );
 criterion_main!(benches);

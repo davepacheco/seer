@@ -286,11 +286,11 @@ New tabs should still open with this dialog.
 
 ### TODO
 
+- `?` binding to pop up summary of key bindings
 - parse SMF entries
 - parse CockroachDB log
 - need to teach Claude about slog_error_chain -- see SourceError
 - confirmation dialog boxes need work
-- `?` binding to pop up summary of key bindings
 - second search (e.g., by time):
   - no feedback
   - super slow navigation after that (not as slow as re-parsing everything)
@@ -304,3 +304,6 @@ New tabs should still open with this dialog.
 - add a marker in the logstream where there are bookmarks
 - should bookmarks be navigable from any tab?
 - press 'Y' over bookmark should open the `seeit` command dialog too
+- loading saved session takes a long time with no feedback
+- creating new tab when you have a filter applied takes a long time with no feedback
+- bookmarks should be listed in timestamp order
