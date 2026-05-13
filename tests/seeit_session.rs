@@ -71,6 +71,7 @@ fn build_session(staged: &StagedSource) -> (Session, seer::LogStreamId) {
     let stream_id = stream.id;
     session.streams.insert_unique(stream).unwrap();
     session.tabs.push(Tab {
+        name: "Tab 1".to_string(),
         stream: stream_id,
         kind: TabKind::Stream,
         cursor: None,

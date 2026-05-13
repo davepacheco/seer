@@ -747,7 +747,8 @@ fn build_streamview(
 /// `App::next_tab_number` past every restored name, so a newly-pushed
 /// tab doesn't collide with a name already in use.  Returns `None`
 /// for names that don't fit the `Word N` shape (e.g. user-renamed
-/// tabs once that feature lands).
+/// tabs), which is fine: a renamed tab is by definition no longer
+/// competing for default-shaped names.
 fn parse_tab_number(name: &str) -> Option<usize> {
     let (_, n) = name.rsplit_once(' ')?;
     n.parse().ok()
@@ -1986,12 +1987,11 @@ impl App {
 
         // First pass: bump next_tab_number past every "Tab N" /
         // "Summary N" name we'll be restoring, so later user-driven
-        // pushes don't collide with names already in use.
+        // pushes don't collide with names already in use.  User-renamed
+        // tabs don't match the `Word N` shape, so `parse_tab_number`
+        // returns `None` and they don't perturb the counter.
         for ptab in &persisted {
-            let Some(stream) = self.session.streams.get(&ptab.stream) else {
-                continue;
-            };
-            if let Some(n) = parse_tab_number(&stream.name) {
+            if let Some(n) = parse_tab_number(&ptab.name) {
                 self.next_tab_number = self.next_tab_number.max(n + 1);
             }
         }
@@ -2003,7 +2003,7 @@ impl App {
                 // user will see one fewer tab but no broken pointer.
                 continue;
             };
-            let name = stream.name.clone();
+            let name = ptab.name.clone();
             let filter = stream.filter.clone();
             let opts = stream.render_opts();
             let mut tab = Tab::new(
@@ -2084,6 +2084,7 @@ impl App {
             .tabs
             .iter()
             .map(|t| seer::Tab {
+                name: t.name.clone(),
                 stream: t.stream,
                 kind: t.kind,
                 cursor: t
@@ -2901,8 +2902,13 @@ impl App {
         self.session.streams.get(&stream_id).expect("stream exists")
     }
 
+    /// Replaces the active tab's display name.  The new name is
+    /// persisted on the next save so a resumed session shows it on the
+    /// restored tab strip; the rename is treated as a low-cadence
+    /// mutation (the user just typed Enter) and flushes inline.
     fn rename_active_tab(&mut self, name: String) {
         self.tabs[self.active].name = name;
+        self.save_after_inline_mutation();
     }
 
     /// Opens the read-only popup showing the `seeit` command that
@@ -9795,6 +9801,36 @@ mod tests {
     }
 
     #[test]
+    fn rename_persists_inline_and_survives_reload() {
+        // Renaming the active tab via the dialog should flush to disk
+        // immediately and the new name should come back on resume —
+        // pinning the bug where renames lived only on the runtime
+        // `Tab` and were lost the moment the session was reloaded.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+
+        a.handle_key(key(KeyCode::Char('r')));
+        a.handle_key(ctrl('u'));
+        type_into(a.dialog.as_mut().unwrap(), "Nexus");
+        a.handle_key(key(KeyCode::Enter));
+
+        assert!(!a.policy.dirty(), "save flushed the dirty bit");
+        let reloaded = reload_session(&a);
+        assert_eq!(reloaded.tabs.len(), 1);
+        assert_eq!(reloaded.tabs[0].name, "Nexus");
+
+        // Resume on the reloaded session should hand the App back a tab
+        // with the renamed name, not the original "Tab 1".
+        let app2 = App::new_with_session(
+            Engine::new(),
+            reloaded,
+            None,
+            SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
+        );
+        assert_eq!(app2.tabs.len(), 1);
+        assert_eq!(app2.tabs[0].name, "Nexus");
+    }
+
+    #[test]
     fn save_records_summary_tab_kind() {
         // A Summary tab persists with `kind: Summary` so resume can
         // restore the histogram view rather than a stream view.
@@ -9825,11 +9861,13 @@ mod tests {
         session.streams.insert_unique(stream_a).unwrap();
         session.streams.insert_unique(stream_b).unwrap();
         session.tabs.push(seer::Tab {
+            name: "Tab 7".to_string(),
             stream: id_a,
             kind: TabKind::Stream,
             cursor: None,
         });
         session.tabs.push(seer::Tab {
+            name: "Summary 9".to_string(),
             stream: id_b,
             kind: TabKind::Summary,
             cursor: None,
@@ -9877,6 +9915,7 @@ mod tests {
         let mut session = Session::new();
         let phantom = LogStream::new("Tab 1".to_string()).id;
         session.tabs.push(seer::Tab {
+            name: "Tab 1".to_string(),
             stream: phantom,
             kind: TabKind::Stream,
             cursor: None,

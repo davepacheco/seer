@@ -320,11 +320,11 @@ fn find_stream<'a>(
     }
 }
 
-/// Looks up the unique tab whose backing stream has the given name.
+/// Looks up the unique tab whose own name equals `name`.
 ///
-/// Returns the stream, the tab's [`TabKind`], and its saved cursor
-/// (if any).  Tabs that reference a stream the session no longer
-/// owns are skipped — the same defensive behavior as the TUI's
+/// Returns the backing stream, the tab's [`TabKind`], and its saved
+/// cursor (if any).  Tabs that reference a stream the session no
+/// longer owns are skipped — the same defensive behavior as the TUI's
 /// tab-restore path.
 fn find_tab<'a>(
     session: &'a Session,
@@ -337,7 +337,7 @@ fn find_tab<'a>(
         .enumerate()
         .filter_map(|(idx, tab)| {
             let stream = session.streams.get(&tab.stream)?;
-            (stream.name == name)
+            (tab.name == name)
                 .then(|| (idx, stream, tab.kind, tab.cursor.clone()))
         })
         .collect();
@@ -555,6 +555,7 @@ mod tests {
         let stream_id = stream.id;
         s.streams.insert_unique(stream).unwrap();
         s.tabs.push(Tab {
+            name: "Tab 1".to_string(),
             stream: stream_id,
             kind: TabKind::Stream,
             cursor: Some(Cursor::with([(

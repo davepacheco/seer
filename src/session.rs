@@ -259,12 +259,17 @@ pub enum TabKind {
 /// A tab in the TUI.
 ///
 /// A tab is a view onto exactly one [`LogStream`] (referenced by id; the
-/// stream lives in [`Session::streams`]).  `cursor` is the byte-offset
-/// [`Cursor`] the tab is currently scrolled to, captured at save time
-/// so a resumed session can land the viewport on the same record.
-/// `cursor` is `None` for an empty-or-unrendered tab.
+/// stream lives in [`Session::streams`]).  The tab's `name` is what the
+/// tab strip shows and what `--tab` matches against; it is independent
+/// of the backing stream's name so renaming a tab does not also rename
+/// the stream (and two tabs targeting the same stream can carry
+/// distinct names).  `cursor` is the byte-offset [`Cursor`] the tab is
+/// currently scrolled to, captured at save time so a resumed session
+/// can land the viewport on the same record.  `cursor` is `None` for
+/// an empty-or-unrendered tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Tab {
+    pub name: String,
     pub stream: LogStreamId,
     pub kind: TabKind,
     #[serde(default)]
@@ -465,6 +470,7 @@ mod tests {
         let mut s = Session::new();
         s.streams.insert_unique(stream).expect("unique id");
         s.tabs.push(Tab {
+            name: "Tab 1".to_string(),
             stream: stream_id,
             kind: TabKind::Stream,
             cursor: Some(cursor_at(42 * 100)),

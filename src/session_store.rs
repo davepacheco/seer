@@ -322,6 +322,7 @@ mod tests {
         let mut s = Session::new();
         s.streams.insert_unique(stream).expect("unique id");
         s.tabs.push(Tab {
+            name: "Tab 1".to_string(),
             stream: stream_id,
             kind: TabKind::Stream,
             cursor: Some(Cursor::with([(
