@@ -40,7 +40,7 @@
       "format": "date-time"
     },
     "sources": {
-      "description": "Sources this session was opened against.",
+      "description": "Sources this session was opened against.  Stored as an [`IdOrdMap`] keyed by id so the uniqueness invariant is encoded in the type, but serialized as a JSON array (same as [`Self::streams`]) — the `schemars(with = …)` annotation surfaces that shape to the schema generator, which has no `JsonSchema` impl for `IdOrdMap` of its own.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/SessionSource"

@@ -25,7 +25,7 @@ use crate::stream::{LogStream, LogStreamId};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
-use iddqd::IdOrdMap;
+use iddqd::{IdOrdItem, IdOrdMap, id_upcast};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -284,6 +284,16 @@ pub struct SessionSource {
     pub size: u64,
 }
 
+impl IdOrdItem for SessionSource {
+    type Key<'a> = SourceId;
+
+    fn key(&self) -> Self::Key<'_> {
+        self.id.clone()
+    }
+
+    id_upcast!();
+}
+
 /// Top-level session state.
 ///
 /// Designed to be the unit of persistence: serialize this and you've
@@ -300,8 +310,14 @@ pub struct Session {
     pub version: u32,
     /// Short id; also the filename stem on disk.
     pub id: SessionId,
-    /// Sources this session was opened against.
-    pub sources: Vec<SessionSource>,
+    /// Sources this session was opened against.  Stored as an
+    /// [`IdOrdMap`] keyed by id so the uniqueness invariant is encoded
+    /// in the type, but serialized as a JSON array (same as
+    /// [`Self::streams`]) — the `schemars(with = …)` annotation
+    /// surfaces that shape to the schema generator, which has no
+    /// `JsonSchema` impl for `IdOrdMap` of its own.
+    #[schemars(with = "Vec<SessionSource>")]
+    pub sources: IdOrdMap<SessionSource>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
     /// When the saver last successfully wrote this session to disk.
@@ -334,7 +350,7 @@ impl Session {
         Self {
             version: CURRENT_SESSION_VERSION,
             id: SessionId::random(),
-            sources: Vec::new(),
+            sources: IdOrdMap::new(),
             created_at: now,
             last_saved_at: now,
             last_pid: std::process::id(),

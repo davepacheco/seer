@@ -200,15 +200,17 @@ struct Args {
 fn build_session_sources(
     paths: &[Utf8PathBuf],
     engine: &mut Engine,
-) -> std::io::Result<Vec<SessionSource>> {
-    let mut sources = Vec::with_capacity(paths.len());
+) -> std::io::Result<iddqd::IdOrdMap<SessionSource>> {
+    let mut sources = iddqd::IdOrdMap::new();
     for path in paths {
         let canonical = path.canonicalize_utf8()?;
         let metadata = std::fs::metadata(&canonical)?;
         let size = metadata.len();
         let mtime: DateTime<Utc> = metadata.modified()?.into();
         let id = engine.add_file_source(&canonical)?;
-        sources.push(SessionSource { id, path: canonical, mtime, size });
+        sources
+            .insert_unique(SessionSource { id, path: canonical, mtime, size })
+            .expect("Engine::add_file_source returns a fresh SourceId");
     }
     Ok(sources)
 }
@@ -221,8 +223,9 @@ enum StartupChoice {
     /// Reuse this on-disk [`Session`].  The dialog already had a full
     /// [`Session`] in hand (it came from
     /// [`SessionStore::find_matches`]), so no second `load()` is
-    /// needed.
-    Resume(Session),
+    /// needed.  Boxed so the enum's other unit variants don't pay
+    /// for the `Session`'s bulk.
+    Resume(Box<Session>),
     /// Mint a fresh saved session: write to disk, plumb the
     /// [`SessionStore`] into [`App`].
     NewSaved,
@@ -276,7 +279,7 @@ impl StartupDialog {
             // `swap_remove` is fine — we are dropping `self` either
             // way, so element-order disturbance is irrelevant.
             let m = self.matches.swap_remove(self.selected);
-            StartupChoice::Resume(m.session)
+            StartupChoice::Resume(Box::new(m.session))
         } else if self.selected == self.new_saved_idx() {
             StartupChoice::NewSaved
         } else {
@@ -690,7 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // store: transient sessions get `None` and skip every write.
     let (session, store_for_app, resumed) = match choice {
         StartupChoice::Quit => return Ok(()),
-        StartupChoice::Resume(s) => (s, Some(store), true),
+        StartupChoice::Resume(s) => (*s, Some(store), true),
         StartupChoice::NewSaved => {
             let mut s = Session::new();
             s.sources = sources;
@@ -9459,17 +9462,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(sources.len(), 2);
-        // Order is preserved.
-        assert_eq!(sources[0].path, a_path.canonicalize_utf8().unwrap());
-        assert_eq!(sources[1].path, b_path.canonicalize_utf8().unwrap());
+        // Order is preserved (`IdOrdMap` iterates by id, which for
+        // file sources is the canonical path, so the two test files
+        // come out in the same lexical order they went in).
+        let by_id: Vec<&SessionSource> = sources.iter().collect();
+        assert_eq!(by_id[0].path, a_path.canonicalize_utf8().unwrap());
+        assert_eq!(by_id[1].path, b_path.canonicalize_utf8().unwrap());
         // Sizes match the bytes we wrote.
-        assert_eq!(sources[0].size, 6);
-        assert_eq!(sources[1].size, 0);
+        assert_eq!(by_id[0].size, 6);
+        assert_eq!(by_id[1].size, 0);
         // The SourceId the engine assigned matches the one recorded
         // in the SessionSource — that's the alignment cursors and
         // bookmarks rely on.
-        let id_as_str: &str = sources[0].id.as_ref();
-        assert_eq!(id_as_str, sources[0].path.as_str());
+        let id_as_str: &str = by_id[0].id.as_ref();
+        assert_eq!(id_as_str, by_id[0].path.as_str());
     }
 
     #[test]
@@ -9783,20 +9789,22 @@ mod tests {
         // Do *not* create `missing`.
 
         let mut s = Session::new();
-        s.sources = vec![
-            SessionSource {
+        s.sources
+            .insert_unique(SessionSource {
                 id: SourceId::from(exists.as_str().to_string()),
                 path: exists.clone(),
                 mtime: chrono::Utc::now(),
                 size: 3,
-            },
-            SessionSource {
+            })
+            .unwrap();
+        s.sources
+            .insert_unique(SessionSource {
                 id: SourceId::from(missing.as_str().to_string()),
                 path: missing.clone(),
                 mtime: chrono::Utc::now(),
                 size: 0,
-            },
-        ];
+            })
+            .unwrap();
         let Err(err) = engine_for_resumed_session(&s) else {
             panic!("expected error when a source file is missing");
         };
@@ -9817,24 +9825,26 @@ mod tests {
         std::fs::write(&b, b"").unwrap();
 
         let mut s = Session::new();
-        s.sources = vec![
-            SessionSource {
+        s.sources
+            .insert_unique(SessionSource {
                 id: SourceId::from(
                     a.canonicalize_utf8().unwrap().as_str().to_string(),
                 ),
                 path: a.canonicalize_utf8().unwrap(),
                 mtime: chrono::Utc::now(),
                 size: 3,
-            },
-            SessionSource {
+            })
+            .unwrap();
+        s.sources
+            .insert_unique(SessionSource {
                 id: SourceId::from(
                     b.canonicalize_utf8().unwrap().as_str().to_string(),
                 ),
                 path: b.canonicalize_utf8().unwrap(),
                 mtime: chrono::Utc::now(),
                 size: 0,
-            },
-        ];
+            })
+            .unwrap();
         let Ok(_engine) = engine_for_resumed_session(&s) else {
             panic!("expected engine_for_resumed_session to succeed");
         };

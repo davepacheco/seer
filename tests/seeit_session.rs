@@ -58,12 +58,15 @@ fn stage_sample(dir: &Utf8TempDir, name: &str) -> StagedSource {
 /// session id, the stream id, and the [`SessionSource`].
 fn build_session(staged: &StagedSource) -> (Session, seer::LogStreamId) {
     let mut session = Session::new();
-    session.sources.push(SessionSource {
-        id: seer::SourceId::from(staged.path.as_str().to_string()),
-        path: staged.path.clone(),
-        mtime: staged.mtime,
-        size: staged.size,
-    });
+    session
+        .sources
+        .insert_unique(SessionSource {
+            id: seer::SourceId::from(staged.path.as_str().to_string()),
+            path: staged.path.clone(),
+            mtime: staged.mtime,
+            size: staged.size,
+        })
+        .unwrap();
     let stream = LogStream::new("Tab 1".to_string());
     let stream_id = stream.id;
     session.streams.insert_unique(stream).unwrap();

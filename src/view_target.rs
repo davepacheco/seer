@@ -549,8 +549,8 @@ mod tests {
     /// the default (matches everything); callers tweak after the fact.
     fn fixture_session(dir: &camino::Utf8Path) -> Session {
         let mut s = Session::new();
-        s.sources.push(write_source(dir, "a.log", "{}\n"));
-        s.sources.push(write_source(dir, "b.log", "{}\n"));
+        s.sources.insert_unique(write_source(dir, "a.log", "{}\n")).unwrap();
+        s.sources.insert_unique(write_source(dir, "b.log", "{}\n")).unwrap();
         let stream = LogStream::new("Tab 1".to_string());
         let stream_id = stream.id;
         s.streams.insert_unique(stream).unwrap();

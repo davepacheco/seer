@@ -52,14 +52,15 @@ fn fresh_session_round_trips_through_save_and_load() {
     let dir = tempdir().unwrap();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut session = Session::new();
-    session.sources.push(synthetic_source("/log/a"));
+    session.sources.insert_unique(synthetic_source("/log/a")).unwrap();
     let id = session.id;
 
     store.save(id, &session).unwrap();
     let loaded = store.load(id).unwrap();
     assert_eq!(loaded.id, id);
     assert_eq!(loaded.sources.len(), 1);
-    assert_eq!(loaded.sources[0].path, Utf8PathBuf::from("/log/a"));
+    let first = loaded.sources.iter().next().expect("one source");
+    assert_eq!(first.path, Utf8PathBuf::from("/log/a"));
 }
 
 #[test]
@@ -72,7 +73,7 @@ fn inline_save_pattern_keeps_disk_state_current() {
     let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
 
     let mut session = Session::new();
-    session.sources.push(synthetic_source("/log/a"));
+    session.sources.insert_unique(synthetic_source("/log/a")).unwrap();
     let id = session.id;
     store.save(id, &session).unwrap();
     policy.mark_saved(Instant::now());
@@ -145,17 +146,17 @@ fn discovery_picks_overlapping_session_among_unrelated_ones() {
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
 
     let mut overlap = Session::new();
-    overlap.sources.push(synthetic_source("/log/a"));
-    overlap.sources.push(synthetic_source("/log/c"));
+    overlap.sources.insert_unique(synthetic_source("/log/a")).unwrap();
+    overlap.sources.insert_unique(synthetic_source("/log/c")).unwrap();
     store.save(overlap.id, &overlap).unwrap();
 
     let mut exact = Session::new();
-    exact.sources.push(synthetic_source("/log/a"));
-    exact.sources.push(synthetic_source("/log/b"));
+    exact.sources.insert_unique(synthetic_source("/log/a")).unwrap();
+    exact.sources.insert_unique(synthetic_source("/log/b")).unwrap();
     store.save(exact.id, &exact).unwrap();
 
     let mut unrelated = Session::new();
-    unrelated.sources.push(synthetic_source("/log/x"));
+    unrelated.sources.insert_unique(synthetic_source("/log/x")).unwrap();
     store.save(unrelated.id, &unrelated).unwrap();
 
     let user_paths =
@@ -182,7 +183,7 @@ fn resume_flow_recovers_user_bookmarks_and_streams_across_processes() {
     {
         let store = SessionStore::open_at(&sessions_dir).unwrap();
         let mut session = Session::new();
-        session.sources.push(synthetic_source("/log/a"));
+        session.sources.insert_unique(synthetic_source("/log/a")).unwrap();
         saved_id = session.id;
 
         let stream = LogStream::new("Tab 1".to_string());

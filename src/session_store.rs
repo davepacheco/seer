@@ -346,12 +346,14 @@ mod tests {
         let mut s = Session::new();
         s.last_saved_at = t(last_saved_at_secs);
         for p in paths {
-            s.sources.push(SessionSource {
-                id: SourceId::from((*p).to_string()),
-                path: Utf8PathBuf::from(*p),
-                mtime: t(0),
-                size: 0,
-            });
+            s.sources
+                .insert_unique(SessionSource {
+                    id: SourceId::from((*p).to_string()),
+                    path: Utf8PathBuf::from(*p),
+                    mtime: t(0),
+                    size: 0,
+                })
+                .expect("test inputs use unique paths");
         }
         let id = s.id;
         store.save(id, &s).unwrap();
