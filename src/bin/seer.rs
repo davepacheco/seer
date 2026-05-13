@@ -830,6 +830,12 @@ fn format_byte_rate(bytes_per_sec: f64) -> String {
 /// suppressed.  The end-of-stream marker still surfaces in that case
 /// because `at_eof` is derived from the materialization, not the
 /// streamview.
+///
+/// Summary tabs are a separate case: their rows are histogram entries,
+/// not records, so the "Showing N records …" framing doesn't apply
+/// and `event_for_line` is empty (the line→event map only exists for
+/// tabs whose lines come from real events).  Those tabs get a row-
+/// position string instead.
 fn format_user_status(
     tab: &Tab,
     engine: &Engine,
@@ -839,7 +845,24 @@ fn format_user_status(
     at_eof: bool,
 ) -> String {
     let total_lines = tab.formatted().len();
-    let records_shown = if top < bottom && bottom <= total_lines {
+    if tab.kind == TabKind::Summary {
+        let mut s = if total_lines == 0 {
+            "Summary: no rows".to_string()
+        } else {
+            format!(
+                "Showing summary rows {}-{} of {}",
+                top + 1,
+                bottom,
+                total_lines
+            )
+        };
+        if at_eof {
+            s.push_str("  ·  (end of summary)");
+        }
+        return s;
+    }
+    let records_shown = if top < bottom && bottom <= tab.event_for_line().len()
+    {
         tab.event_for_line()[bottom - 1].get() - tab.event_for_line()[top].get()
             + 1
     } else {
@@ -10093,6 +10116,21 @@ mod tests {
             "expected `Summary N`, got {:?}",
             a.active_tab().name,
         );
+    }
+
+    #[test]
+    fn summary_tab_renders_after_build_completes() {
+        // Regression: after a Summary build finalizes, the tab's
+        // `event_for_line` is empty (Summary tabs have no underlying
+        // events, only histogram rows).  `format_user_status` used to
+        // index into that empty slice and panic on the next frame.
+        let (mut a, _dir) =
+            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
+        a.handle_key(shift('S'));
+        a.drain_long_op();
+        let backend = TestBackend::new(160, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
     }
 
     // ---------- persistent-session plumbing (phase 5) ----------
