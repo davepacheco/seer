@@ -142,17 +142,31 @@ pub enum Level {
     Fatal,
 }
 
+/// Single source of truth for the bunyan numeric ↔ [`Level`] mapping.
+/// Walked by [`Level::as_bunyan_number`], the [`TryFrom<u8>`] impl, and
+/// the [`schemars::JsonSchema`] impl below.  Ordered by ascending
+/// severity, matching the `Level` variant order.
+///
+/// The pair is `(bunyan number, level)`; adding a new severity is a
+/// one-line edit here.  The round-trip test
+/// `tests::level_round_trip_numbers` catches a missing entry by
+/// failing `as_bunyan_number` for the unlisted variant.
+const BUNYAN_LEVELS: &[(u8, Level)] = &[
+    (10, Level::Trace),
+    (20, Level::Debug),
+    (30, Level::Info),
+    (40, Level::Warn),
+    (50, Level::Error),
+    (60, Level::Fatal),
+];
+
 impl Level {
     /// Returns the numeric value used by the bunyan format.
     pub fn as_bunyan_number(self) -> u8 {
-        match self {
-            Self::Trace => 10,
-            Self::Debug => 20,
-            Self::Info => 30,
-            Self::Warn => 40,
-            Self::Error => 50,
-            Self::Fatal => 60,
-        }
+        BUNYAN_LEVELS
+            .iter()
+            .find_map(|&(n, level)| (level == self).then_some(n))
+            .expect("BUNYAN_LEVELS covers every Level variant")
     }
 
     /// Returns the short uppercase name (e.g. `"INFO"`).
@@ -188,15 +202,10 @@ impl TryFrom<u8> for Level {
     type Error = UnknownLevel;
 
     fn try_from(value: u8) -> Result<Self, UnknownLevel> {
-        match value {
-            10 => Ok(Self::Trace),
-            20 => Ok(Self::Debug),
-            30 => Ok(Self::Info),
-            40 => Ok(Self::Warn),
-            50 => Ok(Self::Error),
-            60 => Ok(Self::Fatal),
-            n => Err(UnknownLevel(n)),
-        }
+        BUNYAN_LEVELS
+            .iter()
+            .find_map(|&(n, level)| (n == value).then_some(level))
+            .ok_or(UnknownLevel(value))
     }
 }
 
@@ -233,14 +242,12 @@ impl schemars::JsonSchema for Level {
     ) -> schemars::schema::Schema {
         schemars::schema::SchemaObject {
             instance_type: Some(schemars::schema::InstanceType::Integer.into()),
-            enum_values: Some(vec![
-                serde_json::json!(10),
-                serde_json::json!(20),
-                serde_json::json!(30),
-                serde_json::json!(40),
-                serde_json::json!(50),
-                serde_json::json!(60),
-            ]),
+            enum_values: Some(
+                BUNYAN_LEVELS
+                    .iter()
+                    .map(|&(n, _)| serde_json::json!(n))
+                    .collect(),
+            ),
             ..Default::default()
         }
         .into()
