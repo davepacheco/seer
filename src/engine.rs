@@ -13,10 +13,10 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
+use crate::position::LogStreamPosition;
 use crate::source::{
     ByteLen, ByteOffset, FileSource, Source, SourceError, SourceId,
 };
-use crate::stream::LogStreamPosition;
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;

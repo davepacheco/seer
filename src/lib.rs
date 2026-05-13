@@ -26,6 +26,7 @@ pub use engine::{
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Form, Predicate, TimeOp};
+pub use position::LogStreamPosition;
 pub use render::{
     HostnameDisplay, RenderOpts, ShowDate, format_event, format_time,
     short_hostname,
@@ -42,7 +43,7 @@ pub use source::{
     ByteLen, ByteOffset, Direction, FileSource, QueryRecord, Source,
     SourceError, SourceId, SourceMetadata,
 };
-pub use stream::{LogStream, LogStreamId, LogStreamPosition};
+pub use stream::{LogStream, LogStreamId};
 pub use streamview::{
     ParseStats, RecordKey, RenderedLine, SEARCH_BUDGET, SearchAnchor,
     SearchDir, SearchOutcome, StreamView, WindowFillStatus,

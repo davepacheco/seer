@@ -12,8 +12,6 @@
 
 use crate::filter::Filter;
 use crate::render::{HostnameDisplay, RenderOpts};
-use crate::source::SourceId;
-use chrono::{DateTime, Utc};
 use derive_more::{Display, From};
 use iddqd::{IdOrdItem, id_upcast};
 use schemars::JsonSchema;
@@ -43,67 +41,6 @@ impl LogStreamId {
     /// Returns a freshly-generated random id.
     pub fn new_v4() -> Self {
         Self(Uuid::new_v4())
-    }
-}
-
-/// Position within a log stream — a stable anchor that survives filter
-/// changes.
-///
-/// A position pins down a specific event by `(source, time,
-/// ordinal_within_time)`.  Same-time tiebreaking happens via
-/// `ordinal_within_time`: the first event with a given `(source, time)`
-/// has ordinal 0, the next has 1, and so on.  This shape was chosen so
-/// that adding/removing predicates from the active filter never moves
-/// what a saved position refers to: only the row index that position
-/// resolves to in a filtered view changes.
-///
-/// The fields are private so future representations (e.g. a content
-/// fingerprint to survive file rewrites) can be added without breaking
-/// callers.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    JsonSchema,
-)]
-pub struct LogStreamPosition {
-    source: SourceId,
-    time: DateTime<Utc>,
-    /// 0-based count of events from the same `source` with this exact
-    /// `time`.
-    ordinal_within_time: u64,
-}
-
-impl LogStreamPosition {
-    /// Builds a position from its component parts.
-    pub fn new(
-        source: SourceId,
-        time: DateTime<Utc>,
-        ordinal_within_time: u64,
-    ) -> Self {
-        Self { source, time, ordinal_within_time }
-    }
-
-    /// Returns the source this position refers to.
-    pub fn source(&self) -> &SourceId {
-        &self.source
-    }
-
-    /// Returns the timestamp of the event at this position.
-    pub fn time(&self) -> DateTime<Utc> {
-        self.time
-    }
-
-    /// Returns the within-source same-timestamp tiebreaker for this
-    /// position.
-    pub fn ordinal_within_time(&self) -> u64 {
-        self.ordinal_within_time
     }
 }
 
