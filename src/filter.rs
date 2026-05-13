@@ -34,7 +34,7 @@
 //! is what's stored.
 
 use crate::event::{Event, Level};
-use crate::source::SourceId;
+use crate::position::SourceId;
 use chrono::{DateTime, SecondsFormat, Utc};
 use regex::Regex;
 use schemars::JsonSchema;

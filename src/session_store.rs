@@ -308,10 +308,10 @@ fn resolve_state_dir(
 mod tests {
     use super::*;
     use crate::engine::Cursor;
+    use crate::position::{ByteOffset, SourceId};
     use crate::session::{
         Session, SessionIdParseError, SessionSource, Tab, TabKind,
     };
-    use crate::source::{ByteOffset, SourceId};
     use crate::stream::LogStream;
     use camino_tempfile::tempdir;
     use chrono::{DateTime, TimeZone, Utc};

@@ -12,12 +12,183 @@
 //! implementation) makes the layering match the data: the session and
 //! the streamview can talk about positions without depending on the
 //! merge implementation.
+//!
+//! [`SourceId`], [`ByteOffset`], and [`ByteLen`] live here too —
+//! they're the primitive position types that the [`Cursor`] and
+//! [`LogStreamPosition`] are built on, and putting them at this layer
+//! lets `crate::filter` reference [`SourceId`] without taking a
+//! dependency on `crate::source` (closing the
+//! `filter ↔ source` cycle that the old placement created).
 
-use crate::source::{ByteOffset, SourceId};
 use chrono::{DateTime, Utc};
+use derive_more::{AsRef, Display, From};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ops::{Add, AddAssign, Sub};
+
+/// Identifier for a source.
+///
+/// Wraps a string so different `Source` impls can choose the most useful
+/// shape for their identifier (canonicalized path, archive entry name,
+/// URL, etc.) without forcing a single representation on the type.
+///
+/// Implements `Serialize`/`Deserialize` so it can ride inside a
+/// [`LogStreamPosition`] in persisted session state.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    From,
+    AsRef,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[as_ref(forward)]
+#[serde(transparent)]
+pub struct SourceId(String);
+
+/// Byte offset into a source's underlying bytes.
+///
+/// A newtype around `u64` so an offset can't be silently confused
+/// with a length, count, or any other unsigned quantity that turns up
+/// in adjacent code.  `Copy + Ord` so it can be used as a `BTreeMap`
+/// key (the engine's eventual merged-stream cursor is a
+/// `BTreeMap<SourceId, ByteOffset>`).
+///
+/// Convention: an offset always names the byte at which the *next*
+/// record would start when scanning forward — equivalently, the byte
+/// just past the end of the previous record.  Backward scans honor
+/// the same convention: an offset of `N` reads the record whose end
+/// is at `N`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    From,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct ByteOffset(u64);
+
+impl ByteOffset {
+    /// Byte offset zero — the start of any source.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the offset as a raw `u64`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Byte length: a span of bytes within a source.
+///
+/// Newtype companion to [`ByteOffset`].  The pair encodes the
+/// arithmetic the engine repeatedly performs on byte counts: an
+/// offset plus a length yields another offset, two lengths add to a
+/// length, an offset minus a length yields an offset.  Mixing the
+/// two in any other shape is a compile error, which catches the
+/// otherwise-invisible bug of (e.g.) adding two offsets.
+///
+/// `#[serde(transparent)]` so persisted shapes are bare `u64`s on
+/// disk — switching a previously-`u64` field to `ByteLen` is a
+/// type-only change with no schema impact.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    From,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct ByteLen(u64);
+
+impl ByteLen {
+    /// Length zero.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the length as a raw `u64`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Saturating subtraction: `a - b`, clamped at [`Self::ZERO`].
+    /// Used by the long-op drivers' "bytes since op start" math
+    /// where wall-clock skew between the snapshot and the latest
+    /// reading could otherwise underflow.
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+impl Add for ByteLen {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl AddAssign for ByteLen {
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
+    }
+}
+
+impl Sub for ByteLen {
+    type Output = Self;
+    fn sub(self, other: Self) -> Self {
+        Self(self.0 - other.0)
+    }
+}
+
+impl std::iter::Sum for ByteLen {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|b| b.0).sum())
+    }
+}
+
+impl Add<ByteLen> for ByteOffset {
+    type Output = ByteOffset;
+    fn add(self, len: ByteLen) -> ByteOffset {
+        ByteOffset(self.0 + len.0)
+    }
+}
+
+impl AddAssign<ByteLen> for ByteOffset {
+    fn add_assign(&mut self, len: ByteLen) {
+        self.0 += len.0;
+    }
+}
+
+impl Sub<ByteLen> for ByteOffset {
+    type Output = ByteOffset;
+    fn sub(self, len: ByteLen) -> ByteOffset {
+        ByteOffset(self.0 - len.0)
+    }
+}
 
 /// Merged-stream byte-offset position — one [`ByteOffset`] per source.
 ///

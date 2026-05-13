@@ -28,8 +28,9 @@ use crate::engine::{
 };
 use crate::event::Event;
 use crate::filter::Filter;
+use crate::position::{ByteLen, ByteOffset, SourceId};
 use crate::render::{RenderOpts, format_event};
-use crate::source::{ByteLen, ByteOffset, Direction, SourceId};
+use crate::source::Direction;
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use std::collections::VecDeque;

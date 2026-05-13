@@ -29,7 +29,7 @@ pub use filter::{
     EventPredicate, Filter, FilterParseError, Form, Predicate, SourcePredicate,
     TimeOp,
 };
-pub use position::LogStreamPosition;
+pub use position::{ByteLen, ByteOffset, LogStreamPosition, SourceId};
 pub use render::{
     HostnameDisplay, RenderOpts, ShowDate, format_event, format_time,
     short_hostname,
@@ -43,8 +43,7 @@ pub use session_store::{
     MatchKind, STATE_DIR_ENV, SessionMatch, SessionStore, StoreError,
 };
 pub use source::{
-    ByteLen, ByteOffset, Direction, FileSource, QueryRecord, Source,
-    SourceError, SourceId, SourceMetadata,
+    Direction, FileSource, QueryRecord, Source, SourceError, SourceMetadata,
 };
 pub use stream::{LogStream, LogStreamId};
 pub use streamview::{

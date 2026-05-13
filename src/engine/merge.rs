@@ -18,10 +18,8 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::position::Cursor;
-use crate::source::{
-    ByteLen, ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
-};
+use crate::position::{ByteLen, ByteOffset, Cursor, SourceId};
+use crate::source::{Direction, QueryRecord, Source, SourceError};
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 use std::sync::Arc;

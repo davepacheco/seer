@@ -20,7 +20,7 @@
 //! shim keyed on `version`.
 
 use crate::engine::Cursor;
-use crate::source::SourceId;
+use crate::position::SourceId;
 use crate::stream::{LogStream, LogStreamId};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
@@ -420,7 +420,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{ByteOffset, SourceId};
+    use crate::position::{ByteOffset, SourceId};
     use chrono::TimeZone;
 
     fn t(secs: i64) -> DateTime<Utc> {

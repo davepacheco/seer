@@ -18,177 +18,12 @@
 
 use crate::event::{Event, Hostname, LoggerName};
 use crate::filter::{EventPredicate, Filter, Predicate};
+use crate::position::{ByteLen, ByteOffset, SourceId};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
-use derive_more::{AsRef, Display, From};
-use schemars::JsonSchema;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::iter;
-use std::ops::{Add, AddAssign, Sub};
-
-/// Identifier for a source.
-///
-/// Wraps a string so different `Source` impls can choose the most useful
-/// shape for their identifier (canonicalized path, archive entry name,
-/// URL, etc.) without forcing a single representation on the type.
-///
-/// Implements `Serialize`/`Deserialize` so it can ride inside a
-/// [`crate::stream::LogStreamPosition`] in persisted session state.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Display,
-    From,
-    AsRef,
-    serde::Serialize,
-    serde::Deserialize,
-    JsonSchema,
-)]
-#[as_ref(forward)]
-#[serde(transparent)]
-pub struct SourceId(String);
-
-/// Byte offset into a source's underlying bytes.
-///
-/// A newtype around `u64` so an offset can't be silently confused
-/// with a length, count, or any other unsigned quantity that turns up
-/// in adjacent code.  `Copy + Ord` so it can be used as a `BTreeMap`
-/// key (the engine's eventual merged-stream cursor is a
-/// `BTreeMap<SourceId, ByteOffset>`).
-///
-/// Convention: an offset always names the byte at which the *next*
-/// record would start when scanning forward — equivalently, the byte
-/// just past the end of the previous record.  Backward scans honor
-/// the same convention: an offset of `N` reads the record whose end
-/// is at `N`.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Display,
-    From,
-    serde::Serialize,
-    serde::Deserialize,
-    JsonSchema,
-)]
-#[serde(transparent)]
-pub struct ByteOffset(u64);
-
-impl ByteOffset {
-    /// Byte offset zero — the start of any source.
-    pub const ZERO: Self = Self(0);
-
-    /// Returns the offset as a raw `u64`.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Byte length: a span of bytes within a source.
-///
-/// Newtype companion to [`ByteOffset`].  The pair encodes the
-/// arithmetic the engine repeatedly performs on byte counts: an
-/// offset plus a length yields another offset, two lengths add to a
-/// length, an offset minus a length yields an offset.  Mixing the
-/// two in any other shape is a compile error, which catches the
-/// otherwise-invisible bug of (e.g.) adding two offsets.
-///
-/// `#[serde(transparent)]` so persisted shapes are bare `u64`s on
-/// disk — switching a previously-`u64` field to `ByteLen` is a
-/// type-only change with no schema impact.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    Display,
-    From,
-    serde::Serialize,
-    serde::Deserialize,
-    JsonSchema,
-)]
-#[serde(transparent)]
-pub struct ByteLen(u64);
-
-impl ByteLen {
-    /// Length zero.
-    pub const ZERO: Self = Self(0);
-
-    /// Returns the length as a raw `u64`.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// Saturating subtraction: `a - b`, clamped at [`Self::ZERO`].
-    /// Used by the long-op drivers' "bytes since op start" math
-    /// where wall-clock skew between the snapshot and the latest
-    /// reading could otherwise underflow.
-    pub fn saturating_sub(self, other: Self) -> Self {
-        Self(self.0.saturating_sub(other.0))
-    }
-}
-
-impl Add for ByteLen {
-    type Output = Self;
-    fn add(self, other: Self) -> Self {
-        Self(self.0 + other.0)
-    }
-}
-
-impl AddAssign for ByteLen {
-    fn add_assign(&mut self, other: Self) {
-        self.0 += other.0;
-    }
-}
-
-impl Sub for ByteLen {
-    type Output = Self;
-    fn sub(self, other: Self) -> Self {
-        Self(self.0 - other.0)
-    }
-}
-
-impl std::iter::Sum for ByteLen {
-    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-        Self(iter.map(|b| b.0).sum())
-    }
-}
-
-impl Add<ByteLen> for ByteOffset {
-    type Output = ByteOffset;
-    fn add(self, len: ByteLen) -> ByteOffset {
-        ByteOffset(self.0 + len.0)
-    }
-}
-
-impl AddAssign<ByteLen> for ByteOffset {
-    fn add_assign(&mut self, len: ByteLen) {
-        self.0 += len.0;
-    }
-}
-
-impl Sub<ByteLen> for ByteOffset {
-    type Output = ByteOffset;
-    fn sub(self, len: ByteLen) -> ByteOffset {
-        ByteOffset(self.0 - len.0)
-    }
-}
 
 /// Direction of a [`Source::query`] scan.
 ///
@@ -623,13 +458,13 @@ fn scan_forward(
             break;
         }
         walks += 1;
-        let length = ByteLen(n as u64);
+        let length = ByteLen::from(n as u64);
         let line = buf.trim_end_matches(['\r', '\n']);
         let parsed =
             serde_json::from_str::<Event>(line).map_err(SourceError::from);
         push_if_accepted(
             results,
-            ByteOffset(current_offset),
+            ByteOffset::from(current_offset),
             length,
             parsed,
             line.to_string(),
@@ -637,7 +472,7 @@ fn scan_forward(
         );
         current_offset += length.get();
     }
-    Ok((ByteLen(current_offset - start_offset), eof))
+    Ok((ByteLen::from(current_offset - start_offset), eof))
 }
 
 /// Walks `file` backward from `start_offset`, reading one record at
@@ -669,7 +504,7 @@ fn scan_backward(
             break;
         }
         let (record_start, bytes) = read_record_before(file, cursor)?;
-        let length = ByteLen(cursor - record_start);
+        let length = ByteLen::from(cursor - record_start);
         walks += 1;
         // Trim a single trailing `\r\n` or `\n` for parsing without
         // copying the bytes — `serde_json::from_slice` handles UTF-8
@@ -689,7 +524,7 @@ fn scan_backward(
         let raw = String::from_utf8_lossy(content).into_owned();
         push_if_accepted(
             results,
-            ByteOffset(record_start),
+            ByteOffset::from(record_start),
             length,
             parsed,
             raw,
@@ -697,7 +532,7 @@ fn scan_backward(
         );
         cursor = record_start;
     }
-    Ok((ByteLen(start_offset - cursor), eof))
+    Ok((ByteLen::from(start_offset - cursor), eof))
 }
 
 /// Pushes a [`QueryRecord`] for a parsed line into `results`,

@@ -515,8 +515,8 @@ fn shell_quote(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::engine::Cursor;
+    use crate::position::{ByteOffset, SourceId};
     use crate::session::{Bookmark, BookmarkId, BookmarkName, Session, Tab};
-    use crate::source::{ByteOffset, SourceId};
     use crate::stream::LogStream;
     use camino_tempfile::tempdir;
     use chrono::TimeZone;

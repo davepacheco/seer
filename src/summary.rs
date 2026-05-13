@@ -34,7 +34,7 @@
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::source::SourceId;
+use crate::position::SourceId;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{BTreeSet, HashMap};
 
