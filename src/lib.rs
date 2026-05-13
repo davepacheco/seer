@@ -9,13 +9,13 @@ pub mod event;
 pub mod filter;
 pub mod render;
 pub mod save_policy;
-pub mod seeit_target;
 pub mod session;
 pub mod session_store;
 pub mod source;
 pub mod stream;
 pub mod streamview;
 pub mod summary;
+pub mod view_target;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures;
@@ -29,10 +29,6 @@ pub use render::{
     HostnameDisplay, RenderOpts, format_event, format_time, short_hostname,
 };
 pub use save_policy::{Cadence, SavePolicy};
-pub use seeit_target::{
-    BookmarkChoice, ResolveError, ResolvedMode, ResolvedTarget, Selector,
-    build_seeit_command, resolve, resolve_in_session,
-};
 pub use session::{
     Bookmark, BookmarkId, BookmarkName, CURRENT_SESSION_VERSION, Session,
     SessionId, SessionIdParseError, SessionSource, Tab, TabKind,
@@ -52,4 +48,8 @@ pub use streamview::{
 pub use summary::{
     FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,
     summarize,
+};
+pub use view_target::{
+    BookmarkChoice, ResolveError, ResolvedMode, ResolvedTarget, Selector,
+    build_seeit_command, resolve, resolve_in_session,
 };
