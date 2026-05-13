@@ -5838,6 +5838,141 @@ mod tests {
         out
     }
 
+    // ---------- line editor (shared by dialogs) ----------
+
+    /// Drives `LineEditor` through a sequence of typed characters,
+    /// asserting each keystroke was consumed.  Mirrors `type_into` but
+    /// targets the editor primitive directly so these tests stay valid
+    /// regardless of which dialog embeds the editor.
+    fn feed(e: &mut LineEditor, s: &str) {
+        for c in s.chars() {
+            assert!(matches!(
+                e.handle_edit(key(KeyCode::Char(c))),
+                EditAction::Handled,
+            ));
+        }
+    }
+
+    #[test]
+    fn line_editor_typing_inserts_at_cursor() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "name=Nexus");
+        assert_eq!(e.text, "name=Nexus");
+        assert_eq!(e.cursor, "name=Nexus".len());
+    }
+
+    #[test]
+    fn line_editor_backspace_deletes_char_before_cursor() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(key(KeyCode::Backspace));
+        assert_eq!(e.text, "ab");
+        assert_eq!(e.cursor, 2);
+    }
+
+    #[test]
+    fn line_editor_left_right_home_end_move_cursor() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(key(KeyCode::Left));
+        assert_eq!(e.cursor, 2);
+        e.handle_edit(key(KeyCode::Home));
+        assert_eq!(e.cursor, 0);
+        e.handle_edit(key(KeyCode::Right));
+        assert_eq!(e.cursor, 1);
+        e.handle_edit(key(KeyCode::End));
+        assert_eq!(e.cursor, 3);
+    }
+
+    #[test]
+    fn line_editor_delete_removes_char_after_cursor() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(key(KeyCode::Home));
+        e.handle_edit(key(KeyCode::Delete));
+        assert_eq!(e.text, "bc");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn line_editor_ctrl_u_kills_to_start_of_line() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "level>=warn name=Nexus");
+        // Position cursor inside "Nexus".
+        for _ in 0..3 {
+            e.handle_edit(key(KeyCode::Left));
+        }
+        let cursor_before = e.cursor;
+        e.handle_edit(ctrl('u'));
+        assert_eq!(e.text, "xus");
+        assert_eq!(e.cursor, 0);
+        assert!(cursor_before > 0);
+    }
+
+    #[test]
+    fn line_editor_ctrl_u_at_start_is_noop() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "abc");
+        e.handle_edit(key(KeyCode::Home));
+        e.handle_edit(ctrl('u'));
+        assert_eq!(e.text, "abc");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn line_editor_ctrl_w_kills_previous_whitespace_word() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "level>=warn name=Nexus");
+        e.handle_edit(ctrl('w'));
+        // The whole `name=Nexus` token disappears, plus the space.
+        assert_eq!(e.text, "level>=warn ");
+        assert_eq!(e.cursor, "level>=warn ".len());
+    }
+
+    #[test]
+    fn line_editor_ctrl_w_consumes_trailing_whitespace_first() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "name=Nexus   ");
+        e.handle_edit(ctrl('w'));
+        assert_eq!(e.text, "");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn line_editor_alt_b_moves_back_one_alphanumeric_word() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "level>=warn name=Nexus");
+        e.handle_edit(alt('b'));
+        assert_eq!(&e.text[e.cursor..], "Nexus");
+        e.handle_edit(alt('b'));
+        assert_eq!(&e.text[e.cursor..], "name=Nexus");
+        e.handle_edit(alt('b'));
+        assert_eq!(&e.text[e.cursor..], "warn name=Nexus");
+        e.handle_edit(alt('b'));
+        assert_eq!(e.cursor, 0);
+        // Once more: clamped at zero.
+        e.handle_edit(alt('b'));
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn line_editor_alt_f_moves_forward_one_alphanumeric_word() {
+        let mut e = LineEditor::new(String::new());
+        feed(&mut e, "level>=warn name=Nexus");
+        e.handle_edit(key(KeyCode::Home));
+        e.handle_edit(alt('f'));
+        assert_eq!(&e.text[..e.cursor], "level");
+        e.handle_edit(alt('f'));
+        assert_eq!(&e.text[..e.cursor], "level>=warn");
+        e.handle_edit(alt('f'));
+        assert_eq!(&e.text[..e.cursor], "level>=warn name");
+        e.handle_edit(alt('f'));
+        assert_eq!(e.cursor, e.text.len());
+        // Once more: clamped.
+        e.handle_edit(alt('f'));
+        assert_eq!(e.cursor, e.text.len());
+    }
+
     // ---------- filter dialog ----------
 
     #[test]
@@ -5870,144 +6005,6 @@ mod tests {
         // without homing first.
         assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
         assert!(d.parse_error().is_none());
-    }
-
-    #[test]
-    fn dialog_typing_inserts_at_cursor() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "name=Nexus");
-        assert_eq!(d.editor().unwrap().text, "name=Nexus");
-        assert_eq!(d.editor().unwrap().cursor, "name=Nexus".len());
-    }
-
-    #[test]
-    fn dialog_backspace_deletes_char_before_cursor() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "abc");
-        d.handle_key(key(KeyCode::Backspace));
-        assert_eq!(d.editor().unwrap().text, "ab");
-        assert_eq!(d.editor().unwrap().cursor, 2);
-    }
-
-    #[test]
-    fn dialog_left_right_move_cursor() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "abc");
-        d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.editor().unwrap().cursor, 2);
-        d.handle_key(key(KeyCode::Home));
-        assert_eq!(d.editor().unwrap().cursor, 0);
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.editor().unwrap().cursor, 1);
-        d.handle_key(key(KeyCode::End));
-        assert_eq!(d.editor().unwrap().cursor, 3);
-    }
-
-    #[test]
-    fn dialog_delete_removes_char_after_cursor() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "abc");
-        d.handle_key(key(KeyCode::Home));
-        d.handle_key(key(KeyCode::Delete));
-        assert_eq!(d.editor().unwrap().text, "bc");
-        assert_eq!(d.editor().unwrap().cursor, 0);
-    }
-
-    #[test]
-    fn dialog_ctrl_u_kills_to_start_of_line() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "level>=warn name=Nexus");
-        // Position cursor inside "Nexus".
-        for _ in 0..3 {
-            d.handle_key(key(KeyCode::Left));
-        }
-        let cursor_before = d.editor().unwrap().cursor;
-        d.handle_key(ctrl('u'));
-        assert_eq!(d.editor().unwrap().text, "xus");
-        assert_eq!(d.editor().unwrap().cursor, 0);
-        assert!(cursor_before > 0);
-    }
-
-    #[test]
-    fn dialog_ctrl_u_at_start_is_noop() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "abc");
-        d.handle_key(key(KeyCode::Home));
-        d.handle_key(ctrl('u'));
-        assert_eq!(d.editor().unwrap().text, "abc");
-        assert_eq!(d.editor().unwrap().cursor, 0);
-    }
-
-    #[test]
-    fn dialog_ctrl_w_kills_previous_whitespace_word() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "level>=warn name=Nexus");
-        d.handle_key(ctrl('w'));
-        // The whole `name=Nexus` token disappears, plus the space.
-        assert_eq!(d.editor().unwrap().text, "level>=warn ");
-        assert_eq!(d.editor().unwrap().cursor, "level>=warn ".len());
-    }
-
-    #[test]
-    fn dialog_ctrl_w_consumes_trailing_whitespace_first() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "name=Nexus   ");
-        d.handle_key(ctrl('w'));
-        assert_eq!(d.editor().unwrap().text, "");
-        assert_eq!(d.editor().unwrap().cursor, 0);
-    }
-
-    #[test]
-    fn dialog_alt_b_moves_back_one_alphanumeric_word() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "level>=warn name=Nexus");
-        d.handle_key(alt('b'));
-        assert_eq!(
-            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
-            "Nexus"
-        );
-        d.handle_key(alt('b'));
-        assert_eq!(
-            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
-            "name=Nexus"
-        );
-        d.handle_key(alt('b'));
-        assert_eq!(
-            &d.editor().unwrap().text[d.editor().unwrap().cursor..],
-            "warn name=Nexus",
-        );
-        d.handle_key(alt('b'));
-        assert_eq!(d.editor().unwrap().cursor, 0);
-        // Once more: clamped at zero.
-        d.handle_key(alt('b'));
-        assert_eq!(d.editor().unwrap().cursor, 0);
-    }
-
-    #[test]
-    fn dialog_alt_f_moves_forward_one_alphanumeric_word() {
-        let mut d = Dialog::filter(&Filter::default());
-        type_into(&mut d, "level>=warn name=Nexus");
-        d.handle_key(key(KeyCode::Home));
-        d.handle_key(alt('f'));
-        assert_eq!(
-            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
-            "level"
-        );
-        d.handle_key(alt('f'));
-        assert_eq!(
-            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
-            "level>=warn"
-        );
-        d.handle_key(alt('f'));
-        assert_eq!(
-            &d.editor().unwrap().text[..d.editor().unwrap().cursor],
-            "level>=warn name",
-        );
-        d.handle_key(alt('f'));
-        assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
-        // Once more: clamped.
-        d.handle_key(alt('f'));
-        assert_eq!(d.editor().unwrap().cursor, d.editor().unwrap().text.len());
     }
 
     #[test]
@@ -6554,14 +6551,6 @@ mod tests {
             d,
             Dialog::Search { direction: SearchDirection::Backward, .. }
         ));
-    }
-
-    #[test]
-    fn search_dialog_typing_inserts() {
-        let mut a = search_app();
-        a.handle_key(key(KeyCode::Char('/')));
-        type_into(a.dialog.as_mut().unwrap(), "alpha");
-        assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "alpha");
     }
 
     #[test]
