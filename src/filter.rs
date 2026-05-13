@@ -1658,4 +1658,208 @@ mod tests {
         let back: Filter = serde_json::from_str(&json).unwrap();
         assert_eq!(f.to_string(), back.to_string());
     }
+
+    // ---------- property tests ----------
+
+    use proptest::prelude::*;
+
+    /// Strategy: any [`Level`].
+    fn arb_level() -> impl Strategy<Value = Level> {
+        prop_oneof![
+            Just(Level::Trace),
+            Just(Level::Debug),
+            Just(Level::Info),
+            Just(Level::Warn),
+            Just(Level::Error),
+            Just(Level::Fatal),
+        ]
+    }
+
+    /// Strategy: any [`Form`].
+    fn arb_form() -> impl Strategy<Value = Form> {
+        prop_oneof![Just(Form::Affirmed), Just(Form::Negated)]
+    }
+
+    /// Strategy: a [`FieldName`] over a small pool of core fields and
+    /// extras.  The values overlap with what [`arb_event`] populates,
+    /// so a non-trivial fraction of generated predicates actually
+    /// match the generated events (the property test would be
+    /// vacuously true if every predicate trivially failed).
+    fn arb_field_name() -> impl Strategy<Value = FieldName> {
+        prop_oneof![
+            Just(FieldName::Core(CoreField::Name)),
+            Just(FieldName::Core(CoreField::Hostname)),
+            Just(FieldName::Core(CoreField::Pid)),
+            Just(FieldName::Core(CoreField::Msg)),
+            Just(FieldName::Core(CoreField::V)),
+            prop::sample::select(vec!["build", "component", "absent"])
+                .prop_map(|s| FieldName::Extra(s.to_string())),
+        ]
+    }
+
+    /// Strategy: a [`Regex`] from a small pool of patterns.  Building
+    /// arbitrary valid regex syntax is more work than this property
+    /// test warrants; a handful of fixed patterns gives the matcher a
+    /// realistic mix of "matches" and "doesn't match" outcomes against
+    /// the message corpus in [`arb_event`].
+    fn arb_regex() -> impl Strategy<Value = Regex> {
+        prop::sample::select(vec![
+            "boom",
+            "^starting",
+            "blueprint",
+            r"\d+",
+            "[xyz]+",
+            ".*",
+        ])
+        .prop_map(|src| Regex::new(src).unwrap())
+    }
+
+    /// Strategy: a [`TimeOp`].
+    fn arb_time_op() -> impl Strategy<Value = TimeOp> {
+        prop_oneof![
+            Just(TimeOp::AtLeast),
+            Just(TimeOp::After),
+            Just(TimeOp::AtMost),
+            Just(TimeOp::Before),
+        ]
+    }
+
+    /// Strategy: a [`DateTime`] from a small pool overlapping with
+    /// [`arb_event`]'s timestamps.
+    fn arb_time() -> impl Strategy<Value = DateTime<Utc>> {
+        prop::sample::select(vec![
+            "2026-04-01T00:00:00Z",
+            "2026-05-01T00:00:00Z",
+            "2026-05-09T12:00:00Z",
+            "2026-05-15T00:00:00Z",
+        ])
+        .prop_map(|s| {
+            DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+        })
+    }
+
+    /// Strategy: an [`EventPredicate`] over all five variants.
+    fn arb_event_predicate() -> impl Strategy<Value = EventPredicate> {
+        prop_oneof![
+            arb_level().prop_map(EventPredicate::LevelAtLeast),
+            (arb_level(), arb_form()).prop_map(|(level, form)| {
+                EventPredicate::LevelEquals { level, form }
+            }),
+            (
+                arb_field_name(),
+                arb_form(),
+                prop::sample::select(vec![
+                    "Nexus",
+                    "SledAgent",
+                    "h-1",
+                    "absent-value",
+                    "true",
+                    "1234",
+                    "0",
+                ])
+            )
+                .prop_map(|(name, form, value)| {
+                    EventPredicate::FieldEquals {
+                        name,
+                        value: value.to_string(),
+                        form,
+                    }
+                }),
+            (arb_regex(), arb_form()).prop_map(|(regex, form)| {
+                EventPredicate::MsgMatches { regex, form }
+            }),
+            (arb_time_op(), arb_time()).prop_map(|(op, value)| {
+                EventPredicate::TimeBound { op, value }
+            }),
+        ]
+    }
+
+    /// Strategy: a [`Predicate`] (event or source wrapper).
+    fn arb_predicate() -> impl Strategy<Value = Predicate> {
+        prop_oneof![
+            arb_event_predicate().prop_map(Predicate::Event),
+            (arb_regex(), arb_form()).prop_map(|(regex, form)| {
+                Predicate::Source(SourcePredicate::SourceIdMatches {
+                    regex,
+                    form,
+                })
+            }),
+        ]
+    }
+
+    /// Strategy: a [`Filter`] with 0-6 predicates.  Upper bound is
+    /// small enough that proptest's shrinker produces readable
+    /// counterexamples; the conjunction property doesn't need
+    /// thousand-predicate filters to exercise.
+    fn arb_filter() -> impl Strategy<Value = Filter> {
+        prop::collection::vec(arb_predicate(), 0..=6)
+            .prop_map(|predicates| Filter { predicates })
+    }
+
+    /// Strategy: an [`Event`] whose fields overlap with the values
+    /// the predicate strategies generate.  Builds via JSON to reuse
+    /// the existing serde plumbing.
+    fn arb_event() -> impl Strategy<Value = Event> {
+        (
+            arb_level(),
+            prop::sample::select(vec!["Nexus", "SledAgent"]),
+            prop::sample::select(vec!["h-1", "h-2"]),
+            prop::sample::select(vec![0u32, 1234, 9999]),
+            prop::sample::select(vec![
+                "starting up",
+                "blueprint executed",
+                "oh boom no",
+                "xyz 42",
+                "boring message",
+            ]),
+            arb_time(),
+        )
+            .prop_map(|(level, name, hostname, pid, msg, time)| {
+                let level_num = level.as_bunyan_number();
+                let json = format!(
+                    r#"{{
+                        "v": 0,
+                        "level": {level_num},
+                        "name": "{name}",
+                        "hostname": "{hostname}",
+                        "pid": {pid},
+                        "time": "{}",
+                        "msg": "{msg}",
+                        "build": "0.1.0",
+                        "component": "{name}"
+                    }}"#,
+                    time.to_rfc3339(),
+                );
+                serde_json::from_str(&json).expect("valid event JSON")
+            })
+    }
+
+    proptest! {
+        /// `Filter::matches` should reduce to the conjunction over
+        /// the event-predicate subset: a filter accepts an event iff
+        /// every [`EventPredicate`] inside it accepts the event.
+        /// [`SourcePredicate`]s don't constrain events (they're
+        /// evaluated separately at source-selection time) and so
+        /// contribute `true` to the per-event conjunction.
+        ///
+        /// Regression cover for refactors that turn the `.all(...)`
+        /// into `.any(...)`, drop one predicate kind, or short-circuit
+        /// incorrectly.
+        #[test]
+        fn filter_matches_is_conjunction_over_event_predicates(
+            filter in arb_filter(),
+            event in arb_event(),
+        ) {
+            let direct = filter.matches(&event);
+            let manual = filter
+                .predicates()
+                .iter()
+                .filter_map(|p| match p {
+                    Predicate::Event(ep) => Some(ep),
+                    Predicate::Source(_) => None,
+                })
+                .all(|ep| ep.matches(&event));
+            prop_assert_eq!(direct, manual);
+        }
+    }
 }
