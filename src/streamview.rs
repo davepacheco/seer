@@ -225,6 +225,22 @@ struct SearchResumePoint {
     line_bound: usize,
 }
 
+/// Tracks whether each scan direction has already exhausted the
+/// engine's content under the active filter.  Set by the extension
+/// methods when a scan returns `eof = true`; cleared when the filter
+/// or window position changes invalidate the prior conclusion.
+///
+/// Pairing the two flags inside one type makes their relationship
+/// explicit; today every caller knows its direction at compile time
+/// and reads / writes `eof.forward` or `eof.backward` directly.  Add
+/// `fn get(self, dir: Direction) -> bool` (matching on `dir`) if a
+/// future caller has a [`Direction`] in hand.
+#[derive(Clone, Copy, Debug, Default)]
+struct DirectionalEof {
+    forward: bool,
+    backward: bool,
+}
+
 /// Lazy-windowed materialization for one stream tab's view of the
 /// merged event stream.
 ///
@@ -245,8 +261,7 @@ pub struct StreamView {
     /// window's back; its `step_backward` would emit `records.back()`.
     back_cursor: Cursor,
     records: VecDeque<WindowEntry>,
-    forward_eof: bool,
-    backward_eof: bool,
+    eof: DirectionalEof,
     anchor: Anchor,
     parse_stats: ParseStats,
     /// Set when a search returns [`SearchOutcome::BudgetExhausted`] so
@@ -267,8 +282,7 @@ impl StreamView {
             front_cursor: Cursor::new(),
             back_cursor: Cursor::new(),
             records: VecDeque::new(),
-            forward_eof: false,
-            backward_eof: false,
+            eof: DirectionalEof::default(),
             anchor: Anchor::PinFront,
             parse_stats: ParseStats::default(),
             search_resume: None,
@@ -435,7 +449,7 @@ impl StreamView {
     /// surface an "at end of stream" indicator when the viewport's
     /// bottom coincides with the last cached line.
     pub fn is_forward_eof(&self) -> bool {
-        self.forward_eof
+        self.eof.forward
     }
 
     /// Replaces the active filter, dropping cached records (since they
@@ -452,8 +466,8 @@ impl StreamView {
         self.records.clear();
         self.front_cursor = Cursor::new();
         self.back_cursor = Cursor::new();
-        self.forward_eof = false;
-        self.backward_eof = false;
+        self.eof.forward = false;
+        self.eof.backward = false;
         self.anchor = Anchor::PinFront;
         self.parse_stats = ParseStats::default();
     }
@@ -511,8 +525,8 @@ impl StreamView {
         self.records.clear();
         self.front_cursor = Cursor::new();
         self.back_cursor = Cursor::new();
-        self.forward_eof = false;
-        self.backward_eof = true;
+        self.eof.forward = false;
+        self.eof.backward = true;
         self.anchor = Anchor::PinFront;
         self.search_resume = None;
     }
@@ -540,8 +554,8 @@ impl StreamView {
         self.records.clear();
         self.front_cursor = end.clone();
         self.back_cursor = end;
-        self.forward_eof = true;
-        self.backward_eof = false;
+        self.eof.forward = true;
+        self.eof.backward = false;
         self.anchor = Anchor::PinBack;
         self.search_resume = None;
         Ok(())
@@ -570,7 +584,7 @@ impl StreamView {
         // calling `seek_to_end`, which would walk the whole stream
         // backwards from EOF; here we want the *closest* visible
         // record before `cursor`, which is at most a batch away.
-        if self.records.is_empty() && !self.backward_eof {
+        if self.records.is_empty() && !self.eof.backward {
             self.anchor = Anchor::PinBack;
             self.ensure_window(engine, viewport_height);
         }
@@ -586,8 +600,8 @@ impl StreamView {
         self.records.clear();
         self.front_cursor = cursor.clone();
         self.back_cursor = cursor;
-        self.forward_eof = false;
-        self.backward_eof = false;
+        self.eof.forward = false;
+        self.eof.backward = false;
         self.anchor = Anchor::PinFront;
         self.search_resume = None;
     }
@@ -652,7 +666,7 @@ impl StreamView {
                         LONG_OP_BATCH,
                         LONG_OP_WALKS_PER_FILL,
                     );
-                    self.backward_eof
+                    self.eof.backward
                 }
                 Anchor::PinFront | Anchor::On { .. } => {
                     self.extend_forward_small_batch(
@@ -661,7 +675,7 @@ impl StreamView {
                         LONG_OP_BATCH,
                         LONG_OP_WALKS_PER_FILL,
                     );
-                    self.forward_eof
+                    self.eof.forward
                 }
                 Anchor::Empty => true,
             };
@@ -783,7 +797,7 @@ impl StreamView {
     /// Fetches up to `FETCH_BATCH_SIZE` records forward and appends
     /// them.  Returns the number actually fetched.
     fn extend_forward_batch(&mut self, engine: &Engine) -> usize {
-        if self.forward_eof {
+        if self.eof.forward {
             return 0;
         }
         let started = Instant::now();
@@ -800,7 +814,7 @@ impl StreamView {
                         .push_back(WindowEntry::new(record, &self.opts));
                 }
                 None => {
-                    self.forward_eof = true;
+                    self.eof.forward = true;
                     break;
                 }
             }
@@ -829,7 +843,7 @@ impl StreamView {
         max_matches: usize,
         max_walks_per_fill: usize,
     ) -> usize {
-        if self.forward_eof || max_matches == 0 {
+        if self.eof.forward || max_matches == 0 {
             return 0;
         }
         let started = Instant::now();
@@ -857,7 +871,7 @@ impl StreamView {
                     // exhausted; otherwise leave it clear so the
                     // next tick can resume scanning.
                     if stepper.is_exhausted(Direction::Forward) {
-                        self.forward_eof = true;
+                        self.eof.forward = true;
                     }
                     break;
                 }
@@ -885,7 +899,7 @@ impl StreamView {
         max_matches: usize,
         max_walks_per_fill: usize,
     ) -> usize {
-        if self.backward_eof || max_matches == 0 {
+        if self.eof.backward || max_matches == 0 {
             return 0;
         }
         let started = Instant::now();
@@ -907,7 +921,7 @@ impl StreamView {
                 }
                 None => {
                     if stepper.is_exhausted(Direction::Backward) {
-                        self.backward_eof = true;
+                        self.eof.backward = true;
                     }
                     break;
                 }
@@ -931,7 +945,7 @@ impl StreamView {
         stepper_batch: usize,
         max_matches: usize,
     ) -> usize {
-        if self.backward_eof || max_matches == 0 {
+        if self.eof.backward || max_matches == 0 {
             return 0;
         }
         let started = Instant::now();
@@ -954,7 +968,7 @@ impl StreamView {
                         .push_front(WindowEntry::new(record, &self.opts));
                 }
                 None => {
-                    self.backward_eof = true;
+                    self.eof.backward = true;
                     break;
                 }
             }
@@ -1039,7 +1053,7 @@ impl StreamView {
                 ),
             );
             // Trimming exposes earlier territory for backward fetches.
-            self.backward_eof = false;
+            self.eof.backward = false;
         }
     }
 
@@ -1057,7 +1071,7 @@ impl StreamView {
             let entry = self.records.pop_back().unwrap();
             self.back_cursor
                 .set(entry.record.source_id.clone(), entry.record.offset);
-            self.forward_eof = false;
+            self.eof.forward = false;
         }
     }
 
@@ -1097,7 +1111,7 @@ impl StreamView {
                 if idx + 1 < self.records.len() {
                     idx += 1;
                     line = 0;
-                } else if !self.forward_eof {
+                } else if !self.eof.forward {
                     self.extend_forward_batch(engine);
                     self.trim_front();
                     let (new_idx, _) = self.anchor_indices();
@@ -1128,7 +1142,7 @@ impl StreamView {
                 if idx > 0 {
                     idx -= 1;
                     line = self.records[idx].lines.len() - 1;
-                } else if !self.backward_eof {
+                } else if !self.eof.backward {
                     self.extend_backward_batch(engine);
                     self.trim_back();
                     let (new_idx, _) = self.anchor_indices();
@@ -1246,7 +1260,7 @@ impl StreamView {
                 }
                 idx += 1;
             }
-            if self.forward_eof {
+            if self.eof.forward {
                 // Snap to the last record.
                 let last = self.records.len() - 1;
                 let key = self.records[last].key();
@@ -1291,7 +1305,7 @@ impl StreamView {
                     return;
                 }
             }
-            if self.backward_eof {
+            if self.eof.backward {
                 let key = self.records.front().unwrap().key();
                 self.anchor = Anchor::On { key, line: 0 };
                 return;
@@ -1473,7 +1487,7 @@ impl StreamView {
                 idx += 1;
                 start_line = 0;
             }
-            if self.forward_eof {
+            if self.eof.forward {
                 return SearchOutcome::NotFound;
             }
             let fetched = self.extend_forward_batch(engine);
@@ -1563,7 +1577,7 @@ impl StreamView {
                         self.records[idx as usize].lines.len() as isize - 1;
                 }
             }
-            if self.backward_eof {
+            if self.eof.backward {
                 return SearchOutcome::NotFound;
             }
             let fetched = self.extend_backward_batch(engine);
@@ -1594,14 +1608,14 @@ impl StreamView {
         let mut idx = self.find_record_idx(current)? as isize;
         let mut target = idx + delta;
         // Extend forward to make `target` representable.
-        while target >= self.records.len() as isize && !self.forward_eof {
+        while target >= self.records.len() as isize && !self.eof.forward {
             self.extend_forward_batch(engine);
             self.trim_front();
             idx = self.find_record_idx(current).map(|i| i as isize)?;
             target = idx + delta;
         }
         // Extend backward symmetrically.
-        while target < 0 && !self.backward_eof {
+        while target < 0 && !self.eof.backward {
             self.extend_backward_batch(engine);
             self.trim_back();
             idx = self.find_record_idx(current).map(|i| i as isize)?;
@@ -1791,7 +1805,7 @@ mod tests {
         }
         // We should have fetched more.  Anchor is somewhere past the
         // initial cap.
-        assert!(view.record_count() > initial || view.forward_eof);
+        assert!(view.record_count() > initial || view.eof.forward);
         dir.cleanup();
     }
 
