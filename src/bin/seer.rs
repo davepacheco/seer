@@ -769,16 +769,39 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// One materialized record in a [`RenderedRows`].  Either a parsed
+/// event (the common case) or an error from the merge layer with its
+/// `Display` form preserved.
+///
+/// Replaces an earlier `Option<EngineEvent>` shape that paired with a
+/// parallel error-string slot in `formatted`; the two halves of an
+/// error row are now in the same variant, so consumers can't accidentally
+/// treat one without considering the other.
+enum Row {
+    Event(EngineEvent),
+    /// `Display` form of the underlying [`engine::MergeError`].  The
+    /// same string is cached at `formatted[first_line_for_event[i]]`
+    /// for the render path; this copy is the source of truth.  Carried
+    /// (rather than a bare unit variant) so an [`Row::Error`] slot
+    /// can't exist without its message attached — that pairing is the
+    /// invariant the enum exists to enforce.  Not yet read by any
+    /// consumer; expected first reader is a future "show error details"
+    /// dialog or a refined exclude-mode notice.
+    #[allow(dead_code)]
+    Error(String),
+}
+
 /// Materializes the active filter against the engine, returning the
 /// records alongside their multi-line display rendering.
 ///
 /// `events` is one entry per record produced by [`Engine::query_events`]:
-/// `Some(EngineEvent)` for an `Ok` result, `None` for a parse/I/O error
-/// or out-of-order warning.  `formatted` is one entry per *display line*
-/// — an event with `n` extra fields contributes `1 + n` lines (header
-/// plus indented `key = value` rows), and an error contributes a single
-/// line carrying its `Display` message.  `formatted.len() >=
-/// events.len()`, with equality only when no event has any extras.
+/// [`Row::Event`] for an `Ok` result, [`Row::Error`] for a parse/I/O
+/// error or out-of-order warning.  `formatted` is one entry per
+/// *display line* — an event with `n` extra fields contributes `1 + n`
+/// lines (header plus indented `key = value` rows), and an error
+/// contributes a single line carrying its `Display` message.
+/// `formatted.len() >= events.len()`, with equality only when no event
+/// has any extras.
 ///
 /// `event_for_line[i]` is the index into `events` of the record that
 /// produced display line `i`.  `first_line_for_event[i]` is the inverse:
@@ -786,7 +809,7 @@ impl Drop for TerminalGuard {
 /// translate freely between "scroll position" (a line index) and "the
 /// record under the cursor" (an event index) without rescanning.
 struct RenderedRows {
-    events: Vec<Option<EngineEvent>>,
+    events: Vec<Row>,
     formatted: Vec<String>,
     event_for_line: Vec<EventIdx>,
     first_line_for_event: Vec<LineIdx>,
@@ -919,13 +942,16 @@ fn materialize_streamview(view: &StreamView) -> RenderedRows {
                     formatted.push(line.clone());
                     event_for_line.push(event_idx);
                 }
-                events
-                    .push(Some(EngineEvent { position, event: event.clone() }));
+                events.push(Row::Event(EngineEvent {
+                    position,
+                    event: event.clone(),
+                }));
             }
             Err(err) => {
-                formatted.push(err.to_string());
+                let msg = err.to_string();
+                formatted.push(msg.clone());
                 event_for_line.push(event_idx);
-                events.push(None);
+                events.push(Row::Error(msg));
             }
         }
     }
@@ -1489,12 +1515,14 @@ struct LastSearch {
 /// per extra.  `event_for_line` and `first_line_for_event` translate
 /// between the two indexings: the former says which record produced a
 /// given display line, the latter says where each record's first line
-/// lives.  `events[i]` is `None` exactly when that record came from a
-/// parse or I/O error rather than a real log record; the stringified
-/// error sits in `formatted[first_line_for_event[i]]`.  Keeping the
-/// parsed events around lets in-place actions (e.g. exclude mode's
-/// "filter out entries like this" or `b`'s "bookmark this entry")
-/// inspect the record under the cursor without re-parsing.
+/// lives.  `events[i]` is [`Row::Error`] exactly when that record came
+/// from a parse or I/O error rather than a real log record; the
+/// stringified error sits in both the [`Row::Error`] payload and in
+/// `formatted[first_line_for_event[i]]` (the latter is the cached
+/// rendering).  Keeping the parsed events around lets in-place actions
+/// (e.g. exclude mode's "filter out entries like this" or `b`'s
+/// "bookmark this entry") inspect the record under the cursor without
+/// re-parsing.
 ///
 /// The active filter is owned by the [`LogStream`] this tab is viewing
 /// (looked up in [`Session::streams`] by `stream`); two tabs that target
@@ -1519,7 +1547,7 @@ struct Tab {
     /// constructed via [`App::with_rows`] / [`App::with_events`] that
     /// bypass the engine.
     streamview: Option<StreamView>,
-    events: Vec<Option<EngineEvent>>,
+    events: Vec<Row>,
     formatted: Vec<String>,
     /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
     event_for_line: Vec<EventIdx>,
@@ -1904,20 +1932,15 @@ impl Tab {
         } else {
             self.events.len()
         };
-        let forward = self
-            .events
-            .iter()
-            .enumerate()
-            .skip(pivot)
-            .find_map(|(i, e)| e.as_ref().map(|_| EventIdx(i)));
+        let forward =
+            self.events.iter().enumerate().skip(pivot).find_map(|(i, e)| {
+                matches!(e, Row::Event(_)).then_some(EventIdx(i))
+            });
         let backward_take = pivot.saturating_add(1).min(self.events.len());
-        let backward = self
-            .events
-            .iter()
-            .enumerate()
-            .take(backward_take)
-            .rev()
-            .find_map(|(i, e)| e.as_ref().map(|_| EventIdx(i)));
+        let backward =
+            self.events.iter().enumerate().take(backward_take).rev().find_map(
+                |(i, e)| matches!(e, Row::Event(_)).then_some(EventIdx(i)),
+            );
         match prefer {
             Direction::Forward => forward.or(backward),
             Direction::Backward => backward.or(forward),
@@ -1959,20 +1982,20 @@ impl Tab {
         let Some(anchor_idx) = self.time_anchor_idx(dir) else {
             return;
         };
-        let anchor_time = self.events[anchor_idx.get()]
-            .as_ref()
-            .expect("time_anchor_idx returns indices of real events")
-            .event
-            .time;
+        let Row::Event(anchor) = &self.events[anchor_idx.get()] else {
+            unreachable!("time_anchor_idx returns indices of real events");
+        };
+        let anchor_time = anchor.event.time;
         let target = anchor_time + delta;
         let max = self.max_top(viewport_height, viewport_width);
         let new_event = match dir {
             Direction::Forward => {
                 self.events.iter().enumerate().skip(anchor_idx.get()).find_map(
-                    |(i, e)| {
-                        e.as_ref()
-                            .filter(|ee| ee.event.time >= target)
-                            .map(|_| EventIdx(i))
+                    |(i, e)| match e {
+                        Row::Event(ee) if ee.event.time >= target => {
+                            Some(EventIdx(i))
+                        }
+                        _ => None,
                     },
                 )
             }
@@ -1982,10 +2005,11 @@ impl Tab {
                 .enumerate()
                 .take(anchor_idx.get() + 1)
                 .rev()
-                .find_map(|(i, e)| {
-                    e.as_ref()
-                        .filter(|ee| ee.event.time <= target)
-                        .map(|_| EventIdx(i))
+                .find_map(|(i, e)| match e {
+                    Row::Event(ee) if ee.event.time <= target => {
+                        Some(EventIdx(i))
+                    }
+                    _ => None,
                 }),
         };
         let new_top = match new_event {
@@ -3708,7 +3732,7 @@ impl App {
         let Some(sel) = tab.select else {
             return;
         };
-        let Some(Some(ee)) = tab.events.get(sel.event_idx.get()) else {
+        let Some(Row::Event(ee)) = tab.events.get(sel.event_idx.get()) else {
             return;
         };
         match sel.action {
@@ -3815,17 +3839,23 @@ impl App {
         let stream_id = stream.id;
         a.session.streams.insert_unique(stream).expect("unique id");
         let synthetic_source = SourceId::from("test".to_string());
-        let engine_events: Vec<Option<EngineEvent>> = events
+        // Test rows: `Some(event)` becomes a real [`Row::Event`]; `None`
+        // becomes a [`Row::Error`] whose error text is whatever the
+        // caller put in the matching `formatted` slot, since tests use
+        // the formatted line as the stand-in display message.
+        let engine_events: Vec<Row> = events
             .into_iter()
-            .map(|maybe| {
-                maybe.map(|event| EngineEvent {
+            .zip(&formatted)
+            .map(|(maybe, line)| match maybe {
+                Some(event) => Row::Event(EngineEvent {
                     position: LogStreamPosition::new(
                         synthetic_source.clone(),
                         event.time,
                         0,
                     ),
                     event,
-                })
+                }),
+                None => Row::Error(line.clone()),
             })
             .collect();
         let event_for_line: Vec<EventIdx> =
@@ -8500,7 +8530,10 @@ mod tests {
     fn viewport_top_msg(a: &App) -> Option<String> {
         let tab = a.active_tab();
         let event_idx = *tab.event_for_line.get(tab.viewport_top.get())?;
-        tab.events.get(event_idx.get())?.as_ref().map(|ee| ee.event.msg.clone())
+        match tab.events.get(event_idx.get())? {
+            Row::Event(ee) => Some(ee.event.msg.clone()),
+            Row::Error(_) => None,
+        }
     }
 
     /// Builds a 5-record multi-line app with a viewport short enough
