@@ -319,22 +319,19 @@ enum Anchor {
 
 /// Running parse statistics over the StreamView's lifetime since the
 /// last filter change.  Each fetch (forward or backward extension)
-/// adds the records it pulled, the bytes those records sum to, and the
+/// adds the records it pulled, the bytes it walked off disk, and the
 /// wall-clock time spent.
 #[derive(Clone, Debug, Default)]
 pub struct ParseStats {
     /// Records appended to the window (i.e., records that passed the
     /// filter).  Equals the number of filter-matching records read.
     pub records: u64,
-    /// Bytes of records that landed in the window.  Sum of `length`
-    /// across each appended `MergeRecord`.
-    pub bytes: ByteLen,
     /// Total bytes scanned off disk while populating the window —
     /// including bytes from records the filter rejected.  Under a
-    /// selective filter `walked_bytes` can be many orders of
-    /// magnitude larger than `bytes`; the TUI uses this for the
-    /// long-op progress bar so the percentage still ticks during
-    /// sparse-region walks.
+    /// selective filter this can be many orders of magnitude larger
+    /// than the size of the matching records; it's what the TUI's
+    /// status line and long-op progress bar both read, so each number
+    /// reflects the work the engine actually had to do.
     pub walked_bytes: ByteLen,
     pub elapsed: StdDuration,
 }
@@ -1059,11 +1056,9 @@ impl StreamView {
         let mut stepper =
             engine.stepper(self.filter.clone(), &self.back_cursor);
         let mut fetched = 0;
-        let mut bytes = ByteLen::ZERO;
         for _ in 0..FETCH_BATCH_SIZE {
             match stepper.step_forward() {
                 Some(record) => {
-                    bytes += record.length;
                     fetched += 1;
                     self.records
                         .push_back(WindowEntry::new(record, &self.opts));
@@ -1076,7 +1071,7 @@ impl StreamView {
         }
         self.back_cursor = stepper.cursor();
         self.parse_stats.records += fetched as u64;
-        self.parse_stats.bytes += bytes;
+        self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.elapsed += started.elapsed();
         fetched
     }
@@ -1111,11 +1106,9 @@ impl StreamView {
             },
         );
         let mut fetched = 0;
-        let mut bytes = ByteLen::ZERO;
         for _ in 0..max_matches {
             match stepper.step_forward() {
                 Some(record) => {
-                    bytes += record.length;
                     fetched += 1;
                     self.records
                         .push_back(WindowEntry::new(record, &self.opts));
@@ -1137,7 +1130,6 @@ impl StreamView {
         self.back_cursor = stepper.cursor();
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.records += fetched as u64;
-        self.parse_stats.bytes += bytes;
         self.parse_stats.elapsed += started.elapsed();
         fetched
     }
@@ -1169,11 +1161,9 @@ impl StreamView {
             },
         );
         let mut fetched = 0;
-        let mut bytes = ByteLen::ZERO;
         for _ in 0..max_matches {
             match stepper.step_backward() {
                 Some(record) => {
-                    bytes += record.length;
                     fetched += 1;
                     self.records
                         .push_front(WindowEntry::new(record, &self.opts));
@@ -1189,7 +1179,6 @@ impl StreamView {
         self.front_cursor = stepper.cursor();
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.records += fetched as u64;
-        self.parse_stats.bytes += bytes;
         self.parse_stats.elapsed += started.elapsed();
         fetched
     }
@@ -1214,14 +1203,12 @@ impl StreamView {
             StepperOptions { batch_size: stepper_batch, ..Default::default() },
         );
         let mut fetched = 0;
-        let mut bytes = ByteLen::ZERO;
         // step_backward returns records in reverse time order; we
         // push them to the front, so the deque stays sorted oldest
         // first.
         for _ in 0..max_matches {
             match stepper.step_backward() {
                 Some(record) => {
-                    bytes += record.length;
                     fetched += 1;
                     self.records
                         .push_front(WindowEntry::new(record, &self.opts));
@@ -1234,7 +1221,7 @@ impl StreamView {
         }
         self.front_cursor = stepper.cursor();
         self.parse_stats.records += fetched as u64;
-        self.parse_stats.bytes += bytes;
+        self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.elapsed += started.elapsed();
         fetched
     }

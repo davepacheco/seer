@@ -808,12 +808,15 @@ fn format_byte_rate(bytes_per_sec: f64) -> String {
 }
 
 /// Renders a [`ParseStats`] as the status-line string shown beneath
-/// each tab.  When the parse finished in zero measurable time (empty
-/// engine, all sources excluded by the source-id filter) the rate
-/// half is dropped — it would either divide by zero or be meaningless.
+/// each tab.  The byte count reflects bytes *scanned* (including those
+/// from filter-rejected records) so it tracks the work the engine had
+/// to do while the user waited, not the size of what survived.  When
+/// the parse finished in zero measurable time (empty engine, all
+/// sources excluded by the source-id filter) the rate half is dropped
+/// — it would either divide by zero or be meaningless.
 fn format_parse_stats(stats: &ParseStats) -> String {
     let secs = stats.elapsed.as_secs_f64();
-    let bytes = format_bytes(stats.bytes.get());
+    let bytes = format_bytes(stats.walked_bytes.get());
     if stats.records == 0 || secs <= 0.0 {
         return format!(
             "{} records ({}) parsed in {:.3}s",
@@ -821,7 +824,7 @@ fn format_parse_stats(stats: &ParseStats) -> String {
         );
     }
     let rps = stats.records as f64 / secs;
-    let bps = stats.bytes.get() as f64 / secs;
+    let bps = stats.walked_bytes.get() as f64 / secs;
     format!(
         "{} records ({}) parsed in {:.3}s ({:.1} records/sec, {})",
         stats.records,
@@ -984,16 +987,8 @@ impl SummaryOp {
         let elapsed = self.started.elapsed();
         let summary = self.builder.finish();
         let formatted = format_summary(&summary);
-        // `bytes_read` counts every byte stepped through, including
-        // those from filter-rejected records, so it really belongs in
-        // `walked_bytes`.  Summary builds don't track a separate
-        // filter-matching byte total; setting `bytes` to the same
-        // value preserves what the status line has always shown here.
-        // Followup item 45 considers narrowing `bytes` to the
-        // filter-matching subset.
         let parse_stats = ParseStats {
             records: self.records,
-            bytes: self.bytes_read,
             walked_bytes: self.bytes_read,
             elapsed,
         };
@@ -1022,10 +1017,12 @@ struct SearchOp {
     /// a previous match advances rather than re-finding it.  Reset to
     /// [`SearchAnchor::Include`] after the first chunk runs.
     anchor: SearchAnchor,
-    /// `parse_stats.bytes` from the streamview at op start.  Subtract
-    /// from the current value to get bytes processed by *this* op.
-    bytes_at_start: ByteLen,
-    /// `parse_stats.records` at op start; same idea as `bytes_at_start`.
+    /// `parse_stats.walked_bytes` from the streamview at op start.
+    /// Subtract from the current value to get bytes scanned by *this*
+    /// op — the numerator of the progress bar.
+    walked_bytes_at_start: ByteLen,
+    /// `parse_stats.records` at op start; same idea as
+    /// `walked_bytes_at_start`.
     records_at_start: u64,
     total_bytes: ByteLen,
     /// Result of the last advance.  `None` while still searching;
@@ -1047,7 +1044,7 @@ impl SearchOp {
         regex: Regex,
         direction: SearchDir,
         anchor: SearchAnchor,
-        bytes_at_start: ByteLen,
+        walked_bytes_at_start: ByteLen,
         records_at_start: u64,
         total_bytes: ByteLen,
     ) -> Self {
@@ -1056,7 +1053,7 @@ impl SearchOp {
             regex,
             direction,
             anchor,
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
             outcome: None,
@@ -2323,7 +2320,8 @@ impl App {
         // "where did we leave off."
         s.anchor = SearchAnchor::Include;
         let stats = view.parse_stats();
-        s.bytes_done = stats.bytes.saturating_sub(s.bytes_at_start);
+        s.bytes_done =
+            stats.walked_bytes.saturating_sub(s.walked_bytes_at_start);
         s.records = stats.records.saturating_sub(s.records_at_start);
         match outcome {
             SearchOutcome::Found
@@ -3213,7 +3211,7 @@ impl App {
             .as_ref()
             .expect("caller checked streamview is_some");
         let stats = view.parse_stats();
-        let bytes_at_start = stats.bytes;
+        let walked_bytes_at_start = stats.walked_bytes;
         let records_at_start = stats.records;
         let total_bytes = self.engine.filtered_total_bytes(view.filter());
         // Hand the search off to the long-op driver.  Cancel any
@@ -3227,7 +3225,7 @@ impl App {
             regex,
             dir,
             anchor,
-            bytes_at_start,
+            walked_bytes_at_start,
             records_at_start,
             total_bytes,
         )));
@@ -7530,7 +7528,6 @@ mod tests {
     fn format_parse_stats_includes_records_bytes_time_and_rates() {
         let stats = ParseStats {
             records: 1023,
-            bytes: ByteLen::from(2013),
             walked_bytes: ByteLen::from(2013),
             elapsed: Duration::from_millis(15_231),
         };
@@ -7549,7 +7546,6 @@ mod tests {
         // bytes are zero and the rate half would be meaningless.
         let stats = ParseStats {
             records: 0,
-            bytes: ByteLen::ZERO,
             walked_bytes: ByteLen::ZERO,
             elapsed: Duration::from_millis(0),
         };
@@ -7570,7 +7566,6 @@ mod tests {
         // relying on whatever the test fixture produced.
         a.active_tab_mut().standalone_materialized.parse_stats = ParseStats {
             records: 42,
-            bytes: ByteLen::from(4096),
             walked_bytes: ByteLen::from(4096),
             elapsed: Duration::from_millis(100),
         };
@@ -7791,7 +7786,6 @@ mod tests {
         // should not appear when the bookmarks pane is showing.
         a.tabs[0].standalone_materialized.parse_stats = ParseStats {
             records: 9999,
-            bytes: ByteLen::from(1024 * 1024),
             walked_bytes: ByteLen::from(1024 * 1024),
             elapsed: Duration::from_millis(1234),
         };
