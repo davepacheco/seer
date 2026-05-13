@@ -1101,11 +1101,16 @@ impl StreamView {
                 // record, then advance to the next.
                 let lines_in_record = self.records[idx].lines.len();
                 let lines_left = lines_in_record - 1 - line;
-                if (remaining as usize) <= lines_left {
-                    line += remaining as usize;
+                let step = usize::try_from(remaining)
+                    .expect("remaining > 0 by outer branch");
+                if step <= lines_left {
+                    line += step;
                     break;
                 }
-                remaining -= (lines_left + 1) as isize;
+                let consumed = isize::try_from(lines_left + 1).expect(
+                    "lines per record fits in isize for any realistic log",
+                );
+                remaining -= consumed;
                 if idx + 1 < self.records.len() {
                     idx += 1;
                     line = 0;
@@ -1131,12 +1136,17 @@ impl StreamView {
             } else {
                 // Backward: consume remaining lines back to the start
                 // of the current record, then to the previous record.
-                let to_top = line as isize;
-                if -remaining <= to_top {
-                    line = (line as isize + remaining) as usize;
+                // `remaining < 0` here; work in unsigned magnitudes
+                // and the sign drops out.
+                let step = remaining.unsigned_abs();
+                if step <= line {
+                    line -= step;
                     break;
                 }
-                remaining += (line + 1) as isize;
+                let consumed = isize::try_from(line + 1).expect(
+                    "lines per record fits in isize for any realistic log",
+                );
+                remaining += consumed;
                 if idx > 0 {
                     idx -= 1;
                     line = self.records[idx].lines.len() - 1;
@@ -1519,11 +1529,18 @@ impl StreamView {
         cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
         let skip_anchor = matches!(anchor, SearchAnchor::Skip);
+        // `idx` and `end_line` are isize so they can hold the -1
+        // "exhausted" sentinel; every read through them at usize first
+        // proves the value is non-negative.
+        let cap_isize = |n: usize| {
+            isize::try_from(n)
+                .expect("record/line counts fit in isize for any realistic log")
+        };
         let (mut idx, mut end_line): (isize, isize) = match resume {
-            Some((i, line)) => (i as isize, line as isize),
+            Some((i, line)) => (cap_isize(i), cap_isize(line)),
             None => {
                 let (anchor_idx, anchor_line) = self.anchor_indices();
-                let mut idx = anchor_idx as isize;
+                let mut idx = cap_isize(anchor_idx);
                 // Initial scan upper bound: the anchor's line, or one
                 // before it when `Skip`.  When skipping and the anchor
                 // is on line 0, skip the current record entirely and
@@ -1533,12 +1550,14 @@ impl StreamView {
                     if idx < 0 {
                         -1
                     } else {
-                        self.records[idx as usize].lines.len() as isize - 1
+                        let idx_u = usize::try_from(idx)
+                            .expect("idx >= 0 by surrounding if");
+                        cap_isize(self.records[idx_u].lines.len()) - 1
                     }
                 } else if skip_anchor {
-                    anchor_line.saturating_sub(1) as isize
+                    cap_isize(anchor_line.saturating_sub(1))
                 } else {
-                    anchor_line as isize
+                    cap_isize(anchor_line)
                 };
                 (idx, end)
             }
@@ -1548,37 +1567,43 @@ impl StreamView {
                 if cancel() {
                     return SearchOutcome::Cancelled;
                 }
+                let idx_u = usize::try_from(idx)
+                    .expect("idx >= 0 by inner-loop condition");
                 if *budget == 0 {
                     // end_line is always >= 0 here: the initial setup
                     // only emits -1 alongside idx < 0 (which would
                     // skip the inner loop), and post-step updates
                     // assign `lines.len() - 1 >= 0`.
                     debug_assert!(end_line >= 0);
+                    let end_u = usize::try_from(end_line.max(0))
+                        .expect("clamped to >= 0 by .max(0)");
                     self.save_search_resume(
                         regex,
                         SearchDir::Backward,
-                        idx as usize,
-                        end_line.max(0) as usize,
+                        idx_u,
+                        end_u,
                     );
                     return SearchOutcome::BudgetExhausted;
                 }
                 *budget -= 1;
-                let lines = &self.records[idx as usize].lines;
-                let upper = end_line.min(lines.len() as isize - 1);
+                let lines = &self.records[idx_u].lines;
+                let upper = end_line.min(cap_isize(lines.len()) - 1);
                 if upper >= 0
-                    && let Some(hit) = (0..=upper as usize)
-                        .rev()
-                        .find(|&i| regex.is_match(&lines[i]))
+                    && let upper_u = usize::try_from(upper)
+                        .expect("upper >= 0 by surrounding if")
+                    && let Some(hit) =
+                        (0..=upper_u).rev().find(|&i| regex.is_match(&lines[i]))
                 {
-                    let key = self.records[idx as usize].key();
+                    let key = self.records[idx_u].key();
                     self.anchor = Anchor::On { key, line: hit };
                     self.ensure_window(engine, viewport_height);
                     return SearchOutcome::Found;
                 }
                 idx -= 1;
                 if idx >= 0 {
-                    end_line =
-                        self.records[idx as usize].lines.len() as isize - 1;
+                    let idx_u = usize::try_from(idx)
+                        .expect("idx >= 0 by surrounding if");
+                    end_line = cap_isize(self.records[idx_u].lines.len()) - 1;
                 }
             }
             if self.eof.backward {
@@ -1592,8 +1617,10 @@ impl StreamView {
             // Newly prepended records sit at indices [0, fetched);
             // continue scanning from the most recent of them backward
             // toward index 0.
-            idx = fetched as isize - 1;
-            end_line = self.records[idx as usize].lines.len() as isize - 1;
+            idx = cap_isize(fetched) - 1;
+            let idx_u =
+                usize::try_from(idx).expect("fetched > 0 by `if fetched == 0`");
+            end_line = cap_isize(self.records[idx_u].lines.len()) - 1;
         }
     }
 
@@ -1609,24 +1636,31 @@ impl StreamView {
         viewport_height: u16,
     ) -> Option<RecordKey> {
         let _ = viewport_height;
-        let mut idx = self.find_record_idx(current)? as isize;
+        // Record counts come from `VecDeque::len` for an in-memory
+        // window, so they comfortably fit in isize for any realistic
+        // log.
+        let cap_isize = |n: usize| {
+            isize::try_from(n).expect("window record count fits in isize")
+        };
+        let mut idx = cap_isize(self.find_record_idx(current)?);
         let mut target = idx + delta;
         // Extend forward to make `target` representable.
-        while target >= self.records.len() as isize && !self.eof.forward {
+        while target >= cap_isize(self.records.len()) && !self.eof.forward {
             self.extend_forward_batch(engine);
             self.trim_front();
-            idx = self.find_record_idx(current).map(|i| i as isize)?;
+            idx = cap_isize(self.find_record_idx(current)?);
             target = idx + delta;
         }
         // Extend backward symmetrically.
         while target < 0 && !self.eof.backward {
             self.extend_backward_batch(engine);
             self.trim_back();
-            idx = self.find_record_idx(current).map(|i| i as isize)?;
+            idx = cap_isize(self.find_record_idx(current)?);
             target = idx + delta;
         }
-        let last = self.records.len() as isize - 1;
-        let clamped = target.clamp(0, last) as usize;
+        let last = cap_isize(self.records.len()) - 1;
+        let clamped = usize::try_from(target.clamp(0, last))
+            .expect("clamped to [0, last] >= 0");
         Some(self.records[clamped].key())
     }
 
