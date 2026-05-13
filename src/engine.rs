@@ -1313,4 +1313,30 @@ mod tests {
         assert!(engine_b.cursor_for_position(&anchor).is_none());
         dir.cleanup();
     }
+
+    #[test]
+    fn cursor_for_position_returns_none_when_ordinal_past_group() {
+        // Two events share a timestamp; a third sits at a later time.
+        // Ask for ordinal 2 at the shared timestamp — only ordinals 0
+        // and 1 exist.  The walk enters the same-time group, increments
+        // through both members, then sees a record whose time has
+        // advanced; the walked-off-group branch fires and returns None.
+        let dir = TestDir::new();
+        let p = dir.path().join("c.log");
+        append_bunyan_at(&p, "x", t(10), "a");
+        append_bunyan_at(&p, "x", t(10), "b");
+        append_bunyan_at(&p, "x", t(20), "c");
+        let mut engine = Engine::new();
+        engine.add_file_source(&p).unwrap();
+        // Reuse the SourceId from a real position so the canonical-path
+        // form matches what the engine sees.
+        let real_pos = nth_position(&engine, 0);
+        let too_far = LogStreamPosition::new(
+            real_pos.source().clone(),
+            t(10),
+            2, // only ordinals 0 and 1 exist at t(10)
+        );
+        assert!(engine.cursor_for_position(&too_far).is_none());
+        dir.cleanup();
+    }
 }
