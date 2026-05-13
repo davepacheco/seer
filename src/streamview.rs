@@ -27,7 +27,7 @@ use crate::engine::{Cursor, Engine, FETCH_BATCH_SIZE, MergeRecord};
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::render::{RenderOpts, format_event};
-use crate::source::{ByteOffset, Direction, SourceId};
+use crate::source::{ByteLen, ByteOffset, Direction, SourceId};
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
 use std::collections::VecDeque;
@@ -148,14 +148,14 @@ pub struct ParseStats {
     pub records: u64,
     /// Bytes of records that landed in the window.  Sum of `length`
     /// across each appended `MergeRecord`.
-    pub bytes: u64,
+    pub bytes: ByteLen,
     /// Total bytes scanned off disk while populating the window —
     /// including bytes from records the filter rejected.  Under a
     /// selective filter `walked_bytes` can be many orders of
     /// magnitude larger than `bytes`; the TUI uses this for the
     /// long-op progress bar so the percentage still ticks during
     /// sparse-region walks.
-    pub walked_bytes: u64,
+    pub walked_bytes: ByteLen,
     pub elapsed: StdDuration,
 }
 
@@ -423,10 +423,7 @@ impl StreamView {
         let mut cursor = self.front_cursor.clone();
         for entry in self.records.iter().take(idx) {
             let r = &entry.record;
-            cursor.set(
-                r.source_id.clone(),
-                ByteOffset::from(r.offset.get() + r.length),
-            );
+            cursor.set(r.source_id.clone(), r.offset + r.length);
         }
         Some(cursor)
     }
@@ -807,7 +804,7 @@ impl StreamView {
         let mut stepper =
             engine.stepper(self.filter.clone(), &self.back_cursor);
         let mut fetched = 0;
-        let mut bytes = 0u64;
+        let mut bytes = ByteLen::ZERO;
         for _ in 0..FETCH_BATCH_SIZE {
             match stepper.step_forward() {
                 Some(record) => {
@@ -857,7 +854,7 @@ impl StreamView {
             max_walks_per_fill,
         );
         let mut fetched = 0;
-        let mut bytes = 0u64;
+        let mut bytes = ByteLen::ZERO;
         for _ in 0..max_matches {
             match stepper.step_forward() {
                 Some(record) => {
@@ -913,7 +910,7 @@ impl StreamView {
             max_walks_per_fill,
         );
         let mut fetched = 0;
-        let mut bytes = 0u64;
+        let mut bytes = ByteLen::ZERO;
         for _ in 0..max_matches {
             match stepper.step_backward() {
                 Some(record) => {
@@ -958,7 +955,7 @@ impl StreamView {
             stepper_batch,
         );
         let mut fetched = 0;
-        let mut bytes = 0u64;
+        let mut bytes = ByteLen::ZERO;
         // step_backward returns records in reverse time order; we
         // push them to the front, so the deque stays sorted oldest
         // first.
@@ -1051,9 +1048,7 @@ impl StreamView {
             // (offset + length).  Other sources unchanged.
             self.front_cursor.set(
                 entry.record.source_id.clone(),
-                ByteOffset::from(
-                    entry.record.offset.get() + entry.record.length,
-                ),
+                entry.record.offset + entry.record.length,
             );
             // Trimming exposes earlier territory for backward fetches.
             self.eof.backward = false;

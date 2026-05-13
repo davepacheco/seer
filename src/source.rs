@@ -25,6 +25,7 @@ use schemars::JsonSchema;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::iter;
+use std::ops::{Add, AddAssign, Sub};
 
 /// Identifier for a source.
 ///
@@ -94,6 +95,101 @@ impl ByteOffset {
     }
 }
 
+/// Byte length: a span of bytes within a source.
+///
+/// Newtype companion to [`ByteOffset`].  The pair encodes the
+/// arithmetic the engine repeatedly performs on byte counts: an
+/// offset plus a length yields another offset, two lengths add to a
+/// length, an offset minus a length yields an offset.  Mixing the
+/// two in any other shape is a compile error, which catches the
+/// otherwise-invisible bug of (e.g.) adding two offsets.
+///
+/// `#[serde(transparent)]` so persisted shapes are bare `u64`s on
+/// disk — switching a previously-`u64` field to `ByteLen` is a
+/// type-only change with no schema impact.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Display,
+    From,
+    serde::Serialize,
+    serde::Deserialize,
+    JsonSchema,
+)]
+#[serde(transparent)]
+pub struct ByteLen(u64);
+
+impl ByteLen {
+    /// Length zero.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the length as a raw `u64`.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Saturating subtraction: `a - b`, clamped at [`Self::ZERO`].
+    /// Used by the long-op drivers' "bytes since op start" math
+    /// where wall-clock skew between the snapshot and the latest
+    /// reading could otherwise underflow.
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+impl Add for ByteLen {
+    type Output = Self;
+    fn add(self, other: Self) -> Self {
+        Self(self.0 + other.0)
+    }
+}
+
+impl AddAssign for ByteLen {
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
+    }
+}
+
+impl Sub for ByteLen {
+    type Output = Self;
+    fn sub(self, other: Self) -> Self {
+        Self(self.0 - other.0)
+    }
+}
+
+impl std::iter::Sum for ByteLen {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|b| b.0).sum())
+    }
+}
+
+impl Add<ByteLen> for ByteOffset {
+    type Output = ByteOffset;
+    fn add(self, len: ByteLen) -> ByteOffset {
+        ByteOffset(self.0 + len.0)
+    }
+}
+
+impl AddAssign<ByteLen> for ByteOffset {
+    fn add_assign(&mut self, len: ByteLen) {
+        self.0 += len.0;
+    }
+}
+
+impl Sub<ByteLen> for ByteOffset {
+    type Output = ByteOffset;
+    fn sub(self, len: ByteLen) -> ByteOffset {
+        ByteOffset(self.0 - len.0)
+    }
+}
+
 /// Direction of a [`Source::query`] scan.
 ///
 /// `Forward` reads records starting at the requested offset and
@@ -131,7 +227,7 @@ pub enum Direction {
 #[derive(Debug)]
 pub struct QueryRecord {
     pub offset: ByteOffset,
-    pub length: u64,
+    pub length: ByteLen,
     pub event: Result<Event, SourceError>,
     pub raw: String,
 }
@@ -156,7 +252,7 @@ pub struct QueryRecord {
 #[derive(Debug)]
 pub struct QueryBatch {
     pub records: Vec<QueryRecord>,
-    pub walked_bytes: u64,
+    pub walked_bytes: ByteLen,
     pub eof: bool,
 }
 
@@ -437,7 +533,7 @@ impl Source for FileSource {
         if count == 0 || self.metadata.excludes_all(filter) {
             return Ok(QueryBatch {
                 records: Vec::new(),
-                walked_bytes: 0,
+                walked_bytes: ByteLen::ZERO,
                 eof: true,
             });
         }
@@ -460,7 +556,7 @@ impl Source for FileSource {
                     walked_bytes = walked;
                     eof = hit_end;
                 } else {
-                    walked_bytes = 0;
+                    walked_bytes = ByteLen::ZERO;
                     eof = true;
                 }
             }
@@ -502,7 +598,7 @@ fn scan_forward(
     max_walks: Option<usize>,
     filter: &Filter,
     results: &mut Vec<QueryRecord>,
-) -> std::io::Result<(u64, bool)> {
+) -> std::io::Result<(ByteLen, bool)> {
     file.seek(SeekFrom::Start(start_offset))?;
     let mut reader = BufReader::new(file);
     let mut buf = String::new();
@@ -522,7 +618,7 @@ fn scan_forward(
             break;
         }
         walks += 1;
-        let length = n as u64;
+        let length = ByteLen(n as u64);
         let line = buf.trim_end_matches(['\r', '\n']);
         let parsed =
             serde_json::from_str::<Event>(line).map_err(SourceError::from);
@@ -534,9 +630,9 @@ fn scan_forward(
             line.to_string(),
             filter,
         );
-        current_offset += length;
+        current_offset += length.get();
     }
-    Ok((current_offset - start_offset, eof))
+    Ok((ByteLen(current_offset - start_offset), eof))
 }
 
 /// Walks `file` backward from `start_offset`, reading one record at
@@ -553,7 +649,7 @@ fn scan_backward(
     max_walks: Option<usize>,
     filter: &Filter,
     results: &mut Vec<QueryRecord>,
-) -> std::io::Result<(u64, bool)> {
+) -> std::io::Result<(ByteLen, bool)> {
     let mut cursor = start_offset;
     let mut walks = 0usize;
     let mut eof = false;
@@ -568,7 +664,7 @@ fn scan_backward(
             break;
         }
         let (record_start, bytes) = read_record_before(file, cursor)?;
-        let length = cursor - record_start;
+        let length = ByteLen(cursor - record_start);
         walks += 1;
         // Trim a single trailing `\r\n` or `\n` for parsing without
         // copying the bytes — `serde_json::from_slice` handles UTF-8
@@ -596,7 +692,7 @@ fn scan_backward(
         );
         cursor = record_start;
     }
-    Ok((start_offset - cursor, eof))
+    Ok((ByteLen(start_offset - cursor), eof))
 }
 
 /// Pushes a [`QueryRecord`] for a parsed line into `results`,
@@ -605,7 +701,7 @@ fn scan_backward(
 fn push_if_accepted(
     results: &mut Vec<QueryRecord>,
     offset: ByteOffset,
-    length: u64,
+    length: ByteLen,
     parsed: Result<Event, SourceError>,
     raw: String,
     filter: &Filter,
@@ -1201,8 +1297,7 @@ mod tests {
             .query(ByteOffset::ZERO, Direction::Forward, 1, &Filter::default())
             .unwrap();
         assert_eq!(first.len(), 1);
-        let next_offset =
-            ByteOffset::from(first[0].offset.get() + first[0].length);
+        let next_offset = first[0].offset + first[0].length;
         let rest = src
             .query(next_offset, Direction::Forward, 10, &Filter::default())
             .unwrap();
@@ -1350,8 +1445,8 @@ mod tests {
         assert_eq!(fwd_msgs, vec!["first", "last"]);
         // The two record lengths sum to file length, matching the
         // "offset + length is the next record's start" contract.
-        let total: u64 = fwd.iter().map(|r| r.length).sum();
-        assert_eq!(total, len);
+        let total: ByteLen = fwd.iter().map(|r| r.length).sum();
+        assert_eq!(total.get(), len);
 
         let bwd = src
             .query(
@@ -1519,14 +1614,9 @@ mod tests {
             )
             .unwrap();
         let last_end =
-            fwd.last().map(|r| r.offset.get() + r.length).unwrap_or(0);
+            fwd.last().map(|r| r.offset + r.length).unwrap_or(ByteOffset::ZERO);
         let bwd = src
-            .query(
-                ByteOffset::from(last_end),
-                Direction::Backward,
-                100,
-                &Filter::default(),
-            )
+            .query(last_end, Direction::Backward, 100, &Filter::default())
             .unwrap();
         assert_eq!(fwd.len(), bwd.len());
         let fwd_offsets: Vec<_> = fwd.iter().map(|r| r.offset).collect();
@@ -1554,12 +1644,12 @@ mod tests {
                 &Filter::default(),
             )
             .unwrap();
-        let mut expected_offset = 0u64;
+        let mut expected_offset = ByteOffset::ZERO;
         for r in &fwd {
-            assert_eq!(r.offset.get(), expected_offset);
+            assert_eq!(r.offset, expected_offset);
             expected_offset += r.length;
         }
-        assert_eq!(expected_offset, len);
+        assert_eq!(expected_offset.get(), len);
         dir.cleanup();
     }
 }

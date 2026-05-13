@@ -19,7 +19,7 @@
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::source::{
-    ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
+    ByteLen, ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
 };
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
@@ -131,8 +131,8 @@ pub struct MergeRecord {
     /// byte offset in `source_id` where the record begins
     pub offset: ByteOffset,
     /// length of the record in bytes (including the trailing newline,
-    /// if present); `0` for synthetic error placeholders
-    pub length: u64,
+    /// if present); [`ByteLen::ZERO`] for synthetic error placeholders
+    pub length: ByteLen,
     /// parsed event when the line was valid; otherwise the per-line
     /// parse or I/O error
     pub event: Result<Event, MergeError>,
@@ -190,7 +190,7 @@ enum EofMark {
 #[derive(Debug, Clone)]
 struct BufferedRecord {
     offset: ByteOffset,
-    length: u64,
+    length: ByteLen,
     event: Result<Event, MergeError>,
     raw: String,
 }
@@ -279,15 +279,15 @@ impl<'a> SourceWindow<'a> {
         filter: &Filter,
         batch_size: usize,
         max_walks: Option<usize>,
-    ) -> u64 {
+    ) -> ByteLen {
         if !self.buf(dir).is_empty() || self.eof(dir) {
-            return 0;
+            return ByteLen::ZERO;
         }
         // A backward query at offset 0 has no records to return — short
         // circuit so we don't even open the file.
         if matches!(dir, Direction::Backward) && self.position.get() == 0 {
             self.set_eof(dir, EofMark::Reached);
-            return 0;
+            return ByteLen::ZERO;
         }
         match self.source.query_bounded(
             self.position,
@@ -317,14 +317,12 @@ impl<'a> SourceWindow<'a> {
                 // semantics intact.)
                 if batch.records.is_empty() && !batch.eof {
                     match dir {
-                        Direction::Forward => {
-                            self.position = ByteOffset::from(
-                                self.position.get().saturating_add(walked),
-                            );
-                        }
+                        Direction::Forward => self.position += walked,
                         Direction::Backward => {
                             self.position = ByteOffset::from(
-                                self.position.get().saturating_sub(walked),
+                                self.position
+                                    .get()
+                                    .saturating_sub(walked.get()),
                             );
                         }
                     }
@@ -343,13 +341,13 @@ impl<'a> SourceWindow<'a> {
                 // avoid hammering the failed fetch.
                 let synth = BufferedRecord {
                     offset: self.position,
-                    length: 0,
+                    length: ByteLen::ZERO,
                     event: Err(MergeError::from(SourceError::from(e))),
                     raw: String::new(),
                 };
                 self.buf_mut(dir).push_back(synth);
                 self.set_eof(dir, EofMark::Reached);
-                0
+                ByteLen::ZERO
             }
         }
     }
@@ -360,7 +358,7 @@ impl<'a> SourceWindow<'a> {
     fn pop(&mut self, dir: Direction) -> MergeRecord {
         let r = self.buf_mut(dir).pop_front().expect("buf has a head");
         self.position = match dir {
-            Direction::Forward => ByteOffset::from(r.offset.get() + r.length),
+            Direction::Forward => r.offset + r.length,
             Direction::Backward => r.offset,
         };
         let opp = opposite(dir);
@@ -416,7 +414,7 @@ pub struct Stepper<'a> {
     /// disk — including bytes from records the filter rejected.
     /// Surfaced to callers via [`Self::walked_bytes`] so the TUI's
     /// progress bar can tick even when fills produce no matches.
-    walked_bytes: u64,
+    walked_bytes: ByteLen,
 }
 
 impl<'a> Stepper<'a> {
@@ -464,13 +462,13 @@ impl<'a> Stepper<'a> {
             filter,
             batch_size,
             max_walks_per_fill,
-            walked_bytes: 0,
+            walked_bytes: ByteLen::ZERO,
         }
     }
 
     /// Total bytes the stepper has walked off disk since construction
     /// (matching plus filter-rejected records).
-    pub fn walked_bytes(&self) -> u64 {
+    pub fn walked_bytes(&self) -> ByteLen {
         self.walked_bytes
     }
 
@@ -1271,12 +1269,12 @@ mod tests {
         let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
-        let mut expected_offset = 0u64;
+        let mut expected_offset = ByteOffset::ZERO;
         while let Some(r) = stepper.step_forward() {
-            assert_eq!(r.offset.get(), expected_offset);
+            assert_eq!(r.offset, expected_offset);
             expected_offset += r.length;
         }
-        assert_eq!(expected_offset, len);
+        assert_eq!(expected_offset.get(), len);
         dir.cleanup();
     }
 

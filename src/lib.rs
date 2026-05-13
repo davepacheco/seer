@@ -38,8 +38,8 @@ pub use session_store::{
     MatchKind, STATE_DIR_ENV, SessionMatch, SessionStore, StoreError,
 };
 pub use source::{
-    ByteOffset, Direction, FileSource, QueryRecord, Source, SourceError,
-    SourceId, SourceMetadata,
+    ByteLen, ByteOffset, Direction, FileSource, QueryRecord, Source,
+    SourceError, SourceId, SourceMetadata,
 };
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
 pub use streamview::{

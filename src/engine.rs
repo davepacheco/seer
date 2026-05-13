@@ -13,7 +13,9 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::source::{ByteOffset, FileSource, Source, SourceError, SourceId};
+use crate::source::{
+    ByteLen, ByteOffset, FileSource, Source, SourceError, SourceId,
+};
 use crate::stream::LogStreamPosition;
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
@@ -140,11 +142,11 @@ impl Engine {
     /// Sources whose `byte_len()` syscall fails contribute zero — the
     /// progress will overshoot rather than fail outright, which is the
     /// less surprising behavior here.
-    pub fn filtered_total_bytes(&self, filter: &Filter) -> u64 {
+    pub fn filtered_total_bytes(&self, filter: &Filter) -> ByteLen {
         self.sources
             .iter()
             .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| s.byte_len().unwrap_or(0))
+            .map(|s| ByteLen::from(s.byte_len().unwrap_or(0)))
             .sum()
     }
 
@@ -207,10 +209,7 @@ impl Engine {
                 // Per-line errors don't carry a time/source pair the
                 // bookmark could be anchored to; advance the cursor
                 // past them and continue.
-                cursor.set(
-                    rec.source_id.clone(),
-                    ByteOffset::from(rec.offset.get() + rec.length),
-                );
+                cursor.set(rec.source_id.clone(), rec.offset + rec.length);
                 continue;
             };
             let on_target_group = rec.source_id == *position.source()
@@ -229,10 +228,7 @@ impl Engine {
                 // the requested ordinal.
                 return None;
             }
-            cursor.set(
-                rec.source_id.clone(),
-                ByteOffset::from(rec.offset.get() + rec.length),
-            );
+            cursor.set(rec.source_id.clone(), rec.offset + rec.length);
         }
         None
     }
@@ -450,7 +446,7 @@ struct SourceCursor<'a> {
     /// bytes from parse-error lines and (when present) line
     /// terminators.  Summed across cursors to drive the
     /// [`EventStream::bytes_read`] accessor.
-    bytes_read: u64,
+    bytes_read: ByteLen,
 }
 
 impl<'a> SourceCursor<'a> {
@@ -462,7 +458,7 @@ impl<'a> SourceCursor<'a> {
             intra_time_count: 0,
             source_id: source.id().clone(),
             out_of_order_warned: false,
-            bytes_read: 0,
+            bytes_read: ByteLen::ZERO,
         }
     }
 
@@ -477,7 +473,7 @@ impl<'a> SourceCursor<'a> {
         let Some((bytes, item)) = self.iter.next() else {
             return;
         };
-        self.bytes_read += bytes;
+        self.bytes_read += ByteLen::from(bytes);
         match item {
             Err(e) => {
                 self.pending.push_back(Err(e));
@@ -554,7 +550,7 @@ impl<'a> EventStream<'a> {
     /// Total source bytes consumed across all sources so far,
     /// including bytes for parse-error lines and (when present) line
     /// terminators.
-    pub fn bytes_read(&self) -> u64 {
+    pub fn bytes_read(&self) -> ByteLen {
         self.cursors.iter().map(|c| c.bytes_read).sum()
     }
 }
@@ -671,14 +667,17 @@ mod tests {
         let total = engine.filtered_total_bytes(&Filter::default());
         let a_size = std::fs::metadata(&a).unwrap().len();
         let b_size = std::fs::metadata(&b).unwrap().len();
-        assert_eq!(total, a_size + b_size);
+        assert_eq!(total, ByteLen::from(a_size + b_size));
 
         // A source-id predicate that excludes `b` drops `b`'s bytes
         // from the denominator; a real progress bar driven by this
         // value would track only the sources that will actually be
         // scanned.
         let path_filter: Filter = "source_id!~b\\.log".parse().unwrap();
-        assert_eq!(engine.filtered_total_bytes(&path_filter), a_size);
+        assert_eq!(
+            engine.filtered_total_bytes(&path_filter),
+            ByteLen::from(a_size)
+        );
 
         dir.cleanup();
     }
@@ -686,7 +685,10 @@ mod tests {
     #[test]
     fn filtered_total_bytes_empty_engine_is_zero() {
         let engine = Engine::new();
-        assert_eq!(engine.filtered_total_bytes(&Filter::default()), 0);
+        assert_eq!(
+            engine.filtered_total_bytes(&Filter::default()),
+            ByteLen::ZERO
+        );
     }
 
     #[test]

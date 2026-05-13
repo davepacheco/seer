@@ -27,8 +27,8 @@ use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Direction, Engine,
-    EngineEvent, Filter, Form, HostnameDisplay, LogStream, LogStreamId,
+    Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, Cursor, Direction,
+    Engine, EngineEvent, Filter, Form, HostnameDisplay, LogStream, LogStreamId,
     LogStreamPosition, MatchKind, ParseStats, Predicate, RenderOpts,
     SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector, Session,
     SessionId, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
@@ -866,7 +866,7 @@ fn format_byte_rate(bytes_per_sec: f64) -> String {
 /// half is dropped — it would either divide by zero or be meaningless.
 fn format_parse_stats(stats: &ParseStats) -> String {
     let secs = stats.elapsed.as_secs_f64();
-    let bytes = format_bytes(stats.bytes);
+    let bytes = format_bytes(stats.bytes.get());
     if stats.records == 0 || secs <= 0.0 {
         return format!(
             "{} records ({}) parsed in {:.3}s",
@@ -874,7 +874,7 @@ fn format_parse_stats(stats: &ParseStats) -> String {
         );
     }
     let rps = stats.records as f64 / secs;
-    let bps = stats.bytes as f64 / secs;
+    let bps = stats.bytes.get() as f64 / secs;
     format!(
         "{} records ({}) parsed in {:.3}s ({:.1} records/sec, {})",
         stats.records,
@@ -917,7 +917,7 @@ enum LongOp {
 impl LongOp {
     /// Bytes processed so far across all sources.  Drives the numerator
     /// of the progress bar.
-    fn bytes_done(&self) -> u64 {
+    fn bytes_done(&self) -> ByteLen {
         match self {
             LongOp::BuildSummary(op) => op.bytes_read,
             LongOp::Search(op) => op.bytes_done(),
@@ -927,7 +927,7 @@ impl LongOp {
 
     /// Total bytes the operation would process if it ran to completion.
     /// Drives the denominator of the progress bar.
-    fn total_bytes(&self) -> u64 {
+    fn total_bytes(&self) -> ByteLen {
         match self {
             LongOp::BuildSummary(op) => op.total_bytes,
             LongOp::Search(op) => op.total_bytes,
@@ -982,21 +982,21 @@ struct SummaryOp {
     filter: Filter,
     builder: SummaryBuilder,
     cursor: Cursor,
-    bytes_read: u64,
+    bytes_read: ByteLen,
     records: u64,
-    total_bytes: u64,
+    total_bytes: ByteLen,
     started: Instant,
     eof: bool,
 }
 
 impl SummaryOp {
-    fn new(tab_idx: usize, filter: Filter, total_bytes: u64) -> Self {
+    fn new(tab_idx: usize, filter: Filter, total_bytes: ByteLen) -> Self {
         Self {
             tab_idx,
             filter,
             builder: SummaryBuilder::default(),
             cursor: Cursor::new(),
-            bytes_read: 0,
+            bytes_read: ByteLen::ZERO,
             records: 0,
             total_bytes,
             started: Instant::now(),
@@ -1078,10 +1078,10 @@ struct SearchOp {
     anchor: SearchAnchor,
     /// `parse_stats.bytes` from the streamview at op start.  Subtract
     /// from the current value to get bytes processed by *this* op.
-    bytes_at_start: u64,
+    bytes_at_start: ByteLen,
     /// `parse_stats.records` at op start; same idea as `bytes_at_start`.
     records_at_start: u64,
-    total_bytes: u64,
+    total_bytes: ByteLen,
     /// Result of the last advance.  `None` while still searching;
     /// `Some(outcome)` once the op has finished and is awaiting
     /// finalize.  Note that `BudgetExhausted` is *not* terminal here —
@@ -1091,7 +1091,7 @@ struct SearchOp {
     /// out at the end of every `advance`.  The streamview itself is
     /// borrowed only during the chunk; the progress bar reads from
     /// here in between.
-    bytes_done: u64,
+    bytes_done: ByteLen,
     records: u64,
 }
 
@@ -1101,9 +1101,9 @@ impl SearchOp {
         regex: Regex,
         direction: SearchDir,
         anchor: SearchAnchor,
-        bytes_at_start: u64,
+        bytes_at_start: ByteLen,
         records_at_start: u64,
-        total_bytes: u64,
+        total_bytes: ByteLen,
     ) -> Self {
         Self {
             tab_idx,
@@ -1114,12 +1114,12 @@ impl SearchOp {
             records_at_start,
             total_bytes,
             outcome: None,
-            bytes_done: 0,
+            bytes_done: ByteLen::ZERO,
             records: 0,
         }
     }
 
-    fn bytes_done(&self) -> u64 {
+    fn bytes_done(&self) -> ByteLen {
         self.bytes_done
     }
 }
@@ -1164,11 +1164,11 @@ struct SeekOp {
     /// filter-rejected records) rather than just matching-record
     /// bytes so the bar still ticks during sparse-filter regions
     /// where the scan walks many records without surfacing any.
-    walked_bytes_at_start: u64,
+    walked_bytes_at_start: ByteLen,
     records_at_start: u64,
-    bytes_done: u64,
+    bytes_done: ByteLen,
     records: u64,
-    total_bytes: u64,
+    total_bytes: ByteLen,
     /// Set once `ensure_window_step` returns `Done`; the next
     /// `advance_long_op` tick finds this and dispatches to
     /// `finalize_long_op`.
@@ -1180,9 +1180,9 @@ impl SeekOp {
         tab_idx: usize,
         finalize: SeekFinalize,
         label: impl Into<String>,
-        walked_bytes_at_start: u64,
+        walked_bytes_at_start: ByteLen,
         records_at_start: u64,
-        total_bytes: u64,
+        total_bytes: ByteLen,
     ) -> Self {
         Self {
             tab_idx,
@@ -1190,7 +1190,7 @@ impl SeekOp {
             label: label.into(),
             walked_bytes_at_start,
             records_at_start,
-            bytes_done: 0,
+            bytes_done: ByteLen::ZERO,
             records: 0,
             total_bytes,
             complete: false,
@@ -1217,19 +1217,20 @@ impl SeekOp {
 fn format_long_op_progress(op: &LongOp, width: usize) -> String {
     let bytes_done = op.bytes_done();
     let total_bytes = op.total_bytes();
-    let pct = if total_bytes == 0 {
+    let pct = if total_bytes == ByteLen::ZERO {
         100.0
     } else {
         // Cap at 100 — search ops that walk back-fetch buffers (or
         // hypothetical accounting drift) can otherwise overshoot.
-        ((bytes_done as f64 / total_bytes as f64) * 100.0).min(100.0)
+        ((bytes_done.get() as f64 / total_bytes.get() as f64) * 100.0)
+            .min(100.0)
     };
     let label = op.label();
     let numbers = format!(
         "{:>5.1}%   {} / {}   {} records",
         pct,
-        format_bytes(bytes_done),
-        format_bytes(total_bytes),
+        format_bytes(bytes_done.get()),
+        format_bytes(total_bytes.get()),
         op.records(),
     );
     let prefix = format!("{label}: ");
@@ -7547,8 +7548,8 @@ mod tests {
     fn format_parse_stats_includes_records_bytes_time_and_rates() {
         let stats = ParseStats {
             records: 1023,
-            bytes: 2013,
-            walked_bytes: 2013,
+            bytes: ByteLen::from(2013),
+            walked_bytes: ByteLen::from(2013),
             elapsed: Duration::from_millis(15_231),
         };
         let s = format_parse_stats(&stats);
@@ -7566,8 +7567,8 @@ mod tests {
         // bytes are zero and the rate half would be meaningless.
         let stats = ParseStats {
             records: 0,
-            bytes: 0,
-            walked_bytes: 0,
+            bytes: ByteLen::ZERO,
+            walked_bytes: ByteLen::ZERO,
             elapsed: Duration::from_millis(0),
         };
         let s = format_parse_stats(&stats);
@@ -7587,8 +7588,8 @@ mod tests {
         // relying on whatever the test fixture produced.
         a.active_tab_mut().parse_stats = ParseStats {
             records: 42,
-            bytes: 4096,
-            walked_bytes: 4096,
+            bytes: ByteLen::from(4096),
+            walked_bytes: ByteLen::from(4096),
             elapsed: Duration::from_millis(100),
         };
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
@@ -7629,8 +7630,8 @@ mod tests {
         // Build a SummaryOp whose state is set up by hand so the
         // formatted output is deterministic — we don't drive a real
         // engine here.
-        let mut s = SummaryOp::new(0, Filter::default(), 1024);
-        s.bytes_read = 256;
+        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(1024));
+        s.bytes_read = ByteLen::from(256);
         s.records = 42;
         let op = LongOp::BuildSummary(Box::new(s));
         let out = format_long_op_progress(&op, 80);
@@ -7650,8 +7651,8 @@ mod tests {
         // At 30 cells there isn't room for a useful bar plus the
         // numbers; the bar is dropped rather than truncating the
         // numbers.
-        let mut s = SummaryOp::new(0, Filter::default(), 1024);
-        s.bytes_read = 256;
+        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(1024));
+        s.bytes_read = ByteLen::from(256);
         s.records = 42;
         let op = LongOp::BuildSummary(Box::new(s));
         let out = format_long_op_progress(&op, 30);
@@ -7665,8 +7666,8 @@ mod tests {
         // Search ops can overshoot total_bytes when the streamview
         // had already pulled bytes for back-fetch that we count
         // against the same denominator; the bar should clamp to 100%.
-        let mut s = SummaryOp::new(0, Filter::default(), 100);
-        s.bytes_read = 200;
+        let mut s = SummaryOp::new(0, Filter::default(), ByteLen::from(100));
+        s.bytes_read = ByteLen::from(200);
         s.records = 1;
         let op = LongOp::BuildSummary(Box::new(s));
         let out = format_long_op_progress(&op, 80);
@@ -7805,8 +7806,8 @@ mod tests {
         // should not appear when the bookmarks pane is showing.
         a.tabs[0].parse_stats = ParseStats {
             records: 9999,
-            bytes: 1024 * 1024,
-            walked_bytes: 1024 * 1024,
+            bytes: ByteLen::from(1024 * 1024),
+            walked_bytes: ByteLen::from(1024 * 1024),
             elapsed: Duration::from_millis(1234),
         };
         let backend = TestBackend::new(120, 5);
