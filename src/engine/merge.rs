@@ -18,13 +18,12 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
+use crate::position::Cursor;
 use crate::source::{
     ByteLen, ByteOffset, Direction, QueryRecord, Source, SourceError, SourceId,
 };
 use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Returns the opposite direction.
@@ -56,65 +55,6 @@ pub const FETCH_BATCH_SIZE: usize = 64;
 /// the *opposite* end is dropped and that direction's EOF flag is
 /// cleared so a subsequent fetch can re-acquire the dropped data.
 const BUFFER_LIMIT: usize = 256;
-
-/// Merged-stream byte-offset position — one [`ByteOffset`] per source.
-///
-/// Wraps a `BTreeMap<SourceId, ByteOffset>` so callers can't accidentally
-/// use it as a plain map.  Used as a serializable bookmark of where a
-/// [`Stepper`] is in the merged stream and as the input shape for
-/// restoring a [`Stepper`] later.  Sources missing from the map resolve
-/// to [`ByteOffset::ZERO`] when used as input to
-/// [`super::Engine::stepper`], so a default `Cursor` walks each source
-/// from its beginning.
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(transparent)]
-pub struct Cursor {
-    offsets: BTreeMap<SourceId, ByteOffset>,
-}
-
-impl Cursor {
-    /// Returns an empty cursor.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Builds a cursor from an iterator of (source id, byte offset)
-    /// pairs.
-    pub fn with(
-        offsets: impl IntoIterator<Item = (SourceId, ByteOffset)>,
-    ) -> Self {
-        Self { offsets: offsets.into_iter().collect() }
-    }
-
-    /// Returns the byte offset stored for `source_id`, if any.
-    pub fn get(&self, source_id: &SourceId) -> Option<ByteOffset> {
-        self.offsets.get(source_id).copied()
-    }
-
-    /// Sets the byte offset for `source_id`, overwriting any previous
-    /// entry.
-    pub fn set(&mut self, source_id: SourceId, offset: ByteOffset) {
-        self.offsets.insert(source_id, offset);
-    }
-
-    /// Iterates over (source id, byte offset) pairs in ascending source
-    /// id order.
-    pub fn iter(&self) -> impl Iterator<Item = (&SourceId, ByteOffset)> {
-        self.offsets.iter().map(|(k, v)| (k, *v))
-    }
-
-    /// Returns the number of source-id entries.
-    pub fn len(&self) -> usize {
-        self.offsets.len()
-    }
-
-    /// Returns true iff this cursor has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
-    }
-}
 
 /// A single record produced by [`Stepper::step_forward`] /
 /// [`Stepper::step_backward`].
@@ -501,13 +441,9 @@ impl<'a> Stepper<'a> {
     /// Returns a snapshot of every source's current byte offset,
     /// suitable for serialization.
     pub fn cursor(&self) -> Cursor {
-        Cursor {
-            offsets: self
-                .sources
-                .iter()
-                .map(|s| (s.source_id.clone(), s.position))
-                .collect(),
-        }
+        Cursor::with(
+            self.sources.iter().map(|s| (s.source_id.clone(), s.position)),
+        )
     }
 
     /// Returns the next record in time order, or `None` when every

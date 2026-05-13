@@ -7,6 +7,7 @@
 pub mod engine;
 pub mod event;
 pub mod filter;
+pub mod position;
 pub mod render;
 pub mod save_policy;
 pub mod session;

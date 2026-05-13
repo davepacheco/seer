@@ -23,7 +23,8 @@ use std::collections::VecDeque;
 
 mod merge;
 
-pub use merge::{Cursor, FETCH_BATCH_SIZE, MergeError, MergeRecord, Stepper};
+pub use crate::position::Cursor;
+pub use merge::{FETCH_BATCH_SIZE, MergeError, MergeRecord, Stepper};
 
 /// An [`Event`] paired with the [`LogStreamPosition`] identifying which
 /// source it came from and its position within that source.
