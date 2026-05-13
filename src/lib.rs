@@ -25,7 +25,10 @@ pub use engine::{
     Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
-pub use filter::{Filter, FilterParseError, Form, Predicate, TimeOp};
+pub use filter::{
+    EventPredicate, Filter, FilterParseError, Form, Predicate, SourcePredicate,
+    TimeOp,
+};
 pub use position::LogStreamPosition;
 pub use render::{
     HostnameDisplay, RenderOpts, ShowDate, format_event, format_time,

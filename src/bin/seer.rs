@@ -28,12 +28,12 @@ use regex::Regex;
 use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, Cursor, Direction,
-    Engine, EngineEvent, Filter, Form, HostnameDisplay, LogStream, LogStreamId,
-    LogStreamPosition, MatchKind, ParseStats, Predicate, RenderOpts,
-    SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector, Session,
-    SessionId, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
-    StreamView, SummaryBuilder, TabKind, WindowFillStatus, build_seeit_command,
-    format_summary,
+    Engine, EngineEvent, EventPredicate, Filter, Form, HostnameDisplay,
+    LogStream, LogStreamId, LogStreamPosition, MatchKind, ParseStats,
+    RenderOpts, SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector,
+    Session, SessionId, SessionMatch, SessionSource, SessionStore, SourceId,
+    StoreError, StreamView, SummaryBuilder, TabKind, WindowFillStatus,
+    build_seeit_command, format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -3744,11 +3744,12 @@ impl App {
                 } else {
                     Form::Affirmed
                 };
-                let new_pred = Predicate::FieldEquals {
+                let new_pred = EventPredicate::FieldEquals {
                     name: "msg".to_string(),
                     value: ee.event.msg.clone(),
                     form,
-                };
+                }
+                .into();
                 let mut new_filter = self.active_stream().filter.clone();
                 new_filter.add_predicate(new_pred);
                 // apply_filter clears search and select; the viewport
@@ -9750,10 +9751,13 @@ mod tests {
         let (mut a, _dir) = app_with_store_and_one_tab();
         let stream_id = a.tabs[a.active].stream;
         let mut new_filter = Filter::default();
-        new_filter.add_predicate(Predicate::MsgMatches {
-            regex: regex::Regex::new("hello").unwrap(),
-            form: Form::Affirmed,
-        });
+        new_filter.add_predicate(
+            EventPredicate::MsgMatches {
+                regex: regex::Regex::new("hello").unwrap(),
+                form: Form::Affirmed,
+            }
+            .into(),
+        );
 
         a.apply_filter(new_filter.clone());
         assert!(!a.policy.dirty());

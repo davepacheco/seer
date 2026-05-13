@@ -17,7 +17,7 @@
 //! ever opening them for reading.
 
 use crate::event::{Event, Hostname, LoggerName};
-use crate::filter::{Filter, Predicate};
+use crate::filter::{EventPredicate, Filter, Predicate};
 use camino::{Utf8Path, Utf8PathBuf};
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
@@ -425,7 +425,12 @@ impl SourceMetadata {
     /// the per-record scan.
     pub fn excludes_all(&self, filter: &Filter) -> bool {
         for predicate in filter.predicates() {
-            let Predicate::FieldEquals { name, value, form } = predicate else {
+            let Predicate::Event(EventPredicate::FieldEquals {
+                name,
+                value,
+                form,
+            }) = predicate
+            else {
                 continue;
             };
             let known_value: &str = match name.as_str() {

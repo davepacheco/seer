@@ -127,6 +127,129 @@
         }
       }
     },
+    "EventPredicate": {
+      "description": "A predicate evaluated against an individual [`Event`].\n\nThe equality and regex variants carry a [`Form`] so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in form.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
+      "oneOf": [
+        {
+          "description": "`event.level >= threshold`",
+          "type": "object",
+          "required": [
+            "LevelAtLeast"
+          ],
+          "properties": {
+            "LevelAtLeast": {
+              "$ref": "#/definitions/Level"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.level == level` (or `!=` when `form` is `Negated`)",
+          "type": "object",
+          "required": [
+            "LevelEquals"
+          ],
+          "properties": {
+            "LevelEquals": {
+              "type": "object",
+              "required": [
+                "form",
+                "level"
+              ],
+              "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
+                "level": {
+                  "$ref": "#/definitions/Level"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Named field has (or, when `form` is `Negated`, does not have) the given exact-string value.\n\nMatches the bunyan core fields (`name`, `hostname`, `pid`, `msg`) or any key in `event.extra`.",
+          "type": "object",
+          "required": [
+            "FieldEquals"
+          ],
+          "properties": {
+            "FieldEquals": {
+              "type": "object",
+              "required": [
+                "form",
+                "name",
+                "value"
+              ],
+              "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.msg` matches (or, when `form` is `Negated`, does not match) the regex.",
+          "type": "object",
+          "required": [
+            "MsgMatches"
+          ],
+          "properties": {
+            "MsgMatches": {
+              "type": "object",
+              "required": [
+                "form",
+                "regex"
+              ],
+              "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
+                "regex": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`event.time` compared against `value` using `op`.  Negation is expressed by flipping the operator (e.g. `!(time >= X)` is `time < X`), so there is no separate [`Form`].",
+          "type": "object",
+          "required": [
+            "TimeBound"
+          ],
+          "properties": {
+            "TimeBound": {
+              "type": "object",
+              "required": [
+                "op",
+                "value"
+              ],
+              "properties": {
+                "op": {
+                  "$ref": "#/definitions/TimeOp"
+                },
+                "value": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "Filter": {
       "description": "A conjunction of predicates over an [`Event`].\n\nThe default value has no predicates and matches every event.",
       "type": "object",
@@ -260,147 +383,28 @@
       }
     },
     "Predicate": {
-      "description": "A single predicate over an [`Event`].\n\nThe equality and regex variants carry a [`Form`] so that `name=Nexus` and `name!=Nexus` (and likewise `msg=~foo` / `msg!~foo`) are the same variant differing only in form.  `LevelAtLeast` has no useful negation (the user can write `level>=` at the threshold they want), so it is left as a single variant.",
+      "description": "A single predicate in a [`Filter`].\n\nSplit into two domains so that per-event matching and per-source matching are statically distinguishable.  Before the split, a single `Predicate::matches(event)` had a `SourceIdMatches` arm that returned `true` unconditionally — a silent no-op buried inside an otherwise honest method.  The wrapper keeps a single persisted list (so DSL ordering round-trips) while [`EventPredicate::matches`] and [`SourcePredicate::matches`] are each exhaustive over the variants they're called on.\n\nNew predicates land in [`EventPredicate`] if they read from an [`Event`], or in [`SourcePredicate`] if they read from a [`SourceId`].",
       "oneOf": [
         {
-          "description": "`event.level >= threshold`",
           "type": "object",
           "required": [
-            "LevelAtLeast"
+            "Event"
           ],
           "properties": {
-            "LevelAtLeast": {
-              "$ref": "#/definitions/Level"
+            "Event": {
+              "$ref": "#/definitions/EventPredicate"
             }
           },
           "additionalProperties": false
         },
         {
-          "description": "`event.level == level` (or `!=` when `form` is `Negated`)",
           "type": "object",
           "required": [
-            "LevelEquals"
+            "Source"
           ],
           "properties": {
-            "LevelEquals": {
-              "type": "object",
-              "required": [
-                "form",
-                "level"
-              ],
-              "properties": {
-                "form": {
-                  "$ref": "#/definitions/Form"
-                },
-                "level": {
-                  "$ref": "#/definitions/Level"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Named field has (or, when `form` is `Negated`, does not have) the given exact-string value.\n\nMatches the bunyan core fields (`name`, `hostname`, `pid`, `msg`) or any key in `event.extra`.",
-          "type": "object",
-          "required": [
-            "FieldEquals"
-          ],
-          "properties": {
-            "FieldEquals": {
-              "type": "object",
-              "required": [
-                "form",
-                "name",
-                "value"
-              ],
-              "properties": {
-                "form": {
-                  "$ref": "#/definitions/Form"
-                },
-                "name": {
-                  "type": "string"
-                },
-                "value": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "`event.msg` matches (or, when `form` is `Negated`, does not match) the regex.",
-          "type": "object",
-          "required": [
-            "MsgMatches"
-          ],
-          "properties": {
-            "MsgMatches": {
-              "type": "object",
-              "required": [
-                "form",
-                "regex"
-              ],
-              "properties": {
-                "form": {
-                  "$ref": "#/definitions/Form"
-                },
-                "regex": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "The source the event came from has an id that matches (or, when `form` is `Negated`, does not match) the regex.  Evaluated against [`crate::source::SourceId`] at source-selection time, not against the event itself; the engine skips entire sources whose ids fail rather than iterating their contents.",
-          "type": "object",
-          "required": [
-            "SourceIdMatches"
-          ],
-          "properties": {
-            "SourceIdMatches": {
-              "type": "object",
-              "required": [
-                "form",
-                "regex"
-              ],
-              "properties": {
-                "form": {
-                  "$ref": "#/definitions/Form"
-                },
-                "regex": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "`event.time` compared against `value` using `op`.  Negation is expressed by flipping the operator (e.g. `!(time >= X)` is `time < X`), so there is no separate [`Form`].",
-          "type": "object",
-          "required": [
-            "TimeBound"
-          ],
-          "properties": {
-            "TimeBound": {
-              "type": "object",
-              "required": [
-                "op",
-                "value"
-              ],
-              "properties": {
-                "op": {
-                  "$ref": "#/definitions/TimeOp"
-                },
-                "value": {
-                  "type": "string",
-                  "format": "date-time"
-                }
-              }
+            "Source": {
+              "$ref": "#/definitions/SourcePredicate"
             }
           },
           "additionalProperties": false
@@ -443,6 +447,36 @@
           "minimum": 0.0
         }
       }
+    },
+    "SourcePredicate": {
+      "description": "A predicate evaluated against a [`SourceId`] at source-selection time, not against any individual event.\n\nToday the only variant is regex-on-source-id, so the enum is trivially extensible.  Kept as an enum (rather than a plain struct) so future per-source predicates — matching on cached metadata, file mtime windows, etc. — slot in alongside without reshaping callers.",
+      "oneOf": [
+        {
+          "description": "The source's id matches (or, when `form` is `Negated`, does not match) the regex.  The engine skips entire sources whose ids fail rather than iterating their contents.",
+          "type": "object",
+          "required": [
+            "SourceIdMatches"
+          ],
+          "properties": {
+            "SourceIdMatches": {
+              "type": "object",
+              "required": [
+                "form",
+                "regex"
+              ],
+              "properties": {
+                "form": {
+                  "$ref": "#/definitions/Form"
+                },
+                "regex": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
     },
     "Tab": {
       "description": "A tab in the TUI.\n\nA tab is a view onto exactly one [`LogStream`] (referenced by id; the stream lives in [`Session::streams`]).  `cursor` is the byte-offset [`Cursor`] the tab is currently scrolled to, captured at save time so a resumed session can land the viewport on the same record. `cursor` is `None` for an empty-or-unrendered tab.",
@@ -493,7 +527,7 @@
       ]
     },
     "TimeOp": {
-      "description": "Comparison operator for a [`Predicate::TimeBound`].",
+      "description": "Comparison operator for a [`EventPredicate::TimeBound`].",
       "oneOf": [
         {
           "description": "`event.time >= value`",
