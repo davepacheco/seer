@@ -4856,7 +4856,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         title: "Other",
         items: &[
-            ("Y", "show seeit reproduction command"),
+            ("Y", "show `seeit` reproduction command"),
             ("h", "show this help"),
             ("q", "quit"),
         ],
@@ -4867,9 +4867,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("j, k", "move cursor"),
             ("Enter", "open bookmark"),
             ("x", "delete bookmark (with confirmation)"),
-            ("Tab, Shift-Tab", "cycle panes"),
-            ("h", "show this help"),
-            ("q", "quit"),
         ],
     },
 ];
