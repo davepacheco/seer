@@ -24,16 +24,16 @@
 //! shape, not by the file size.
 
 use crate::engine::{
-    Cursor, Engine, FETCH_BATCH_SIZE, MergeRecord, StepperOptions,
+    Cursor, Engine, EngineEvent, FETCH_BATCH_SIZE, MergeRecord, StepperOptions,
 };
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::position::{ByteLen, ByteOffset, SourceId};
+use crate::position::{ByteLen, ByteOffset, LogStreamPosition, SourceId};
 use crate::render::{RenderOpts, format_event};
 use crate::source::Direction;
 use chrono::{DateTime, Duration, Utc};
 use regex::Regex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration as StdDuration, Instant};
 
 /// Soft cap on cached records.  When extending in a direction would
@@ -90,6 +90,183 @@ impl WindowEntry {
 
     fn key(&self) -> RecordKey {
         RecordKey::from_record(&self.record)
+    }
+}
+
+/// One materialized record in a [`Materialized`].  Either a parsed
+/// event (the common case) or an error from the merge layer with its
+/// `Display` form preserved.
+///
+/// The `Error` variant carries the stringified error so callers don't
+/// have to look up `formatted[first_line_for_event[i]]` to recover
+/// it — the pairing is enforced at the type level.
+#[derive(Debug, Clone)]
+pub enum Row {
+    Event(EngineEvent),
+    /// `Display` form of the underlying [`crate::engine::MergeError`].
+    /// The same string is cached at
+    /// `formatted[first_line_for_event[i]]` for the render path; this
+    /// copy is the source of truth.  Carried (rather than a bare unit
+    /// variant) so a [`Row::Error`] slot can't exist without its
+    /// message attached.  Not yet read by any consumer; expected first
+    /// reader is a future "show error details" dialog or a refined
+    /// exclude-mode notice.
+    #[allow(dead_code)]
+    Error(String),
+}
+
+/// Index of a record within a [`Materialized::events`] vector.
+///
+/// Distinct from [`LineIdx`] (a position in `formatted`).  Keeping
+/// them as separate types makes accidental swaps between the two
+/// index domains — most importantly the `event_for_line` /
+/// `first_line_for_event` translation tables — a compile error.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventIdx(pub usize);
+
+impl EventIdx {
+    pub const ZERO: Self = Self(0);
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl std::ops::Add<usize> for EventIdx {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::fmt::Display for EventIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<usize> for EventIdx {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<usize> for EventIdx {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+/// Index of a display row within a [`Materialized::formatted`] vector.
+///
+/// See [`EventIdx`] for the type-safety rationale.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LineIdx(pub usize);
+
+impl LineIdx {
+    pub const ZERO: Self = Self(0);
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+
+    pub fn saturating_sub(self, n: usize) -> Self {
+        Self(self.0.saturating_sub(n))
+    }
+}
+
+impl std::ops::Add<usize> for LineIdx {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::ops::AddAssign<usize> for LineIdx {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs;
+    }
+}
+
+impl std::ops::Sub<LineIdx> for LineIdx {
+    type Output = usize;
+
+    fn sub(self, rhs: LineIdx) -> usize {
+        self.0 - rhs.0
+    }
+}
+
+impl std::fmt::Display for LineIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq<usize> for LineIdx {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<usize> for LineIdx {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
+    }
+}
+
+/// Flat materialization of a [`StreamView`]'s current window.
+///
+/// `events` is one entry per record produced by the underlying merge:
+/// [`Row::Event`] for an `Ok` result, [`Row::Error`] for a parse / I/O
+/// error or out-of-order warning.  `formatted` is one entry per
+/// *display line* — an event with `n` extra fields contributes `1 + n`
+/// lines (header plus indented `key = value` rows), and an error
+/// contributes a single line carrying its `Display` message.
+/// `formatted.len() >= events.len()`, with equality only when no
+/// event has any extras.
+///
+/// `event_for_line[i]` is the index into `events` of the record that
+/// produced display line `i`.  `first_line_for_event[i]` is the
+/// inverse: the first line index for record `i`.  Together they let
+/// callers translate freely between "scroll position" (a line index)
+/// and "the record under the cursor" (an event index) without
+/// rescanning.
+///
+/// Built by [`StreamView`] and refreshed in-place at the end of every
+/// mutator that affects the window or its formatting.  Test fixtures
+/// that don't go through `StreamView` (e.g. summary placeholders, or
+/// the TUI's `App::with_events` synthetic-tab path) build a
+/// `Materialized` directly via [`Materialized::synthetic`].
+#[derive(Debug, Clone, Default)]
+pub struct Materialized {
+    pub events: Vec<Row>,
+    pub formatted: Vec<String>,
+    pub event_for_line: Vec<EventIdx>,
+    pub first_line_for_event: Vec<LineIdx>,
+    pub parse_stats: ParseStats,
+}
+
+impl Materialized {
+    /// Builds a [`Materialized`] from caller-supplied flat vectors.
+    /// Used by TUI paths that don't have a [`StreamView`] backing them
+    /// (summary tabs whose histogram is computed elsewhere, test
+    /// fixtures with hand-crafted rows).
+    pub fn synthetic(
+        events: Vec<Row>,
+        formatted: Vec<String>,
+        event_for_line: Vec<EventIdx>,
+        first_line_for_event: Vec<LineIdx>,
+        parse_stats: ParseStats,
+    ) -> Self {
+        Self {
+            events,
+            formatted,
+            event_for_line,
+            first_line_for_event,
+            parse_stats,
+        }
     }
 }
 
@@ -275,6 +452,12 @@ pub struct StreamView {
     /// Cleared on `Found` and `NotFound`; ignored when the regex,
     /// direction, or anchor changes between calls.
     search_resume: Option<SearchResumePoint>,
+    /// Cached flat view of the window for the TUI render path,
+    /// recomputed at the end of every mutator that touches the records
+    /// or formatting.  Callers read via [`Self::materialized`] — there's
+    /// only one source of truth for the flat shape, so the old
+    /// "streamview + Tab carry parallel copies" sync hazard is gone.
+    materialized: Materialized,
 }
 
 impl StreamView {
@@ -292,6 +475,7 @@ impl StreamView {
             anchor: Anchor::PinFront,
             parse_stats: ParseStats::default(),
             search_resume: None,
+            materialized: Materialized::default(),
         }
     }
 
@@ -306,6 +490,65 @@ impl StreamView {
 
     pub fn parse_stats(&self) -> &ParseStats {
         &self.parse_stats
+    }
+
+    /// Returns the cached flat materialization of the current window.
+    /// Refreshed in-place at the end of every mutator that affects the
+    /// records or formatting, so callers can read `&self` without
+    /// triggering a recompute.
+    pub fn materialized(&self) -> &Materialized {
+        &self.materialized
+    }
+
+    /// Rebuilds [`Self::materialized`] from the current `records` deque
+    /// and `parse_stats`.  Called from every mutator that slides the
+    /// window, swaps render options, or otherwise changes what would
+    /// be rendered.  O(window_size) per call; the window is bounded by
+    /// [`WINDOW_SOFT_CAP`] so this is microseconds in practice.
+    fn recompute_materialized(&mut self) {
+        let mut events = Vec::with_capacity(self.records.len());
+        let mut formatted = Vec::new();
+        let mut event_for_line = Vec::new();
+        let mut first_line_for_event = Vec::with_capacity(self.records.len());
+        let mut ordinals: HashMap<(SourceId, DateTime<Utc>), u64> =
+            HashMap::new();
+        for entry in &self.records {
+            let event_idx = EventIdx(events.len());
+            first_line_for_event.push(LineIdx(formatted.len()));
+            match &entry.record.event {
+                Ok(event) => {
+                    let key = (entry.record.source_id.clone(), event.time);
+                    let ordinal = *ordinals.entry(key.clone()).or_insert(0);
+                    ordinals.insert(key, ordinal + 1);
+                    let position = LogStreamPosition::new(
+                        entry.record.source_id.clone(),
+                        event.time,
+                        ordinal,
+                    );
+                    for line in &entry.lines {
+                        formatted.push(line.clone());
+                        event_for_line.push(event_idx);
+                    }
+                    events.push(Row::Event(EngineEvent {
+                        position,
+                        event: event.clone(),
+                    }));
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    formatted.push(msg.clone());
+                    event_for_line.push(event_idx);
+                    events.push(Row::Error(msg));
+                }
+            }
+        }
+        self.materialized = Materialized {
+            events,
+            formatted,
+            event_for_line,
+            first_line_for_event,
+            parse_stats: self.parse_stats.clone(),
+        };
     }
 
     /// Iterates over the cached records and their pre-formatted display
@@ -473,6 +716,7 @@ impl StreamView {
         self.eof.backward = false;
         self.anchor = Anchor::PinFront;
         self.parse_stats = ParseStats::default();
+        self.recompute_materialized();
     }
 
     /// Replaces the active rendering options and reformats every cached
@@ -501,6 +745,7 @@ impl StreamView {
         {
             *line = 0;
         }
+        self.recompute_materialized();
     }
 
     /// Re-runs [`format_record`] for every cached entry against the
@@ -532,6 +777,7 @@ impl StreamView {
         self.eof.backward = true;
         self.anchor = Anchor::PinFront;
         self.search_resume = None;
+        self.recompute_materialized();
     }
 
     /// Resets the view to the end of the merged stream and ensures
@@ -561,6 +807,7 @@ impl StreamView {
         self.eof.backward = false;
         self.anchor = Anchor::PinBack;
         self.search_resume = None;
+        self.recompute_materialized();
         Ok(())
     }
 
@@ -607,6 +854,7 @@ impl StreamView {
         self.eof.backward = false;
         self.anchor = Anchor::PinFront;
         self.search_resume = None;
+        self.recompute_materialized();
     }
 
     /// Sets the anchor to [`Anchor::PinBack`] without touching the
@@ -684,6 +932,7 @@ impl StreamView {
             };
             let target_met = total_lines(&self.records) >= target_lines;
             if !target_met && !dir_eof {
+                self.recompute_materialized();
                 return WindowFillStatus::NotDone;
             }
         }
@@ -723,6 +972,7 @@ impl StreamView {
                 .sum::<usize>()
                 >= target_lines
         });
+        self.recompute_materialized();
         WindowFillStatus::Done
     }
 
@@ -771,6 +1021,7 @@ impl StreamView {
             }
         }
         if self.records.is_empty() {
+            self.recompute_materialized();
             return;
         }
         // Look-ahead: fetch forward batches until at least
@@ -795,6 +1046,7 @@ impl StreamView {
                 .sum::<usize>()
                 >= target_lines
         });
+        self.recompute_materialized();
     }
 
     /// Fetches up to `FETCH_BATCH_SIZE` records forward and appends
@@ -1096,6 +1348,8 @@ impl StreamView {
             }
         }
         if delta == 0 {
+            // No motion, but `ensure_window` above may have populated
+            // the deque (and thus recomputed); nothing more to do.
             return;
         }
         // Resolve the current anchor to a (record_idx, line_within)
@@ -1179,6 +1433,7 @@ impl StreamView {
             self.anchor = Anchor::On { key: self.records[idx].key(), line };
         }
         self.anchor = Anchor::On { key: self.records[idx].key(), line };
+        self.recompute_materialized();
     }
 
     /// Resolves the current anchor to `(record_idx, line)` in the
@@ -1229,6 +1484,7 @@ impl StreamView {
                 self.advance_time_backward(engine, target, viewport_height)
             }
         }
+        self.recompute_materialized();
     }
 
     /// Returns the timestamp of the closest event to the anchor in
@@ -1400,7 +1656,7 @@ impl StreamView {
         }
         let resume_idx = self.consume_valid_resume(regex, direction);
         let mut budget = budget;
-        match direction {
+        let outcome = match direction {
             SearchDir::Forward => self.search_step_forward(
                 engine,
                 regex,
@@ -1419,7 +1675,9 @@ impl StreamView {
                 resume_idx,
                 cancel,
             ),
-        }
+        };
+        self.recompute_materialized();
+        outcome
     }
 
     /// Takes any saved resume point, validates it against the requested

@@ -28,14 +28,15 @@ use regex::Regex;
 use seer::Event as LogEvent;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, Cursor, Direction,
-    Engine, EngineEvent, EventPredicate, Filter, Form, HostnameDisplay,
-    LogStream, LogStreamId, LogStreamPosition, MatchKind, ParseStats,
-    RenderOpts, SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector,
-    Session, SessionId, SessionMatch, SessionSource, SessionStore, SourceId,
-    StoreError, StreamView, SummaryBuilder, TabKind, WindowFillStatus,
-    build_seeit_command, format_summary,
+    Engine, EventIdx, EventPredicate, Filter, Form, HostnameDisplay, LineIdx,
+    LogStream, LogStreamId, MatchKind, Materialized, ParseStats, RenderOpts,
+    Row, SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector, Session,
+    SessionId, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
+    StreamView, SummaryBuilder, TabKind, WindowFillStatus, build_seeit_command,
+    format_summary,
 };
-use std::collections::HashMap;
+#[cfg(test)]
+use seer::{EngineEvent, LogStreamPosition};
 use std::time::{Duration, Instant};
 
 /// Position of a tab in [`App::tabs`].
@@ -61,107 +62,6 @@ impl PartialEq<usize> for TabIdx {
 }
 
 impl PartialOrd<usize> for TabIdx {
-    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
-/// Index of a record within a tab's `events` vector.
-///
-/// Distinct from [`LineIdx`] (a position in `formatted`).  Keeping them
-/// as separate types makes accidental swaps between the two index
-/// domains — most importantly the `event_for_line` /
-/// `first_line_for_event` translation tables — a compile error.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct EventIdx(usize);
-
-impl EventIdx {
-    const ZERO: Self = Self(0);
-
-    fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::ops::Add<usize> for EventIdx {
-    type Output = Self;
-
-    fn add(self, rhs: usize) -> Self {
-        Self(self.0 + rhs)
-    }
-}
-
-impl std::fmt::Display for EventIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl PartialEq<usize> for EventIdx {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialOrd<usize> for EventIdx {
-    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
-/// Index of a display row within a tab's `formatted` vector.
-///
-/// See [`EventIdx`] for the type-safety rationale.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct LineIdx(usize);
-
-impl LineIdx {
-    const ZERO: Self = Self(0);
-
-    fn get(self) -> usize {
-        self.0
-    }
-
-    fn saturating_sub(self, n: usize) -> Self {
-        Self(self.0.saturating_sub(n))
-    }
-}
-
-impl std::ops::Add<usize> for LineIdx {
-    type Output = Self;
-
-    fn add(self, rhs: usize) -> Self {
-        Self(self.0 + rhs)
-    }
-}
-
-impl std::ops::AddAssign<usize> for LineIdx {
-    fn add_assign(&mut self, rhs: usize) {
-        self.0 += rhs;
-    }
-}
-
-impl std::ops::Sub<LineIdx> for LineIdx {
-    type Output = usize;
-
-    fn sub(self, rhs: LineIdx) -> usize {
-        self.0 - rhs.0
-    }
-}
-
-impl std::fmt::Display for LineIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl PartialEq<usize> for LineIdx {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialOrd<usize> for LineIdx {
     fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
         self.0.partial_cmp(other)
     }
@@ -769,53 +669,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// One materialized record in a [`RenderedRows`].  Either a parsed
-/// event (the common case) or an error from the merge layer with its
-/// `Display` form preserved.
-///
-/// Replaces an earlier `Option<EngineEvent>` shape that paired with a
-/// parallel error-string slot in `formatted`; the two halves of an
-/// error row are now in the same variant, so consumers can't accidentally
-/// treat one without considering the other.
-enum Row {
-    Event(EngineEvent),
-    /// `Display` form of the underlying [`engine::MergeError`].  The
-    /// same string is cached at `formatted[first_line_for_event[i]]`
-    /// for the render path; this copy is the source of truth.  Carried
-    /// (rather than a bare unit variant) so an [`Row::Error`] slot
-    /// can't exist without its message attached — that pairing is the
-    /// invariant the enum exists to enforce.  Not yet read by any
-    /// consumer; expected first reader is a future "show error details"
-    /// dialog or a refined exclude-mode notice.
-    #[allow(dead_code)]
-    Error(String),
-}
-
-/// Materializes the active filter against the engine, returning the
-/// records alongside their multi-line display rendering.
-///
-/// `events` is one entry per record produced by [`Engine::query_events`]:
-/// [`Row::Event`] for an `Ok` result, [`Row::Error`] for a parse/I/O
-/// error or out-of-order warning.  `formatted` is one entry per
-/// *display line* — an event with `n` extra fields contributes `1 + n`
-/// lines (header plus indented `key = value` rows), and an error
-/// contributes a single line carrying its `Display` message.
-/// `formatted.len() >= events.len()`, with equality only when no event
-/// has any extras.
-///
-/// `event_for_line[i]` is the index into `events` of the record that
-/// produced display line `i`.  `first_line_for_event[i]` is the inverse:
-/// the first line index for record `i`.  Together they let callers
-/// translate freely between "scroll position" (a line index) and "the
-/// record under the cursor" (an event index) without rescanning.
-struct RenderedRows {
-    events: Vec<Row>,
-    formatted: Vec<String>,
-    event_for_line: Vec<EventIdx>,
-    first_line_for_event: Vec<LineIdx>,
-    parse_stats: ParseStats,
-}
-
 /// Default viewport height used when constructing a [`Tab`] before
 /// the actual terminal size is known.  The first render call replaces
 /// this with the real height via [`Tab::maintain_window`].  Set high
@@ -875,23 +728,18 @@ fn column_chunks(text: &str, width: u16) -> Vec<&str> {
 }
 
 /// Builds a Stream-tab's initial render state by populating a
-/// [`StreamView`] window and materializing it.
-///
-/// Returned [`StreamView`] is owned by the calling [`Tab`] so
-/// subsequent navigation (scroll past window edge, `G`, search) can
-/// slide it without re-walking the whole file.  [`RenderedRows`]
-/// reflects the StreamView's current window and is rebuilt on every
-/// slide via [`materialize_streamview`].
-fn render_rows(
+/// [`StreamView`] window.  The streamview eagerly maintains its own
+/// flat [`Materialized`] cache, so the caller doesn't need to pull
+/// out a separate copy.
+fn build_streamview(
     engine: &Engine,
     filter: &Filter,
     opts: RenderOpts,
     viewport_height: u16,
-) -> (StreamView, RenderedRows) {
+) -> StreamView {
     let mut view = StreamView::new(filter.clone(), opts);
     view.ensure_window(engine, viewport_height);
-    let rows = materialize_streamview(&view);
-    (view, rows)
+    view
 }
 
 /// Extracts the trailing integer from a default-shaped tab name like
@@ -905,73 +753,14 @@ fn parse_tab_number(name: &str) -> Option<usize> {
     n.parse().ok()
 }
 
-/// Translates a [`StreamView`]'s current window into the flat
-/// [`RenderedRows`] shape that the Tab/render pipeline expects.
-///
-/// Walks the cached records once, cloning their pre-formatted display
-/// lines into a single flat vector and accumulating the line/record
-/// index maps.  Computes a [`LogStreamPosition`] per `Ok` event by
-/// counting same-`(source, time)` records seen so far in the window;
-/// the ordinal is window-relative — accurate for filter-change starts
-/// (where the window begins at byte 0), best-effort otherwise.  The
-/// position is used by exclude-mode and is decoupled from bookmarks,
-/// which now store byte cursors directly.
-fn materialize_streamview(view: &StreamView) -> RenderedRows {
-    let mut events = Vec::new();
-    let mut formatted = Vec::new();
-    let mut event_for_line = Vec::new();
-    let mut first_line_for_event = Vec::new();
-    let mut ordinals: HashMap<
-        (seer::SourceId, chrono::DateTime<chrono::Utc>),
-        u64,
-    > = HashMap::new();
-    for (record, lines) in view.records() {
-        let event_idx = EventIdx(events.len());
-        first_line_for_event.push(LineIdx(formatted.len()));
-        match &record.event {
-            Ok(event) => {
-                let key = (record.source_id.clone(), event.time);
-                let ordinal = *ordinals.entry(key.clone()).or_insert(0);
-                ordinals.insert(key, ordinal + 1);
-                let position = LogStreamPosition::new(
-                    record.source_id.clone(),
-                    event.time,
-                    ordinal,
-                );
-                for line in lines {
-                    formatted.push(line.clone());
-                    event_for_line.push(event_idx);
-                }
-                events.push(Row::Event(EngineEvent {
-                    position,
-                    event: event.clone(),
-                }));
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                formatted.push(msg.clone());
-                event_for_line.push(event_idx);
-                events.push(Row::Error(msg));
-            }
-        }
-    }
-    RenderedRows {
-        events,
-        formatted,
-        event_for_line,
-        first_line_for_event,
-        parse_stats: view.parse_stats().clone(),
-    }
-}
-
 /// Placeholder rows for a Summary tab whose build hasn't run yet.
 /// Surfaced by [`Tab::new`] when constructing a Summary tab and by
 /// [`App::start_summary_build`] when an existing tab is being
 /// rebuilt.  Rendered as a single "Computing summary..." line so the
 /// pane isn't visually empty while the [`LongOp`] populates the real
 /// histogram; the progress bar lives below in the parse-stats row.
-fn summary_placeholder_rows() -> RenderedRows {
-    RenderedRows {
+fn summary_placeholder_rows() -> Materialized {
+    Materialized {
         events: Vec::new(),
         formatted: vec!["Computing summary...".to_string()],
         event_for_line: vec![EventIdx::ZERO],
@@ -1188,10 +977,10 @@ impl SummaryOp {
         self.eof
     }
 
-    /// Consumes the in-progress build and returns the histogram rows
-    /// plus a final [`ParseStats`] snapshot.  Caller installs both into
-    /// the destination tab.
-    fn finalize(self) -> (RenderedRows, ParseStats) {
+    /// Consumes the in-progress build and returns the histogram rows.
+    /// Caller installs the result into the destination tab's
+    /// [`Tab::standalone_materialized`] slot.
+    fn finalize(self) -> Materialized {
         let elapsed = self.started.elapsed();
         let summary = self.builder.finish();
         let formatted = format_summary(&summary);
@@ -1208,14 +997,13 @@ impl SummaryOp {
             walked_bytes: self.bytes_read,
             elapsed,
         };
-        let rows = RenderedRows {
+        Materialized {
             events: Vec::new(),
             formatted,
             event_for_line: Vec::new(),
             first_line_for_event: Vec::new(),
-            parse_stats: parse_stats.clone(),
-        };
-        (rows, parse_stats)
+            parse_stats,
+        }
     }
 }
 
@@ -1509,20 +1297,12 @@ struct LastSearch {
 /// with the host stream's filter, and the scroll offset within those
 /// rows.
 ///
-/// `events` is one entry per record (an event or an error); `formatted`
-/// is one entry per *display line*, where a single event with extra
-/// fields contributes its header plus one indented `key = value` line
-/// per extra.  `event_for_line` and `first_line_for_event` translate
-/// between the two indexings: the former says which record produced a
-/// given display line, the latter says where each record's first line
-/// lives.  `events[i]` is [`Row::Error`] exactly when that record came
-/// from a parse or I/O error rather than a real log record; the
-/// stringified error sits in both the [`Row::Error`] payload and in
-/// `formatted[first_line_for_event[i]]` (the latter is the cached
-/// rendering).  Keeping the parsed events around lets in-place actions
-/// (e.g. exclude mode's "filter out entries like this" or `b`'s
-/// "bookmark this entry") inspect the record under the cursor without
-/// re-parsing.
+/// Reads the flat materialization (events, formatted lines, the two
+/// line/event translation tables, parse stats) through
+/// [`Self::materialized`].  For [`TabKind::Stream`] tabs backed by a
+/// streamview, the streamview owns and maintains the cache; for
+/// summary tabs and the test-fixture path, [`Self::standalone_materialized`]
+/// carries an owned copy.
 ///
 /// The active filter is owned by the [`LogStream`] this tab is viewing
 /// (looked up in [`Session::streams`] by `stream`); two tabs that target
@@ -1536,8 +1316,7 @@ struct Tab {
     /// holds the transient render state.
     stream: LogStreamId,
     /// What this tab displays.  [`TabKind::Stream`] is the regular log
-    /// view; [`TabKind::Summary`] renders a field/time histogram (and
-    /// leaves the per-record vectors empty).
+    /// view; [`TabKind::Summary`] renders a field/time histogram.
     kind: TabKind,
     /// For [`TabKind::Stream`]: the lazy windowed source.  Slides as
     /// the user scrolls past the window's edges; survives filter
@@ -1547,21 +1326,20 @@ struct Tab {
     /// constructed via [`App::with_rows`] / [`App::with_events`] that
     /// bypass the engine.
     streamview: Option<StreamView>,
-    events: Vec<Row>,
-    formatted: Vec<String>,
-    /// `event_for_line[line] = event_idx`.  `formatted.len()` long.
-    event_for_line: Vec<EventIdx>,
-    /// `first_line_for_event[event] = line`.  `events.len()` long.
-    /// Maintained so the (event_idx → line_idx) translation is O(1) on
-    /// every selection move and bookmark navigation.
-    first_line_for_event: Vec<LineIdx>,
+    /// Owned [`Materialized`] used by tabs without a streamview:
+    /// [`TabKind::Summary`] (filled by [`SummaryOp::finalize`]) and
+    /// test fixtures.  When `streamview` is `Some`, this field is
+    /// unused — [`Self::materialized`] dispatches through to
+    /// [`StreamView::materialized`] instead.
+    standalone_materialized: Materialized,
     /// Index of the *display line* at the top of the viewport.  The
     /// viewport scrolls in line steps so users can see (and search) the
     /// extra-field rows independently from their headers.
     viewport_top: LineIdx,
     /// Active highlighted search, if any.  Match indices are line
-    /// indices into `formatted`; cleared when the rows are re-queried
-    /// (filter change), because the indices would otherwise dangle.
+    /// indices into the materialization's `formatted`; cleared when
+    /// the rows are re-queried (filter change), because the indices
+    /// would otherwise dangle.
     search: Option<TabSearch>,
     /// When `Some`, select mode is active.  The contained value carries
     /// the *event* (record) currently highlighted and the action (`x`
@@ -1571,11 +1349,6 @@ struct Tab {
     /// pin a bookmark to a position).  Cleared whenever the rows are
     /// re-queried so the index can't dangle.
     select: Option<Selection>,
-    /// Stats from the most recent parse pass that produced
-    /// `events`/`formatted` — used to render the per-tab status line.
-    /// Refreshed by [`Self::refresh`] / [`Self::rerender`] so users see
-    /// up-to-date numbers after every filter edit.
-    parse_stats: ParseStats,
 }
 
 /// What a select-mode commit will do.
@@ -1611,17 +1384,21 @@ impl Tab {
         filter: &Filter,
         opts: RenderOpts,
     ) -> Self {
-        let (streamview, rendered) = match kind {
+        let (streamview, standalone_materialized) = match kind {
             TabKind::Stream => {
-                let (view, rows) =
-                    render_rows(engine, filter, opts, INITIAL_VIEWPORT_HEIGHT);
-                (Some(view), rows)
+                let view = build_streamview(
+                    engine,
+                    filter,
+                    opts,
+                    INITIAL_VIEWPORT_HEIGHT,
+                );
+                (Some(view), Materialized::default())
             }
-            // Summary tabs defer their build to a [`LongOp`] driven
-            // by the main loop.  Construction returns the placeholder
-            // shape (empty rows, default stats); the App spins up a
-            // [`SummaryOp`] right after pushing the tab so the
-            // progress bar shows up on the next frame.
+            // Summary tabs defer their build to a [`LongOp`] driven by
+            // the main loop.  Construction installs the placeholder
+            // ("Computing summary…") into the standalone slot; the
+            // App spins up a [`SummaryOp`] right after pushing the
+            // tab so the progress bar shows up on the next frame.
             TabKind::Summary => (None, summary_placeholder_rows()),
         };
         Self {
@@ -1629,15 +1406,46 @@ impl Tab {
             stream,
             kind,
             streamview,
-            events: rendered.events,
-            formatted: rendered.formatted,
-            event_for_line: rendered.event_for_line,
-            first_line_for_event: rendered.first_line_for_event,
+            standalone_materialized,
             viewport_top: LineIdx::ZERO,
             search: None,
             select: None,
-            parse_stats: rendered.parse_stats,
         }
+    }
+
+    /// Returns the flat materialization of this tab's current content.
+    /// Dispatches through to [`StreamView::materialized`] when the tab
+    /// is backed by a streamview, or to the owned
+    /// [`Self::standalone_materialized`] otherwise (summary tabs and
+    /// test fixtures).
+    fn materialized(&self) -> &Materialized {
+        match self.streamview.as_ref() {
+            Some(view) => view.materialized(),
+            None => &self.standalone_materialized,
+        }
+    }
+
+    /// Convenience accessors for the materialization's flat vectors.
+    /// Read sites prefer these to spelling out `tab.materialized().X`
+    /// every time.
+    fn events(&self) -> &[Row] {
+        &self.materialized().events
+    }
+
+    fn formatted(&self) -> &[String] {
+        &self.materialized().formatted
+    }
+
+    fn event_for_line(&self) -> &[EventIdx] {
+        &self.materialized().event_for_line
+    }
+
+    fn first_line_for_event(&self) -> &[LineIdx] {
+        &self.materialized().first_line_for_event
+    }
+
+    fn parse_stats(&self) -> &ParseStats {
+        &self.materialized().parse_stats
     }
 
     /// Re-runs the host stream's filter against the engine and refreshes
@@ -1664,7 +1472,7 @@ impl Tab {
         opts: RenderOpts,
         anchor: Option<Cursor>,
     ) {
-        let rendered = match self.kind {
+        match self.kind {
             TabKind::Stream => {
                 let mut view = StreamView::new(filter.clone(), opts);
                 let h = INITIAL_VIEWPORT_HEIGHT;
@@ -1672,19 +1480,15 @@ impl Tab {
                     Some(cursor) => view.seek_to_cursor(engine, cursor, h),
                     None => view.ensure_window(engine, h),
                 }
-                let rows = materialize_streamview(&view);
                 self.streamview = Some(view);
-                rows
+                self.standalone_materialized = Materialized::default();
             }
             // Summary refresh installs the placeholder; the App
             // enqueues a [`LongOp`] to fill it in.
-            TabKind::Summary => summary_placeholder_rows(),
-        };
-        self.events = rendered.events;
-        self.formatted = rendered.formatted;
-        self.event_for_line = rendered.event_for_line;
-        self.first_line_for_event = rendered.first_line_for_event;
-        self.parse_stats = rendered.parse_stats;
+            TabKind::Summary => {
+                self.standalone_materialized = summary_placeholder_rows();
+            }
+        }
         // The streamview's anchor sits on whichever record we want at
         // the top of the viewport: byte 0 for a fresh tab, the
         // matching record (or its visible neighbor) when seeking to
@@ -1717,23 +1521,20 @@ impl Tab {
             return;
         }
         let anchor_event =
-            self.event_for_line.get(self.viewport_top.get()).copied();
-        let rendered = if let Some(view) = self.streamview.as_mut() {
+            self.event_for_line().get(self.viewport_top.get()).copied();
+        if let Some(view) = self.streamview.as_mut() {
             view.set_render_opts(opts);
-            materialize_streamview(view)
         } else {
-            let (view, rows) =
-                render_rows(engine, filter, opts, INITIAL_VIEWPORT_HEIGHT);
-            self.streamview = Some(view);
-            rows
-        };
-        self.events = rendered.events;
-        self.formatted = rendered.formatted;
-        self.event_for_line = rendered.event_for_line;
-        self.first_line_for_event = rendered.first_line_for_event;
-        self.parse_stats = rendered.parse_stats;
+            self.streamview = Some(build_streamview(
+                engine,
+                filter,
+                opts,
+                INITIAL_VIEWPORT_HEIGHT,
+            ));
+            self.standalone_materialized = Materialized::default();
+        }
         self.viewport_top = anchor_event
-            .and_then(|i| self.first_line_for_event.get(i.get()).copied())
+            .and_then(|i| self.first_line_for_event().get(i.get()).copied())
             .unwrap_or(LineIdx::ZERO);
         self.search = None;
     }
@@ -1746,7 +1547,7 @@ impl Tab {
         if self.streamview.is_some() {
             Vec::new()
         } else {
-            compute_matches(&self.formatted, regex)
+            compute_matches(self.formatted(), regex)
         }
     }
 
@@ -1764,12 +1565,6 @@ impl Tab {
             return;
         };
         let anchor = LineIdx(view.anchor_flat_line());
-        let rendered = materialize_streamview(view);
-        self.events = rendered.events;
-        self.formatted = rendered.formatted;
-        self.event_for_line = rendered.event_for_line;
-        self.first_line_for_event = rendered.first_line_for_event;
-        self.parse_stats = rendered.parse_stats;
         let max = self.max_top(viewport_height, viewport_width);
         self.viewport_top = anchor.min(max);
         // When the streamview's anchor sat past `max_top` (e.g. after
@@ -1793,10 +1588,10 @@ impl Tab {
     /// same line.
     fn last_line_for_event(&self, event_idx: EventIdx) -> LineIdx {
         let next_first = self
-            .first_line_for_event
+            .first_line_for_event()
             .get(event_idx.get() + 1)
             .copied()
-            .unwrap_or(LineIdx(self.formatted.len()));
+            .unwrap_or(LineIdx(self.formatted().len()));
         // `next_first` is exclusive; the last line for this event is
         // one before it.  Records always contribute at least one line
         // so the subtraction never underflows.
@@ -1818,14 +1613,14 @@ impl Tab {
     /// the result matches the original `formatted.len() -
     /// viewport_height` formula.
     fn max_top(&self, viewport_height: u16, viewport_width: u16) -> LineIdx {
-        if self.formatted.is_empty() {
+        if self.formatted().is_empty() {
             return LineIdx::ZERO;
         }
         let viewport_height = viewport_height as usize;
-        let last_idx = self.formatted.len() - 1;
+        let last_idx = self.formatted().len() - 1;
         let mut visual_used: usize = 0;
         for i in (0..=last_idx).rev() {
-            let rows = visual_rows_for(&self.formatted[i], viewport_width);
+            let rows = visual_rows_for(&self.formatted()[i], viewport_width);
             visual_used = visual_used.saturating_add(rows);
             if visual_used > viewport_height {
                 return LineIdx((i + 1).min(last_idx));
@@ -1888,16 +1683,16 @@ impl Tab {
         let Some(sel) = self.select else {
             return;
         };
-        if self.events.is_empty() {
+        if self.events().is_empty() {
             return;
         }
-        let last = self.events.len() - 1;
+        let last = self.events().len() - 1;
         let new_idx = EventIdx(
             (sel.event_idx.get() as isize + delta).clamp(0, last as isize)
                 as usize,
         );
         self.select = Some(Selection { event_idx: new_idx, ..sel });
-        let first = self.first_line_for_event[new_idx.get()];
+        let first = self.first_line_for_event()[new_idx.get()];
         let last_line = self.last_line_for_event(new_idx);
         let height = viewport_height as usize;
         if first < self.viewport_top {
@@ -1927,20 +1722,25 @@ impl Tab {
         // (only possible if `formatted` is empty, in which case events
         // is too) `event_for_line` would index out of range — check
         // length first.
-        let pivot = if self.viewport_top.get() < self.event_for_line.len() {
-            self.event_for_line[self.viewport_top.get()].get()
+        let pivot = if self.viewport_top.get() < self.event_for_line().len() {
+            self.event_for_line()[self.viewport_top.get()].get()
         } else {
-            self.events.len()
+            self.events().len()
         };
         let forward =
-            self.events.iter().enumerate().skip(pivot).find_map(|(i, e)| {
+            self.events().iter().enumerate().skip(pivot).find_map(|(i, e)| {
                 matches!(e, Row::Event(_)).then_some(EventIdx(i))
             });
-        let backward_take = pivot.saturating_add(1).min(self.events.len());
-        let backward =
-            self.events.iter().enumerate().take(backward_take).rev().find_map(
-                |(i, e)| matches!(e, Row::Event(_)).then_some(EventIdx(i)),
-            );
+        let backward_take = pivot.saturating_add(1).min(self.events().len());
+        let backward = self
+            .events()
+            .iter()
+            .enumerate()
+            .take(backward_take)
+            .rev()
+            .find_map(|(i, e)| {
+                matches!(e, Row::Event(_)).then_some(EventIdx(i))
+            });
         match prefer {
             Direction::Forward => forward.or(backward),
             Direction::Backward => backward.or(forward),
@@ -1982,25 +1782,26 @@ impl Tab {
         let Some(anchor_idx) = self.time_anchor_idx(dir) else {
             return;
         };
-        let Row::Event(anchor) = &self.events[anchor_idx.get()] else {
+        let Row::Event(anchor) = &self.events()[anchor_idx.get()] else {
             unreachable!("time_anchor_idx returns indices of real events");
         };
         let anchor_time = anchor.event.time;
         let target = anchor_time + delta;
         let max = self.max_top(viewport_height, viewport_width);
         let new_event = match dir {
-            Direction::Forward => {
-                self.events.iter().enumerate().skip(anchor_idx.get()).find_map(
-                    |(i, e)| match e {
-                        Row::Event(ee) if ee.event.time >= target => {
-                            Some(EventIdx(i))
-                        }
-                        _ => None,
-                    },
-                )
-            }
+            Direction::Forward => self
+                .events()
+                .iter()
+                .enumerate()
+                .skip(anchor_idx.get())
+                .find_map(|(i, e)| match e {
+                    Row::Event(ee) if ee.event.time >= target => {
+                        Some(EventIdx(i))
+                    }
+                    _ => None,
+                }),
             Direction::Backward => self
-                .events
+                .events()
                 .iter()
                 .enumerate()
                 .take(anchor_idx.get() + 1)
@@ -2013,7 +1814,7 @@ impl Tab {
                 }),
         };
         let new_top = match new_event {
-            Some(idx) => self.first_line_for_event[idx.get()],
+            Some(idx) => self.first_line_for_event()[idx.get()],
             None if dir == Direction::Forward => max,
             None => LineIdx::ZERO,
         };
@@ -2406,12 +2207,7 @@ impl App {
     fn start_summary_build(&mut self, tab_idx: TabIdx, filter: Filter) {
         debug_assert!(self.long_op.is_none());
         if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
-            let placeholder = summary_placeholder_rows();
-            tab.events = placeholder.events;
-            tab.formatted = placeholder.formatted;
-            tab.event_for_line = placeholder.event_for_line;
-            tab.first_line_for_event = placeholder.first_line_for_event;
-            tab.parse_stats = placeholder.parse_stats;
+            tab.standalone_materialized = summary_placeholder_rows();
             tab.viewport_top = LineIdx::ZERO;
             tab.search = None;
         }
@@ -2552,13 +2348,9 @@ impl App {
         match op {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
-                let (rendered, stats) = s.finalize();
+                let materialized = s.finalize();
                 if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
-                    tab.events = rendered.events;
-                    tab.formatted = rendered.formatted;
-                    tab.event_for_line = rendered.event_for_line;
-                    tab.first_line_for_event = rendered.first_line_for_event;
-                    tab.parse_stats = stats;
+                    tab.standalone_materialized = materialized;
                     tab.viewport_top = LineIdx::ZERO;
                 }
                 // Drain a queued Summary build so a filter change
@@ -2679,10 +2471,16 @@ impl App {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
                 if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
-                    tab.formatted = vec![
-                        "summary cancelled — rerun with `f<enter>`".to_string(),
-                    ];
-                    tab.parse_stats = ParseStats::default();
+                    tab.standalone_materialized = Materialized {
+                        events: Vec::new(),
+                        formatted: vec![
+                            "summary cancelled — rerun with `f<enter>`"
+                                .to_string(),
+                        ],
+                        event_for_line: vec![EventIdx::ZERO],
+                        first_line_for_event: vec![LineIdx::ZERO],
+                        parse_stats: ParseStats::default(),
+                    };
                 }
                 // Cancel any queued Summary builds too — the user
                 // pressed Ctrl-C to stop, not to skip ahead.
@@ -3591,7 +3389,7 @@ impl App {
     /// into).  No-op when the tab has no records.
     fn start_selection(&mut self, action: SelectionAction) {
         let tab = self.active_tab_mut();
-        if tab.events.is_empty() {
+        if tab.events().is_empty() {
             return;
         }
         // event_for_line is empty iff formatted is empty iff events is
@@ -3599,10 +3397,10 @@ impl App {
         // similarly impossible after the empty check, but be defensive
         // against a viewport_top set out of range by a future caller.
         let event_idx = tab
-            .event_for_line
+            .event_for_line()
             .get(tab.viewport_top.get())
             .copied()
-            .unwrap_or(EventIdx(tab.events.len() - 1));
+            .unwrap_or(EventIdx(tab.events().len() - 1));
         tab.select = Some(Selection { event_idx, action });
     }
 
@@ -3732,7 +3530,7 @@ impl App {
         let Some(sel) = tab.select else {
             return;
         };
-        let Some(Row::Event(ee)) = tab.events.get(sel.event_idx.get()) else {
+        let Some(Row::Event(ee)) = tab.events().get(sel.event_idx.get()) else {
             return;
         };
         match sel.action {
@@ -3869,17 +3667,19 @@ impl App {
             kind: TabKind::Stream,
             // Test fixtures bypass the engine; no streamview to feed
             // off.  `Tab::maintain_window` and the seek helpers are
-            // no-ops in this case so the materialized vecs above stay
-            // authoritative.
+            // no-ops in this case so the materialized vectors below
+            // stay authoritative.
             streamview: None,
-            events: engine_events,
-            formatted,
-            event_for_line,
-            first_line_for_event,
+            standalone_materialized: Materialized {
+                events: engine_events,
+                formatted,
+                event_for_line,
+                first_line_for_event,
+                parse_stats: ParseStats::default(),
+            },
             viewport_top: LineIdx::ZERO,
             search: None,
             select: None,
-            parse_stats: ParseStats::default(),
         });
         a.next_tab_number += 1;
         a
@@ -5083,7 +4883,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 
     let tab = app.active_tab();
-    let total = tab.formatted.len();
+    let total = tab.formatted().len();
     let top = tab.viewport_top.get();
     // Walk forward from `top`, accumulating each line's wrapped row
     // count until we've covered the content area.  The result is the
@@ -5094,7 +4894,8 @@ fn render(frame: &mut Frame, app: &mut App) {
     let mut bottom = top;
     let mut visual_used: usize = 0;
     while bottom < total && visual_used < max_visual {
-        let rows = visual_rows_for(&tab.formatted[bottom], content_area.width);
+        let rows =
+            visual_rows_for(&tab.formatted()[bottom], content_area.width);
         visual_used = visual_used.saturating_add(rows);
         bottom += 1;
     }
@@ -5123,7 +4924,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             format_long_op_progress(op, stats_area.width.into())
         }
         _ => {
-            let base = format_parse_stats(&tab.parse_stats);
+            let base = format_parse_stats(tab.parse_stats());
             if at_eof {
                 format!("{base}  ·  (at end of stream)")
             } else {
@@ -5142,7 +4943,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     // Non-raw mode keeps ratatui's word-wrap, which reads better for
     // header-and-extras layouts.
     let raw_mode = app.active_stream().show_raw;
-    let lines: Vec<Line<'_>> = tab.formatted[top..bottom]
+    let lines: Vec<Line<'_>> = tab.formatted()[top..bottom]
         .iter()
         .enumerate()
         .flat_map(|(i, s)| {
@@ -5155,7 +4956,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             // the entry you're about to act on" without fighting
             // search styling.
             let selected = selected_event.is_some_and(|target| {
-                tab.event_for_line.get(line_index).copied() == Some(target)
+                tab.event_for_line().get(line_index).copied() == Some(target)
             });
             let selected_style = Style::default()
                 .bg(Color::DarkGray)
@@ -5209,7 +5010,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             let footer = if let Some(notice) = app.notice.as_deref() {
                 notice.to_string()
             } else if let Some(sel) = tab.select {
-                let entry_total = tab.events.len();
+                let entry_total = tab.events().len();
                 match sel.action {
                     SelectionAction::Exclude | SelectionAction::Include => {
                         let verb = match sel.action {
@@ -5832,7 +5633,7 @@ mod tests {
         engine.add_file_source(&path).unwrap();
         let mut a = App::new(engine);
         a.viewport_height = 10;
-        let initial_len = a.active_tab().formatted.len();
+        let initial_len = a.active_tab().formatted().len();
         // Page down a generous number of times — each press advances by
         // viewport_height (10) lines, so 50 presses target line 500,
         // well past the bug's clamp point.
@@ -6284,7 +6085,7 @@ mod tests {
         let mut a = App::new(engine);
         a.viewport_height = 2;
         a.active_tab_mut().viewport_top = LineIdx(3);
-        assert_eq!(a.active_tab().formatted.len(), 6);
+        assert_eq!(a.active_tab().formatted().len(), 6);
 
         a.handle_key(key(KeyCode::Char('f')));
         type_into(a.dialog.as_mut().unwrap(), "level>=warn");
@@ -6292,7 +6093,7 @@ mod tests {
         a.drain_long_op();
 
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_tab().formatted.len(), 1);
+        assert_eq!(a.active_tab().formatted().len(), 1);
         assert_eq!(a.active_tab().viewport_top, 0);
     }
 
@@ -6634,7 +6435,7 @@ mod tests {
         // The active stream's first formatted line is the raw JSON
         // for the single event.  Compute the expected chunks and
         // confirm each appears in the dump.
-        let raw = a.active_tab().formatted[0].clone();
+        let raw = a.active_tab().formatted()[0].clone();
         assert!(
             raw.starts_with('{') && raw.contains(r#""msg":"first message""#),
             "raw line should be JSON: {raw}",
@@ -7017,7 +6818,7 @@ mod tests {
         }
         a.drain_long_op();
         // After the op, the only matching record is visible.
-        let formatted = &a.active_tab().formatted;
+        let formatted = a.active_tab().formatted();
         assert!(
             formatted.iter().any(|l| l.contains("payload-m25")),
             "expected 'payload-m25' in viewport, got {formatted:?}",
@@ -7297,7 +7098,7 @@ mod tests {
         // no sources, so the re-queried rows are now empty), but the
         // search clears either way.  To realistically test
         // re-derivation, we sneak the rows back in directly.
-        a.active_tab_mut().formatted = (0..10)
+        a.active_tab_mut().standalone_materialized.formatted = (0..10)
             .map(|i| {
                 if i % 2 == 0 {
                     format!("alpha row {i}")
@@ -7778,7 +7579,7 @@ mod tests {
         let mut a = App::with_rows(vec!["row".to_string()]);
         // Force a ParseStats with deterministic values rather than
         // relying on whatever the test fixture produced.
-        a.active_tab_mut().parse_stats = ParseStats {
+        a.active_tab_mut().standalone_materialized.parse_stats = ParseStats {
             records: 42,
             bytes: ByteLen::from(4096),
             walked_bytes: ByteLen::from(4096),
@@ -7884,13 +7685,13 @@ mod tests {
         // Before draining: placeholder lives in the tab, long op is
         // active, progress is reported on the active tab's stats row.
         assert_eq!(
-            a.active_tab().formatted,
-            vec!["Computing summary...".to_string()],
+            a.active_tab().formatted(),
+            &["Computing summary...".to_string()],
         );
         assert!(a.long_op.is_some());
         a.drain_long_op();
         assert!(a.long_op.is_none());
-        let lines = &a.active_tab().formatted;
+        let lines = a.active_tab().formatted();
         assert!(
             lines.iter().any(|l| l.starts_with("Summary: 3 events")),
             "got:\n{}",
@@ -7907,7 +7708,7 @@ mod tests {
         a.cancel_long_op();
         assert!(a.long_op.is_none());
         assert!(a.pending_summary_builds.is_empty());
-        let lines = &a.active_tab().formatted;
+        let lines = a.active_tab().formatted();
         assert!(
             lines.iter().any(|l| l.contains("cancelled")),
             "expected cancel notice, got: {lines:?}"
@@ -7977,12 +7778,12 @@ mod tests {
         assert!(a.long_op.is_none());
         // Viewport should sit on the matching record.
         let top = a.active_tab().viewport_top.get();
-        let line = &a.active_tab().formatted[top];
+        let line = &a.active_tab().formatted()[top];
         assert!(
             line.contains("match-here"),
             "expected viewport on the match; got line {line:?} \
              (top={top}, formatted.len()={})",
-            a.active_tab().formatted.len(),
+            a.active_tab().formatted().len(),
         );
     }
 
@@ -7999,7 +7800,7 @@ mod tests {
         assert!(a.bookmarks_active());
         // Make the active *regular* tab's stats distinctive — they
         // should not appear when the bookmarks pane is showing.
-        a.tabs[0].parse_stats = ParseStats {
+        a.tabs[0].standalone_materialized.parse_stats = ParseStats {
             records: 9999,
             bytes: ByteLen::from(1024 * 1024),
             walked_bytes: ByteLen::from(1024 * 1024),
@@ -8518,7 +8319,7 @@ mod tests {
         // record, so its rendered line is at index 0 of the
         // materialized view.
         assert_eq!(a.active_tab().viewport_top, 0);
-        let line0 = &a.active_tab().formatted[0];
+        let line0 = &a.active_tab().formatted()[0];
         assert!(line0.contains("third"), "first formatted line was {line0:?}");
         // No filter mismatch, so no notice.
         assert!(a.notice.is_none());
@@ -8530,8 +8331,8 @@ mod tests {
     /// at the top after a filter change.
     fn viewport_top_msg(a: &App) -> Option<String> {
         let tab = a.active_tab();
-        let event_idx = *tab.event_for_line.get(tab.viewport_top.get())?;
-        match tab.events.get(event_idx.get())? {
+        let event_idx = *tab.event_for_line().get(tab.viewport_top.get())?;
+        match tab.events().get(event_idx.get())? {
             Row::Event(ee) => Some(ee.event.msg.clone()),
             Row::Error(_) => None,
         }
@@ -8602,7 +8403,7 @@ mod tests {
         let filter: Filter = "msg!=fourth msg!=fifth".parse().unwrap();
         a.apply_filter(filter);
         a.drain_long_op();
-        let formatted = &a.active_tab().formatted;
+        let formatted = a.active_tab().formatted();
         assert!(
             formatted.iter().any(|l| l.contains("third")),
             "expected fallback to land 'third' in the viewport, \
@@ -8761,19 +8562,32 @@ mod tests {
         ]);
         let tab = a.active_tab();
         // 3 events, but 6 display lines: 2 + 1 + 3.
-        assert_eq!(tab.events.len(), 3);
-        assert_eq!(tab.formatted.len(), 6);
-        assert_eq!(tab.first_line_for_event, vec![0, 2, 3]);
-        assert_eq!(tab.event_for_line, vec![0, 0, 1, 2, 2, 2]);
+        assert_eq!(tab.events().len(), 3);
+        assert_eq!(tab.formatted().len(), 6);
+        assert_eq!(
+            tab.first_line_for_event(),
+            &[LineIdx(0), LineIdx(2), LineIdx(3)],
+        );
+        assert_eq!(
+            tab.event_for_line(),
+            &[
+                EventIdx(0),
+                EventIdx(0),
+                EventIdx(1),
+                EventIdx(2),
+                EventIdx(2),
+                EventIdx(2),
+            ],
+        );
         // Spot-check the indented-extras layout.  msg sits at the end
         // of the header line, so the assertion latches onto its
         // trailing word.
-        assert!(tab.formatted[0].ends_with(" starting"));
-        assert_eq!(tab.formatted[1], r#"    build = "0.1.0""#);
-        assert!(tab.formatted[2].ends_with(" tick"));
-        assert!(tab.formatted[3].ends_with(" loaded"));
-        assert_eq!(tab.formatted[4], "    ms = 12");
-        assert_eq!(tab.formatted[5], "    zones = 4");
+        assert!(tab.formatted()[0].ends_with(" starting"));
+        assert_eq!(tab.formatted()[1], r#"    build = "0.1.0""#);
+        assert!(tab.formatted()[2].ends_with(" tick"));
+        assert!(tab.formatted()[3].ends_with(" loaded"));
+        assert_eq!(tab.formatted()[4], "    ms = 12");
+        assert_eq!(tab.formatted()[5], "    zones = 4");
     }
 
     #[test]
@@ -8894,10 +8708,10 @@ mod tests {
         engine.add_file_source(&path).unwrap();
         let a = App::new(engine);
         let tab = a.active_tab();
-        assert_eq!(tab.events.len(), 2);
-        assert_eq!(tab.formatted.len(), 2, "extras should be hidden");
-        assert!(tab.formatted[0].ends_with(" first"));
-        assert!(tab.formatted[1].ends_with(" second"));
+        assert_eq!(tab.events().len(), 2);
+        assert_eq!(tab.formatted().len(), 2, "extras should be hidden");
+        assert!(tab.formatted()[0].ends_with(" first"));
+        assert!(tab.formatted()[1].ends_with(" second"));
         assert!(!a.active_stream().show_extras);
     }
 
@@ -8911,15 +8725,15 @@ mod tests {
         // it off, then back on, asserting the line count tracks the
         // setting and that `F` is the user-visible binding.
         assert!(a.active_stream().show_extras);
-        assert_eq!(a.active_tab().formatted.len(), 3);
+        assert_eq!(a.active_tab().formatted().len(), 3);
         a.handle_key(shift('F'));
         assert!(!a.active_stream().show_extras);
-        assert_eq!(a.active_tab().formatted.len(), 2);
+        assert_eq!(a.active_tab().formatted().len(), 2);
         // Bare `F` (some terminals don't set the SHIFT modifier) toggles
         // back on.
         a.handle_key(key(KeyCode::Char('F')));
         assert!(a.active_stream().show_extras);
-        assert_eq!(a.active_tab().formatted.len(), 3);
+        assert_eq!(a.active_tab().formatted().len(), 3);
     }
 
     #[test]
@@ -8939,7 +8753,7 @@ mod tests {
         // Without extras: lines = [first, second, third].  The same
         // record's first line is now index 1.
         assert_eq!(a.active_tab().viewport_top, 1);
-        assert_eq!(a.active_tab().formatted.len(), 3);
+        assert_eq!(a.active_tab().formatted().len(), 3);
         a.handle_key(shift('F')); // show again
         // First line for record 1 is still index 1 (event 0 is single
         // line).  Anchor preserved across the second toggle too.
@@ -8959,25 +8773,25 @@ mod tests {
         // multi_line_app enabled extras; the default (raw off) renders
         // a header followed by one extras row.
         assert!(!a.active_stream().show_raw);
-        assert_eq!(a.active_tab().formatted.len(), 2);
-        assert!(a.active_tab().formatted[0].contains("INFO"));
+        assert_eq!(a.active_tab().formatted().len(), 2);
+        assert!(a.active_tab().formatted()[0].contains("INFO"));
 
         a.handle_key(shift('R'));
         assert!(a.active_stream().show_raw);
         // Raw mode is one line per record regardless of extras.
-        assert_eq!(a.active_tab().formatted.len(), 1);
+        assert_eq!(a.active_tab().formatted().len(), 1);
         assert!(
-            a.active_tab().formatted[0].starts_with('{')
-                && a.active_tab().formatted[0].contains(r#""msg":"first""#),
+            a.active_tab().formatted()[0].starts_with('{')
+                && a.active_tab().formatted()[0].contains(r#""msg":"first""#),
             "raw row should be the source JSON: {:?}",
-            a.active_tab().formatted[0],
+            a.active_tab().formatted()[0],
         );
 
         // Bare `R` (terminals without the SHIFT modifier) flips back.
         a.handle_key(key(KeyCode::Char('R')));
         assert!(!a.active_stream().show_raw);
-        assert_eq!(a.active_tab().formatted.len(), 2);
-        assert!(a.active_tab().formatted[0].contains("INFO"));
+        assert_eq!(a.active_tab().formatted().len(), 2);
+        assert!(a.active_tab().formatted()[0].contains("INFO"));
     }
 
     // ---------- show_date toggle (D) ----------
@@ -8989,7 +8803,7 @@ mod tests {
         // opts out (`D`) when they're zoomed in on a tight window.
         let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
         assert!(a.active_stream().show_date);
-        let row = &a.active_tab().formatted[0];
+        let row = &a.active_tab().formatted()[0];
         // Timestamp prefix carries the date and ends in millisecond
         // precision with a `Z` suffix.
         assert!(
@@ -9002,12 +8816,12 @@ mod tests {
     fn shift_d_toggles_show_date_and_repaints() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
         assert!(a.active_stream().show_date);
-        let dated = a.active_tab().formatted[0].clone();
+        let dated = a.active_tab().formatted()[0].clone();
         assert!(dated.starts_with("1970-01-01T00:00:10.000Z "));
 
         a.handle_key(shift('D'));
         assert!(!a.active_stream().show_date);
-        let undated = a.active_tab().formatted[0].clone();
+        let undated = a.active_tab().formatted()[0].clone();
         assert!(
             undated.starts_with("00:00:10.000Z "),
             "expected time-only header, got {undated:?}",
@@ -9016,7 +8830,7 @@ mod tests {
         // Bare `D` (some terminals don't set SHIFT) toggles back on.
         a.handle_key(key(KeyCode::Char('D')));
         assert!(a.active_stream().show_date);
-        assert!(a.active_tab().formatted[0].starts_with("1970-01-01T"));
+        assert!(a.active_tab().formatted()[0].starts_with("1970-01-01T"));
     }
 
     #[test]
@@ -9034,10 +8848,10 @@ mod tests {
         // that way `viewport_top` indexes records 1:1.
         a.handle_key(shift('F'));
         a.active_tab_mut().viewport_top = LineIdx(1);
-        let lines_before = a.active_tab().formatted.len();
+        let lines_before = a.active_tab().formatted().len();
         a.handle_key(shift('D'));
         assert_eq!(a.active_tab().viewport_top, 1);
-        assert_eq!(a.active_tab().formatted.len(), lines_before);
+        assert_eq!(a.active_tab().formatted().len(), lines_before);
     }
 
     #[test]
@@ -9201,7 +9015,7 @@ mod tests {
             "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
             &[(10, "first")],
         );
-        let short_line = a.active_tab().formatted[0].clone();
+        let short_line = a.active_tab().formatted()[0].clone();
         assert!(
             short_line.contains(" oxz_nexus_c53300fc Nexus "),
             "expected short hostname (and no pid by default), got \
@@ -9212,7 +9026,7 @@ mod tests {
         focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
-        let full_line = a.active_tab().formatted[0].clone();
+        let full_line = a.active_tab().formatted()[0].clone();
         assert!(
             full_line.contains(
                 " oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test \
@@ -9322,9 +9136,9 @@ mod tests {
         // Inherited filter should leave only the one matching event;
         // the summary's first line records the count.
         assert!(
-            a.active_tab().formatted[0].starts_with("Summary: 1 event"),
+            a.active_tab().formatted()[0].starts_with("Summary: 1 event"),
             "summary should reflect inherited filter; got {:?}",
-            a.active_tab().formatted.first(),
+            a.active_tab().formatted().first(),
         );
         // And the underlying stream's filter is the same the user had.
         let stream_id = a.active_tab().stream;
@@ -9366,7 +9180,7 @@ mod tests {
         a.drain_long_op();
         assert!(a.dialog.is_none());
         assert_eq!(a.active_tab().kind, TabKind::Summary);
-        let lines = &a.active_tab().formatted;
+        let lines = a.active_tab().formatted();
         assert!(lines.iter().any(|l| l.starts_with("Summary: 3 events")));
         assert!(lines.iter().any(|l| l.starts_with("== name")));
         assert!(lines.iter().any(|l| l.starts_with("== msg")));
@@ -9390,7 +9204,7 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         a.drain_long_op();
         assert!(a.dialog.is_none());
-        let lines = &a.active_tab().formatted;
+        let lines = a.active_tab().formatted();
         assert!(
             lines.iter().any(|l| l.starts_with("Summary: 1 event")),
             "expected one-event summary, got:\n{}",
