@@ -8269,6 +8269,69 @@ mod tests {
     }
 
     #[test]
+    fn user_status_byte_offset_survives_k_at_top_of_filtered_stream() {
+        // Pins a second-order bug surfaced after the multi-source
+        // fix: after applying a filter that excludes a whole source,
+        // pressing `k` at the top of the stream (a no-op
+        // navigation-wise) used to reset the user-status byte offset
+        // back to 0 — the backward extend's stepper walked the
+        // excluded source down to 0 and the streamview blindly
+        // overwrote `front_cursor` with the now-zero stepper cursor.
+        use camino_tempfile::tempdir;
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let paths: Vec<_> = (0..3)
+            .map(|i| dir.path().join(format!("sled-{i:02}.log")))
+            .collect();
+        for (i, path) in paths.iter().enumerate() {
+            let mut file = std::fs::File::create(path).unwrap();
+            for j in 0..50 {
+                let secs = (i as i64) * 1000 + j as i64;
+                writeln!(
+                    file,
+                    r#"{{"hostname":"oxz-sled-{i:02}.oxide.test","level":30,"msg":"entry","name":"SledAgent","pid":1234,"time":"2024-03-09T16:{:02}:{:02}+00:00","v":0,"j":{j}}}"#,
+                    secs / 60,
+                    secs % 60,
+                )
+                .unwrap();
+            }
+        }
+        let mut engine = Engine::new();
+        for path in &paths {
+            engine.add_file_source(path).unwrap();
+        }
+        let mut a = App::new(engine);
+        a.viewport_height = 5;
+
+        let filter: Filter =
+            "hostname!=oxz-sled-00.oxide.test".parse().unwrap();
+        a.apply_filter(filter);
+        a.drain_long_op();
+
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let before = buffer_text(terminal.backend().buffer());
+        assert!(
+            !before.contains("from byte offset 0 B of"),
+            "post-filter offset should be non-zero, dump:\n{before}",
+        );
+
+        // `k` at the top: viewport doesn't actually scroll (no records
+        // earlier than records[0] exist under the filter), so the
+        // user status should be unchanged.
+        a.handle_key(key(KeyCode::Char('k')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let after = buffer_text(terminal.backend().buffer());
+        assert!(
+            !after.contains("from byte offset 0 B of"),
+            "k at top should not have reset the byte offset to 0, \
+             before:\n{before}\nafter:\n{after}",
+        );
+    }
+
+    #[test]
     fn user_status_for_synthetic_fixture_omits_byte_half() {
         // Tabs without a streamview (synthetic test fixtures and
         // pre-build Summary tabs) carry no byte-offset signal, so the

@@ -1218,7 +1218,16 @@ impl StreamView {
                 }
             }
         }
-        self.front_cursor = stepper.cursor();
+        // Only advance `front_cursor` when we actually prepended
+        // records.  A no-fetch backward step (the user pressed `k` at
+        // the top of the stream) would otherwise overwrite the
+        // carefully-anchored value our forward pass installed —
+        // backward fills on filter-excluded sources walk down to 0
+        // and reset their position, which would zero out the user-
+        // status byte offset for no real navigation.
+        if fetched > 0 {
+            self.front_cursor = stepper.cursor();
+        }
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.records += fetched as u64;
         self.parse_stats.elapsed += started.elapsed();
@@ -1261,7 +1270,11 @@ impl StreamView {
                 }
             }
         }
-        self.front_cursor = stepper.cursor();
+        // See `extend_backward_small_batch` for why we don't update
+        // `front_cursor` on a zero-fetch step.
+        if fetched > 0 {
+            self.front_cursor = stepper.cursor();
+        }
         self.parse_stats.records += fetched as u64;
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.elapsed += started.elapsed();
