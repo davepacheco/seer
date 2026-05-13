@@ -2919,59 +2919,14 @@ impl App {
         }
     }
 
-    /// Returns the active stream's [`RenderOpts`] snapshot.  Convenience
-    /// for the field-display dialog, which pre-fills with the current
-    /// settings so the user can edit relative to what's on screen.
-    fn active_render_opts(&self) -> RenderOpts {
+    /// Returns the [`LogStream`] backing the active tab.  All read-only
+    /// access to the active stream's filter or render fields goes
+    /// through here, so the single `.expect("stream exists")` lives in
+    /// one place; the invariant is that every tab's `stream` id is
+    /// owned by `session.streams`.
+    fn active_stream(&self) -> &LogStream {
         let stream_id = self.tabs[self.active].stream;
-        self.session
-            .streams
-            .get(&stream_id)
-            .expect("stream exists")
-            .render_opts()
-    }
-
-    /// Returns the active stream's filter.  Convenience for the few
-    /// places that need to display or clone it (footer, dialog
-    /// pre-fill, Ctrl-T new-tab).
-    fn active_filter(&self) -> &Filter {
-        let stream_id = self.tabs[self.active].stream;
-        &self.session.streams.get(&stream_id).expect("stream exists").filter
-    }
-
-    /// Returns whether the active stream is currently rendering
-    /// structured-field extras.  Used by the footer to show the F-key
-    /// state.
-    fn active_show_extras(&self) -> bool {
-        let stream_id = self.tabs[self.active].stream;
-        self.session.streams.get(&stream_id).expect("stream exists").show_extras
-    }
-
-    /// Returns whether the active stream is currently rendering the
-    /// `YYYY-MM-DD` prefix on timestamps.  Used by the footer to show
-    /// the D-key state.
-    fn active_show_date(&self) -> bool {
-        let stream_id = self.tabs[self.active].stream;
-        self.session.streams.get(&stream_id).expect("stream exists").show_date
-    }
-
-    /// Returns whether the active stream is currently rendering its
-    /// records as raw bytes.  Used by the footer to show the R-key
-    /// state.
-    fn active_show_raw(&self) -> bool {
-        let stream_id = self.tabs[self.active].stream;
-        self.session.streams.get(&stream_id).expect("stream exists").show_raw
-    }
-
-    /// Returns the active stream's hostname-rendering mode.  Used by
-    /// the footer to show the H-key state.
-    fn active_hostname_display(&self) -> HostnameDisplay {
-        let stream_id = self.tabs[self.active].stream;
-        self.session
-            .streams
-            .get(&stream_id)
-            .expect("stream exists")
-            .hostname_display
+        self.session.streams.get(&stream_id).expect("stream exists")
     }
 
     fn rename_active_tab(&mut self, name: String) {
@@ -3593,7 +3548,7 @@ impl App {
                     value: ee.event.msg.clone(),
                     negated,
                 };
-                let mut new_filter = self.active_filter().clone();
+                let mut new_filter = self.active_stream().filter.clone();
                 new_filter.add_predicate(new_pred);
                 // apply_filter clears search and select; the viewport
                 // slides to the nearest visible record under the new
@@ -3886,7 +3841,8 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog = Some(Dialog::filter(self.active_filter()));
+                self.dialog =
+                    Some(Dialog::filter(&self.active_stream().filter));
             }
             // `F`: toggle whether the active stream's structured-field
             // extras render below the bunyan header.  Some terminals
@@ -3926,8 +3882,9 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog =
-                    Some(Dialog::display_fields(self.active_render_opts()));
+                self.dialog = Some(Dialog::display_fields(
+                    self.active_stream().render_opts(),
+                ));
             }
             // `x`: enter select mode for *exclusion*; `X`: same mode
             // but for *inclusion*; `b`: same mode but for bookmarking
@@ -4009,9 +3966,10 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
-                let cloned = self.active_filter().clone();
+                let cloned = self.active_stream().filter.clone();
                 self.push_tab(TabKind::Stream, cloned);
-                self.dialog = Some(Dialog::filter(self.active_filter()));
+                self.dialog =
+                    Some(Dialog::filter(&self.active_stream().filter));
             }
             // `S`: open a Summary tab over the same filter the user
             // is already viewing.  Unlike Ctrl-T this does NOT drop
@@ -4024,7 +3982,7 @@ impl App {
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                let cloned = self.active_filter().clone();
+                let cloned = self.active_stream().filter.clone();
                 self.push_tab(TabKind::Summary, cloned);
             }
             // Tab cycles forward; Shift-Tab cycles back.  Some
@@ -4974,7 +4932,7 @@ fn render(frame: &mut Frame, app: &mut App) {
     // newline-replaces-space behavior would lose that property.
     // Non-raw mode keeps ratatui's word-wrap, which reads better for
     // header-and-extras layouts.
-    let raw_mode = app.active_show_raw();
+    let raw_mode = app.active_stream().show_raw;
     let lines: Vec<Line<'_>> = tab.formatted[top..bottom]
         .iter()
         .enumerate()
@@ -5090,10 +5048,12 @@ fn render(frame: &mut Frame, app: &mut App) {
                      R raw={} · h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · 0/0",
-                    if app.active_show_extras() { "on" } else { "off" },
-                    if app.active_show_date() { "on" } else { "off" },
-                    if app.active_show_raw() { "on" } else { "off" },
-                    hostname_display_label(app.active_hostname_display()),
+                    if app.active_stream().show_extras { "on" } else { "off" },
+                    if app.active_stream().show_date { "on" } else { "off" },
+                    if app.active_stream().show_raw { "on" } else { "off" },
+                    hostname_display_label(
+                        app.active_stream().hostname_display
+                    ),
                     app.current_step_label(),
                 )
             } else {
@@ -5102,10 +5062,12 @@ fn render(frame: &mut Frame, app: &mut App) {
                      R raw={} · h host={} · / search · </> step={} · \
                      x/X exclude/include · b bookmark · ^T new · \
                      S summary · ^W close · r rename · {}-{} of {}",
-                    if app.active_show_extras() { "on" } else { "off" },
-                    if app.active_show_date() { "on" } else { "off" },
-                    if app.active_show_raw() { "on" } else { "off" },
-                    hostname_display_label(app.active_hostname_display()),
+                    if app.active_stream().show_extras { "on" } else { "off" },
+                    if app.active_stream().show_date { "on" } else { "off" },
+                    if app.active_stream().show_raw { "on" } else { "off" },
+                    hostname_display_label(
+                        app.active_stream().hostname_display
+                    ),
                     app.current_step_label(),
                     top + 1,
                     bottom,
@@ -6068,18 +6030,18 @@ mod tests {
         type_into(a.dialog.as_mut().unwrap(), "level>=warn");
         a.handle_key(key(KeyCode::Enter));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_filter().to_string(), "level>=warn");
+        assert_eq!(&a.active_stream().filter.to_string(), "level>=warn");
     }
 
     #[test]
     fn dialog_escape_discards_changes() {
         let mut a = app(10, 5);
-        let original_filter = a.active_filter().to_string();
+        let original_filter = &a.active_stream().filter.to_string();
         a.handle_key(key(KeyCode::Char('f')));
         type_into(a.dialog.as_mut().unwrap(), "name=Nexus");
         a.handle_key(key(KeyCode::Esc));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_filter().to_string(), original_filter);
+        assert_eq!(&a.active_stream().filter.to_string(), original_filter);
     }
 
     #[test]
@@ -6252,7 +6214,7 @@ mod tests {
         a.handle_key(ctrl('t'));
         assert_eq!(a.tabs.len(), 2);
         assert_eq!(a.active, 1);
-        assert_eq!(a.active_filter().to_string(), "level>=warn");
+        assert_eq!(&a.active_stream().filter.to_string(), "level>=warn");
         // Filter dialog is open with the cloned filter prefilled.
         let d = a.dialog.as_ref().expect("dialog should be open");
         assert!(matches!(d, Dialog::Filter { .. }));
@@ -6282,7 +6244,7 @@ mod tests {
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.tabs.len(), 2);
         assert_eq!(a.active, 1);
-        assert_eq!(a.active_filter().to_string(), "level>=warn");
+        assert_eq!(&a.active_stream().filter.to_string(), "level>=warn");
     }
 
     #[test]
@@ -6336,7 +6298,7 @@ mod tests {
         assert_eq!(a.active, 0);
         // It's a new tab — different name (next number).
         assert_ne!(a.active_tab().name, original_name);
-        assert!(a.active_filter().predicates().is_empty());
+        assert!(&a.active_stream().filter.predicates().is_empty());
     }
 
     #[test]
@@ -7396,12 +7358,12 @@ mod tests {
     #[test]
     fn select_esc_cancels_without_changing_filter() {
         let mut a = select_app(5, 5);
-        let before = a.active_filter().to_string();
+        let before = &a.active_stream().filter.to_string();
         a.handle_key(key(KeyCode::Char('x')));
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Esc));
         assert_eq!(a.active_tab().select, None);
-        assert_eq!(a.active_filter().to_string(), before);
+        assert_eq!(&a.active_stream().filter.to_string(), before);
     }
 
     #[test]
@@ -7415,7 +7377,7 @@ mod tests {
         assert_eq!(a.active_tab().select, None);
         // The new predicate displays as `msg!="msg 2"` (quoted because
         // it contains whitespace).
-        let displayed = a.active_filter().to_string();
+        let displayed = &a.active_stream().filter.to_string();
         assert!(
             displayed.contains("msg!=") && displayed.contains("msg 2"),
             "expected exclusion predicate in {displayed:?}",
@@ -7431,7 +7393,7 @@ mod tests {
         // Selection is at row 2 → "msg 2".
         a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.active_tab().select, None);
-        let displayed = a.active_filter().to_string();
+        let displayed = &a.active_stream().filter.to_string();
         assert!(
             displayed.contains("msg=") && displayed.contains("msg 2"),
             "expected inclusion predicate in {displayed:?}",
@@ -7456,10 +7418,10 @@ mod tests {
         a.viewport_height = 5;
         a.handle_key(key(KeyCode::Char('x')));
         a.handle_key(key(KeyCode::Char('j'))); // selection -> row 1 (error)
-        let before = a.active_filter().to_string();
+        let before = &a.active_stream().filter.to_string();
         a.handle_key(key(KeyCode::Enter));
         assert_eq!(a.active_tab().select, Some(excl_sel(1)));
-        assert_eq!(a.active_filter().to_string(), before);
+        assert_eq!(&a.active_stream().filter.to_string(), before);
     }
 
     #[test]
@@ -8711,7 +8673,7 @@ mod tests {
         assert_eq!(tab.formatted.len(), 2, "extras should be hidden");
         assert!(tab.formatted[0].ends_with(" first"));
         assert!(tab.formatted[1].ends_with(" second"));
-        assert!(!a.active_show_extras());
+        assert!(!a.active_stream().show_extras);
     }
 
     #[test]
@@ -8723,15 +8685,15 @@ mod tests {
         // multi_line_app already enabled extras for its own tests; flip
         // it off, then back on, asserting the line count tracks the
         // setting and that `F` is the user-visible binding.
-        assert!(a.active_show_extras());
+        assert!(a.active_stream().show_extras);
         assert_eq!(a.active_tab().formatted.len(), 3);
         a.handle_key(shift('F'));
-        assert!(!a.active_show_extras());
+        assert!(!a.active_stream().show_extras);
         assert_eq!(a.active_tab().formatted.len(), 2);
         // Bare `F` (some terminals don't set the SHIFT modifier) toggles
         // back on.
         a.handle_key(key(KeyCode::Char('F')));
-        assert!(a.active_show_extras());
+        assert!(a.active_stream().show_extras);
         assert_eq!(a.active_tab().formatted.len(), 3);
     }
 
@@ -8768,7 +8730,7 @@ mod tests {
         // multi_line_app starts with extras enabled; flip off so we
         // exercise a non-default value through the round-trip.
         a.handle_key(shift('F'));
-        assert!(!a.active_show_extras());
+        assert!(!a.active_stream().show_extras);
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream_id = a.tabs[a.active].stream;
@@ -8788,12 +8750,12 @@ mod tests {
             multi_line_app(&[(10, "first", &[("build", r#""0.1.0""#)])]);
         // multi_line_app enabled extras; the default (raw off) renders
         // a header followed by one extras row.
-        assert!(!a.active_show_raw());
+        assert!(!a.active_stream().show_raw);
         assert_eq!(a.active_tab().formatted.len(), 2);
         assert!(a.active_tab().formatted[0].contains("INFO"));
 
         a.handle_key(shift('R'));
-        assert!(a.active_show_raw());
+        assert!(a.active_stream().show_raw);
         // Raw mode is one line per record regardless of extras.
         assert_eq!(a.active_tab().formatted.len(), 1);
         assert!(
@@ -8805,7 +8767,7 @@ mod tests {
 
         // Bare `R` (terminals without the SHIFT modifier) flips back.
         a.handle_key(key(KeyCode::Char('R')));
-        assert!(!a.active_show_raw());
+        assert!(!a.active_stream().show_raw);
         assert_eq!(a.active_tab().formatted.len(), 2);
         assert!(a.active_tab().formatted[0].contains("INFO"));
     }
@@ -8816,7 +8778,7 @@ mod tests {
         // the user doesn't have to flip R again every session.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(shift('R'));
-        assert!(a.active_show_raw());
+        assert!(a.active_stream().show_raw);
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream_id = a.tabs[a.active].stream;
@@ -8832,7 +8794,7 @@ mod tests {
         // most triage starts with "what day was this?" and the user
         // opts out (`D`) when they're zoomed in on a tight window.
         let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert!(a.active_show_date());
+        assert!(a.active_stream().show_date);
         let row = &a.active_tab().formatted[0];
         // Timestamp prefix carries the date and ends in millisecond
         // precision with a `Z` suffix.
@@ -8845,12 +8807,12 @@ mod tests {
     #[test]
     fn shift_d_toggles_show_date_and_repaints() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert!(a.active_show_date());
+        assert!(a.active_stream().show_date);
         let dated = a.active_tab().formatted[0].clone();
         assert!(dated.starts_with("1970-01-01T00:00:10.000Z "));
 
         a.handle_key(shift('D'));
-        assert!(!a.active_show_date());
+        assert!(!a.active_stream().show_date);
         let undated = a.active_tab().formatted[0].clone();
         assert!(
             undated.starts_with("00:00:10.000Z "),
@@ -8859,7 +8821,7 @@ mod tests {
 
         // Bare `D` (some terminals don't set SHIFT) toggles back on.
         a.handle_key(key(KeyCode::Char('D')));
-        assert!(a.active_show_date());
+        assert!(a.active_stream().show_date);
         assert!(a.active_tab().formatted[0].starts_with("1970-01-01T"));
     }
 
@@ -8890,9 +8852,9 @@ mod tests {
         // for the same reason `F` does: the preference outlives one
         // session.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert!(a.active_show_date());
+        assert!(a.active_stream().show_date);
         a.handle_key(shift('D'));
-        assert!(!a.active_show_date());
+        assert!(!a.active_stream().show_date);
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream_id = a.tabs[a.active].stream;
@@ -8936,7 +8898,7 @@ mod tests {
     #[test]
     fn streams_default_to_short_hostname() {
         let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Short);
     }
 
     #[test]
@@ -8946,7 +8908,7 @@ mod tests {
         match &a.dialog {
             Some(Dialog::DisplayFields { draft, cursor }) => {
                 assert_eq!(*cursor, 0);
-                assert_eq!(*draft, a.active_render_opts());
+                assert_eq!(*draft, a.active_stream().render_opts());
             }
             _ => panic!("expected DisplayFields dialog"),
         }
@@ -9022,34 +8984,34 @@ mod tests {
             _ => panic!("dialog closed unexpectedly"),
         }
         // Active stream still on Short — draft hasn't been applied.
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Short);
         a.handle_key(key(KeyCode::Enter));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
+        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Full);
     }
 
     #[test]
     fn display_fields_dialog_space_toggles_pid_checkbox() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        let before = a.active_render_opts();
+        let before = a.active_stream().render_opts();
         assert!(!before.show_pid, "default is pid hidden");
         a.handle_key(key(KeyCode::Char('h')));
         focus_display_field(&mut a, DisplayFieldItem::Pid);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
-        assert!(a.active_render_opts().show_pid);
+        assert!(a.active_stream().render_opts().show_pid);
     }
 
     #[test]
     fn display_fields_dialog_esc_discards_draft() {
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        let before = a.active_render_opts();
+        let before = a.active_stream().render_opts();
         a.handle_key(key(KeyCode::Char('h')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameNone);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Esc));
         assert!(a.dialog.is_none());
-        assert_eq!(a.active_render_opts(), before);
+        assert_eq!(a.active_stream().render_opts(), before);
     }
 
     #[test]
@@ -9087,12 +9049,12 @@ mod tests {
         // Open the dialog, switch to full hostname, apply, then
         // confirm the new value rides through serde.
         let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Short);
+        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Short);
         a.handle_key(key(KeyCode::Char('h')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.active_hostname_display(), HostnameDisplay::Full);
+        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Full);
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream_id = a.tabs[a.active].stream;
