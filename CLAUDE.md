@@ -307,6 +307,3 @@ New tabs should still open with this dialog.
 - creating new tab when you have a filter applied takes a long time with no feedback
 - bookmarks should be listed in timestamp order
 - when entering any mode that involves selection, there should be some instructions about it
-- hide the line showing parse details by default (some binding should show it again)
-  - it should also say "fetched"
-  - EOF marker should still be present, maybe with progress marker through the overall stream

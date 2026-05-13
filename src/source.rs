@@ -236,6 +236,11 @@ pub struct SourceMetadata {
     pub name: Option<LoggerName>,
     /// `hostname` field of the first record, if present
     pub hostname: Option<Hostname>,
+    /// file size in bytes, captured at probe time.  Used by
+    /// `query_bounded` to report a meaningful `walked_bytes` even on
+    /// the whole-source-prune fast path (so the merge stepper's per-
+    /// source cursor still advances past pruned files).
+    pub byte_len: u64,
 }
 
 impl SourceMetadata {
@@ -377,10 +382,34 @@ impl Source for FileSource {
         max_walks: Option<usize>,
         filter: &Filter,
     ) -> std::io::Result<QueryBatch> {
-        if count == 0 || self.metadata.excludes_all(filter) {
+        if count == 0 {
             return Ok(QueryBatch {
                 records: Vec::new(),
                 walked_bytes: ByteLen::ZERO,
+                eof: true,
+            });
+        }
+        // Whole-file pruning via metadata.  Even though we don't open
+        // the file, report `walked_bytes` as the bytes the scan would
+        // have logically traversed: the merge stepper uses
+        // `walked_bytes` to advance its per-source cursor, and a zero
+        // here would leave the cursor frozen at `offset` even after a
+        // source has been definitively excluded — which throws off
+        // the StreamView's user-status byte-offset display.
+        if self.metadata.excludes_all(filter) {
+            // Use the byte length captured at open time rather than a
+            // fresh `byte_len()` call: the existing "metadata
+            // short-circuit avoids any I/O" contract is what lets the
+            // engine skip excluded files without a stat after the file
+            // has been removed underneath us.
+            let len = self.metadata.byte_len;
+            let walked = match direction {
+                Direction::Forward => len.saturating_sub(offset.get()),
+                Direction::Backward => offset.get().min(len),
+            };
+            return Ok(QueryBatch {
+                records: Vec::new(),
+                walked_bytes: ByteLen::from(walked),
                 eof: true,
             });
         }
@@ -628,7 +657,7 @@ fn probe_metadata(path: &Utf8Path) -> std::io::Result<SourceMetadata> {
     let mut file = File::open(path)?;
     let len = file.seek(SeekFrom::End(0))?;
     if len == 0 {
-        return Ok(SourceMetadata::default());
+        return Ok(SourceMetadata { byte_len: 0, ..Default::default() });
     }
 
     file.seek(SeekFrom::Start(0))?;
@@ -648,7 +677,7 @@ fn probe_metadata(path: &Utf8Path) -> std::io::Result<SourceMetadata> {
     };
     let latest = last_event.map(|e| e.time);
 
-    Ok(SourceMetadata { earliest, latest, name, hostname })
+    Ok(SourceMetadata { earliest, latest, name, hostname, byte_len: len })
 }
 
 /// Reads the first line of `file` (up to and including the first
@@ -919,12 +948,18 @@ mod tests {
         // record at either end; `latest` is unset because the byte
         // before the trailing newline is itself a newline (so the
         // last "line" is empty), and `earliest` is unset because
-        // serde rejects the empty string.
+        // serde rejects the empty string.  `byte_len` still reflects
+        // the file's actual size — that field is always populated.
         let dir = TestDir::new();
         let p = dir.path().join("newlines.log");
         std::fs::write(&p, "\n\n\n").unwrap();
         let src = FileSource::open(&p).unwrap();
-        assert_eq!(src.metadata(), &SourceMetadata::default());
+        let m = src.metadata();
+        assert_eq!(m.earliest, None);
+        assert_eq!(m.latest, None);
+        assert_eq!(m.name, None);
+        assert_eq!(m.hostname, None);
+        assert_eq!(m.byte_len, 3);
         dir.cleanup();
     }
 
@@ -1007,6 +1042,7 @@ mod tests {
             latest: None,
             name: Some(LoggerName::from(name.to_string())),
             hostname: None,
+            byte_len: 0,
         }
     }
 
@@ -1045,6 +1081,7 @@ mod tests {
             latest: None,
             name: None,
             hostname: Some(Hostname::from("h-1".to_string())),
+            byte_len: 0,
         };
         let f: Filter = "hostname=h-2".parse().unwrap();
         assert!(m.excludes_all(&f));

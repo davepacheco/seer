@@ -808,26 +808,95 @@ fn format_byte_rate(bytes_per_sec: f64) -> String {
     }
 }
 
-/// Renders a [`ParseStats`] as the status-line string shown beneath
-/// each tab.  The byte count reflects bytes *scanned* (including those
-/// from filter-rejected records) so it tracks the work the engine had
-/// to do while the user waited, not the size of what survived.  When
-/// the parse finished in zero measurable time (empty engine, all
-/// sources excluded by the source-id filter) the rate half is dropped
-/// — it would either divide by zero or be meaningless.
-fn format_parse_stats(stats: &ParseStats) -> String {
+/// Renders the always-shown user-facing status line under each tab.
+///
+/// The format is:
+///
+/// ```text
+/// Showing N records from byte offset B of T (P%)  ·  (end of stream)
+/// ```
+///
+/// where N is the number of records currently visible, B is the byte
+/// offset of the topmost visible record across all sources (a single
+/// number summed from the streamview anchor cursor), T is the total
+/// bytes of every source matched by the active filter, and P is
+/// `100 * B / T`.  When the viewport sits at the very start every
+/// source contributes zero to B, so the "(beginning of stream)" marker
+/// only appears when we have a streamview to consult.
+///
+/// Tabs without a streamview (synthetic test fixtures and Summary
+/// builds before they materialize) have no meaningful byte offset, so
+/// the byte half is dropped and the beginning-of-stream marker is
+/// suppressed.  The end-of-stream marker still surfaces in that case
+/// because `at_eof` is derived from the materialization, not the
+/// streamview.
+fn format_user_status(
+    tab: &Tab,
+    engine: &Engine,
+    filter: &Filter,
+    top: usize,
+    bottom: usize,
+    at_eof: bool,
+) -> String {
+    let total_lines = tab.formatted().len();
+    let records_shown = if top < bottom && bottom <= total_lines {
+        tab.event_for_line()[bottom - 1].get() - tab.event_for_line()[top].get()
+            + 1
+    } else {
+        0
+    };
+    let total_bytes = engine.filtered_total_bytes(filter).get();
+    let offset_bytes: Option<u64> = tab
+        .streamview
+        .as_ref()
+        .and_then(|v| v.cursor_at_anchor())
+        .map(|c| c.iter().map(|(_, off)| off.get()).sum());
+
+    let mut s = match offset_bytes {
+        Some(b) if total_bytes > 0 => {
+            let pct = (b as f64 / total_bytes as f64) * 100.0;
+            format!(
+                "Showing {} records from byte offset {} of {} ({:.0}%)",
+                records_shown,
+                format_bytes(b),
+                format_bytes(total_bytes),
+                pct,
+            )
+        }
+        _ => format!("Showing {records_shown} records"),
+    };
+    // EOF wins over BOF when somehow both could be true (a tiny stream
+    // where the only visible record is the first and the last): reaching
+    // the end is the more notable state.
+    if at_eof {
+        s.push_str("  ·  (end of stream)");
+    } else if offset_bytes == Some(0) && records_shown > 0 {
+        s.push_str("  ·  (beginning of stream)");
+    }
+    s
+}
+
+/// Renders a [`ParseStats`] as the developer-oriented fetch-progress
+/// row revealed by `p`.  The byte count reflects bytes *scanned*
+/// (including those from filter-rejected records) so it tracks the
+/// work the engine had to do while the user waited, not the size of
+/// what survived.  When the fetch finished in zero measurable time
+/// (empty engine, all sources excluded by the source-id filter) the
+/// rate half is dropped — it would either divide by zero or be
+/// meaningless.
+fn format_fetch_stats(stats: &ParseStats) -> String {
     let secs = stats.elapsed.as_secs_f64();
     let bytes = format_bytes(stats.walked_bytes.get());
     if stats.records == 0 || secs <= 0.0 {
         return format!(
-            "{} records ({}) parsed in {:.3}s",
+            "{} records ({}) fetched in {:.3}s",
             stats.records, bytes, secs,
         );
     }
     let rps = stats.records as f64 / secs;
     let bps = stats.walked_bytes.get() as f64 / secs;
     format!(
-        "{} records ({}) parsed in {:.3}s ({:.1} records/sec, {})",
+        "{} records ({}) fetched in {:.3}s ({:.1} records/sec, {})",
         stats.records,
         bytes,
         secs,
@@ -1143,9 +1212,9 @@ impl SeekOp {
 }
 
 /// Formats a [`LongOp`]'s running progress as a single-line status
-/// string sized to fit `width` columns.  Replaces [`format_parse_stats`]
-/// in the stats row while the op is in flight; on completion the
-/// parse-stats line takes over again on the next frame.
+/// string sized to fit `width` columns.  Replaces [`format_user_status`]
+/// in the user status row while the op is in flight; on completion the
+/// user status line takes over again on the next frame.
 ///
 /// Layout, from left to right:
 ///
@@ -1911,6 +1980,11 @@ struct App {
     /// the appropriate mutation sites and consult `policy.due()` in
     /// the event loop.
     policy: SavePolicy,
+    /// When true, draw a developer-oriented row above the user status
+    /// line showing engine fetch progress (`X records (Y) fetched in
+    /// Zs ...`).  Toggled with `p` and not persisted across sessions:
+    /// it's a debugging affordance, not part of the user's view state.
+    show_fetch_stats: bool,
 }
 
 impl App {
@@ -1965,6 +2039,7 @@ impl App {
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
+            show_fetch_stats: false,
             store,
             policy,
         };
@@ -3628,6 +3703,7 @@ impl App {
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
+            show_fetch_stats: false,
             store: None,
             policy: SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE),
         };
@@ -3883,6 +3959,17 @@ impl App {
                     || modifiers == KeyModifiers::SHIFT =>
             {
                 self.toggle_show_raw();
+            }
+            // `p`: toggle the developer-oriented engine-fetch-progress
+            // row.  Off by default — it tracks engine work, not what a
+            // typical user wants to read, and the numbers are confusing
+            // out of context.
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.show_fetch_stats = !self.show_fetch_stats;
             }
             // `d`: open the field-display dialog (timestamp format,
             // hostname mode, name/pid/extras visibility).  Folds the
@@ -4868,6 +4955,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("F", "toggle structured-fields visibility"),
             ("D", "toggle date in timestamp"),
             ("R", "toggle raw rendering"),
+            ("p", "toggle engine fetch-progress row"),
         ],
     },
     HelpSection {
@@ -5072,13 +5160,19 @@ fn render(frame: &mut Frame, app: &mut App) {
         Some(Dialog::Search { parse_error: Some(_), .. }) => 2,
         _ => 1,
     };
-    // Bookmarks pane has no parse activity to report, so we omit the
-    // stats row there and reclaim the row for content.
+    // Bookmarks pane has no parse activity to report, so we omit
+    // both stats rows there and reclaim those lines for content.
     let stats_height: u16 = if app.bookmarks_active() { 0 } else { 1 };
-    let [tabs_area, content_area, stats_area, bottom_area] =
+    // The developer-only fetch-progress row is hidden by default and
+    // toggled with `p`.  Suppressed in the Bookmarks pane (same
+    // reasoning as `stats_height`).
+    let fetch_stats_height: u16 =
+        if !app.bookmarks_active() && app.show_fetch_stats { 1 } else { 0 };
+    let [tabs_area, content_area, fetch_stats_area, stats_area, bottom_area] =
         Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(fetch_stats_height),
             Constraint::Length(stats_height),
             Constraint::Length(bottom_height),
         ])
@@ -5136,39 +5230,49 @@ fn render(frame: &mut Frame, app: &mut App) {
         bottom += 1;
     }
 
-    // "At end of stream" surfaces when the viewport's last visible
-    // line is the last line we have AND no more records can appear
-    // past it.  A streamview-backed tab (the live case) checks
+    // "End of stream" surfaces when the viewport's last visible line
+    // is the last line we have AND no more records can appear past
+    // it.  A streamview-backed tab (the live case) checks
     // `is_forward_eof`; test fixtures without a streamview have all
     // their data already materialized, so reaching the bottom is
     // sufficient.  Scrolling up makes `bottom < total` and the
-    // indicator disappears.  Shown on the parse-stats line (rather
-    // than the keybinding footer, which is too long to keep visible
-    // on narrow terminals) so users actually see it.
+    // indicator disappears.  Shown on the always-on user status line
+    // (rather than the keybinding footer, which is too long to keep
+    // visible on narrow terminals) so users actually see it.
     let at_eof = total > 0
         && bottom == total
         && tab.streamview.as_ref().is_none_or(|v| v.is_forward_eof());
 
     // While a long op targeting the active tab is in flight, the
-    // progress bar replaces the parse-stats line.  After completion,
-    // `format_parse_stats` is restored on the next frame.  The EOF
-    // marker is only appended outside the long-op branch — a running
-    // op is by definition not "done", so the marker would be
-    // misleading there.
-    let stats_text = match app.long_op.as_ref() {
+    // progress bar replaces the user status line.  After completion,
+    // the user status returns on the next frame.  The BOF/EOF markers
+    // are only appended outside the long-op branch — a running op is
+    // by definition not "done", so the marker would be misleading.
+    let active_filter = app.active_stream().filter.clone();
+    let user_status_text = match app.long_op.as_ref() {
         Some(op) if op.targets_tab(TabIdx(app.active)) => {
             format_long_op_progress(op, stats_area.width.into())
         }
-        _ => {
-            let base = format_parse_stats(tab.parse_stats());
-            if at_eof {
-                format!("{base}  ·  (at end of stream)")
-            } else {
-                base
-            }
-        }
+        _ => format_user_status(
+            tab,
+            &app.engine,
+            &active_filter,
+            top,
+            bottom,
+            at_eof,
+        ),
     };
-    frame.render_widget(Paragraph::new(stats_text), stats_area);
+    frame.render_widget(Paragraph::new(user_status_text), stats_area);
+
+    // Optional developer-oriented fetch-progress row, toggled by `p`.
+    // Always shows the engine's running fetch totals, even during a
+    // long op — the user status above is already commandeered by the
+    // long-op progress bar, and seeing the fetch counters mid-op is
+    // the whole reason a developer reaches for this toggle.
+    if fetch_stats_height > 0 {
+        let fetch_text = format_fetch_stats(tab.parse_stats());
+        frame.render_widget(Paragraph::new(fetch_text), fetch_stats_area);
+    }
 
     let selected_event = tab.select.map(|s| s.event_idx);
     // In raw mode, pre-wrap each logical line at the column boundary
@@ -6037,11 +6141,11 @@ mod tests {
     /// whose streamview has hit forward EOF.  Scrolling up by one
     /// line must hide the indicator again.
     #[test]
-    fn render_shows_at_end_of_stream_when_viewport_reaches_last_row() {
+    fn render_shows_end_of_stream_when_viewport_reaches_last_row() {
         // 7 rows is enough to show all 4 logical rows plus tab bar +
-        // stats + footer; the bottom of the viewport touches the last
-        // row.  Keep the surface wide so the parse-stats line plus
-        // the EOF suffix fits without clipping.
+        // user status + footer; the bottom of the viewport touches
+        // the last row.  Keep the surface wide so the status line
+        // plus the EOF suffix fits without clipping.
         let backend = TestBackend::new(300, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec![
@@ -6053,7 +6157,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(
-            dump.contains("(at end of stream)"),
+            dump.contains("(end of stream)"),
             "expected EOF indicator when viewport reaches last row:\n{dump}",
         );
     }
@@ -6062,7 +6166,7 @@ mod tests {
     /// row (the user scrolled up, or the content is taller than the
     /// viewport at first paint), the stats line omits the indicator.
     #[test]
-    fn render_hides_at_end_of_stream_when_more_rows_below() {
+    fn render_hides_end_of_stream_when_more_rows_below() {
         // Tiny viewport (2 content rows) over 6 logical rows: the
         // bottom of the viewport is far from the last row.
         let backend = TestBackend::new(200, 5);
@@ -6072,7 +6176,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(
-            !dump.contains("(at end of stream)"),
+            !dump.contains("(end of stream)"),
             "did not expect EOF indicator with rows below:\n{dump}",
         );
     }
@@ -6093,7 +6197,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(
-            dump.contains("(at end of stream)"),
+            dump.contains("(end of stream)"),
             "expected EOF indicator after `G`:\n{dump}",
         );
 
@@ -6102,7 +6206,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
         assert!(
-            !dump.contains("(at end of stream)"),
+            !dump.contains("(end of stream)"),
             "did not expect EOF indicator after scrolling up:\n{dump}",
         );
     }
@@ -7967,23 +8071,24 @@ mod tests {
     }
 
     #[test]
-    fn format_parse_stats_includes_records_bytes_time_and_rates() {
+    fn format_fetch_stats_includes_records_bytes_time_and_rates() {
         let stats = ParseStats {
             records: 1023,
             walked_bytes: ByteLen::from(2013),
             elapsed: Duration::from_millis(15_231),
         };
-        let s = format_parse_stats(&stats);
+        let s = format_fetch_stats(&stats);
         // Spot-check each piece of information the user expects to see.
         assert!(s.contains("1023 records"), "{s}");
         assert!(s.contains("2.0 KiB"), "{s}");
         assert!(s.contains("15.231s"), "{s}");
+        assert!(s.contains("fetched"), "{s}");
         assert!(s.contains("records/sec"), "{s}");
         assert!(s.contains("B/sec") || s.contains("KiB/sec"), "{s}");
     }
 
     #[test]
-    fn format_parse_stats_drops_rates_when_records_zero() {
+    fn format_fetch_stats_drops_rates_when_records_zero() {
         // Empty engine (no sources or all filtered out): records and
         // bytes are zero and the rate half would be meaningless.
         let stats = ParseStats {
@@ -7991,21 +8096,207 @@ mod tests {
             walked_bytes: ByteLen::ZERO,
             elapsed: Duration::from_millis(0),
         };
-        let s = format_parse_stats(&stats);
+        let s = format_fetch_stats(&stats);
         assert!(s.contains("0 records"), "{s}");
+        assert!(s.contains("fetched"), "{s}");
         assert!(!s.contains("records/sec"), "{s}");
     }
 
+    /// Builds a small bunyan log file, points an Engine at it, and
+    /// returns the App so a test can drive the streamview-backed
+    /// status-line code path that needs real byte offsets.
+    fn app_with_real_log(
+        records: usize,
+    ) -> (App, camino_tempfile::Utf8TempDir) {
+        use camino_tempfile::tempdir;
+        use slog::{Drain, Logger, info, o};
+        use std::fs::OpenOptions;
+        use std::sync::Mutex;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let drain = slog_bunyan::with_name("Nexus", file).build().fuse();
+            let log = Logger::root(Mutex::new(drain).fuse(), o!());
+            for i in 0..records {
+                info!(log, "entry"; "i" => i);
+            }
+        }
+        let mut engine = Engine::new();
+        engine.add_file_source(&path).unwrap();
+        (App::new(engine), dir)
+    }
+
     #[test]
-    fn render_shows_parse_stats_row_above_footer() {
-        // Wide enough to hold the full status line; tall enough for
-        // tabs(1) + content(2) + stats(1) + footer(1).  The stats row
-        // sits one above the footer.
+    fn user_status_shows_byte_offset_and_percent_when_streamview_present() {
+        // A real file-backed engine is required so the streamview's
+        // anchor cursor has meaningful byte offsets to sum.  At the
+        // top of the stream the offset is zero, the percent rounds to
+        // 0, and the "(beginning of stream)" marker appears.
+        let (mut a, _dir) = app_with_real_log(50);
+        a.viewport_height = 5;
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("Showing"), "dump:\n{dump}");
+        assert!(dump.contains("from byte offset"), "dump:\n{dump}");
+        assert!(dump.contains("0 B of"), "dump:\n{dump}");
+        assert!(dump.contains("(0%)"), "dump:\n{dump}");
+        assert!(dump.contains("(beginning of stream)"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn user_status_shows_end_marker_at_eof() {
+        // Scrolling to the end of a streamview-backed tab surfaces the
+        // "(end of stream)" marker and a non-zero byte offset.  The
+        // beginning-of-stream marker must not also appear.
+        let (mut a, _dir) = app_with_real_log(50);
+        a.viewport_height = 10;
+        let backend = TestBackend::new(160, 13);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // `G` installs a Seek long-op; the user status line is taken
+        // over by the progress bar while it runs, so we have to drain
+        // it before checking for the EOF marker.
+        a.handle_key(shift('G'));
+        a.drain_long_op();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("(end of stream)"), "dump:\n{dump}");
+        assert!(!dump.contains("(beginning of stream)"), "dump:\n{dump}");
+        assert!(dump.contains("from byte offset"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn user_status_byte_offset_reflects_filter_skipped_bytes() {
+        // Pins the user-reported bug: applying a filter that excludes
+        // the start of the file used to leave the byte offset at 0,
+        // because `front_cursor` wasn't anchored to the first match.
+        // After the fix, the user status reports a non-zero offset
+        // corresponding to the first matching record's actual byte
+        // position in its source file.
+        let (mut a, _dir) = app_with_real_log(50);
+        a.viewport_height = 5;
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Filter to a record well into the file.  `apply_filter`
+        // installs a Seek long op that does the work; drain it before
+        // rendering so the user status line (not the progress bar) is
+        // the one we read.
+        let filter: Filter = "msg=entry  i=40".parse().unwrap();
+        a.apply_filter(filter);
+        a.drain_long_op();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("from byte offset"), "dump:\n{dump}");
+        // The "0 B of" form is what showed before the fix; the offset
+        // should now be the actual position of the first matching
+        // record, which has to be more than a hundred bytes deep into
+        // a 50-record bunyan log.
+        assert!(!dump.contains("from byte offset 0 B of"), "dump:\n{dump}");
+        // ...and no longer marked as the beginning of the stream.
+        assert!(!dump.contains("(beginning of stream)"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn user_status_byte_offset_accounts_for_filtered_sister_sources() {
+        // Repros the multi-source case the user reported against `t/`:
+        // three per-sled log files, the user filters out one sled's
+        // hostname, and the displayed byte offset must reflect the
+        // bytes the engine walked past in the filtered-out sources
+        // (not just the visible record's offset in its own file).
+        use camino_tempfile::tempdir;
+        use std::io::Write;
+
+        let dir = tempdir().unwrap();
+        let paths: Vec<_> = (0..3)
+            .map(|i| dir.path().join(format!("sled-{i:02}.log")))
+            .collect();
+        // Hand-roll the bunyan records: slog-bunyan auto-injects the
+        // machine `hostname`, which clashes with our per-sled
+        // `hostname` field and would render the filter a no-op.
+        for (i, path) in paths.iter().enumerate() {
+            let mut file = std::fs::File::create(path).unwrap();
+            for j in 0..50 {
+                let secs = (i as i64) * 1000 + j as i64;
+                writeln!(
+                    file,
+                    r#"{{"hostname":"oxz-sled-{i:02}.oxide.test","level":30,"msg":"entry","name":"SledAgent","pid":1234,"time":"2024-03-09T16:{:02}:{:02}+00:00","v":0,"j":{j}}}"#,
+                    secs / 60,
+                    secs % 60,
+                )
+                .unwrap();
+            }
+        }
+        let mut engine = Engine::new();
+        for path in &paths {
+            engine.add_file_source(path).unwrap();
+        }
+        let mut a = App::new(engine);
+        a.viewport_height = 5;
+
+        // Filter out the first sled entirely: every one of its records
+        // matches the hostname predicate's *exclusion*, and the merge
+        // stepper has to walk past every byte of sled-00's file to
+        // satisfy the time-merge before it can return a sled-01 record.
+        let filter: Filter =
+            "hostname!=oxz-sled-00.oxide.test".parse().unwrap();
+        a.apply_filter(filter);
+        a.drain_long_op();
+
+        let backend = TestBackend::new(160, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("from byte offset"), "dump:\n{dump}");
+        // sled-00's file is large enough that we should observe a
+        // non-trivial offset, not 0.  The user's bug had the line
+        // reading `from byte offset 0 B of …` even after the filter.
+        assert!(
+            !dump.contains("from byte offset 0 B of"),
+            "byte offset should reflect bytes walked past in the \
+             filtered-out sister source, dump:\n{dump}",
+        );
+        assert!(
+            !dump.contains("(beginning of stream)"),
+            "should not still be marked as beginning, dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn user_status_for_synthetic_fixture_omits_byte_half() {
+        // Tabs without a streamview (synthetic test fixtures and
+        // pre-build Summary tabs) carry no byte-offset signal, so the
+        // user status line drops the "from byte offset …" half rather
+        // than printing a misleading zero.
         let backend = TestBackend::new(120, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut a = App::with_rows(vec!["row".to_string()]);
-        // Force a ParseStats with deterministic values rather than
-        // relying on whatever the test fixture produced.
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("Showing 1 records"), "dump:\n{dump}");
+        assert!(!dump.contains("from byte offset"), "dump:\n{dump}");
+        // The synthetic path has no streamview, so the beginning
+        // marker should not appear even though the viewport is at
+        // line 0 of the materialization.
+        assert!(!dump.contains("(beginning of stream)"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn render_shows_user_status_above_footer_by_default() {
+        // Wide enough to hold the full status line; tall enough for
+        // tabs(1) + content(2) + stats(1) + footer(1).  The user
+        // status row sits one above the footer.  The developer-only
+        // fetch-stats row is hidden by default, so the user just
+        // sees the "Showing N records …" line.
+        let backend = TestBackend::new(120, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
         a.active_tab_mut().standalone_materialized.parse_stats = ParseStats {
             records: 42,
             walked_bytes: ByteLen::from(4096),
@@ -8013,9 +8304,54 @@ mod tests {
         };
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         let dump = buffer_text(terminal.backend().buffer());
+        assert!(dump.contains("Showing 1 records"), "dump:\n{dump}");
+        // No fetch-stats row in default state — the "42 records …
+        // fetched" text must not appear anywhere on screen.
+        assert!(!dump.contains("fetched"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn p_reveals_fetch_stats_row() {
+        // Pressing `p` toggles the developer-oriented fetch-stats row
+        // on.  The row shows the engine's running ParseStats with the
+        // user-friendly "fetched" verb.  Tall enough for
+        // tabs(1) + content(1) + fetch(1) + stats(1) + footer(1).
+        let backend = TestBackend::new(160, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.active_tab_mut().standalone_materialized.parse_stats = ParseStats {
+            records: 42,
+            walked_bytes: ByteLen::from(4096),
+            elapsed: Duration::from_millis(100),
+        };
+        a.handle_key(key(KeyCode::Char('p')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
         assert!(dump.contains("42 records"), "dump:\n{dump}");
+        assert!(dump.contains("fetched"), "dump:\n{dump}");
         assert!(dump.contains("4.0 KiB"), "dump:\n{dump}");
         assert!(dump.contains("0.100s"), "dump:\n{dump}");
+        // The user status line still shows in its slot.
+        assert!(dump.contains("Showing 1 records"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn p_toggle_hides_fetch_stats_row_again() {
+        // Press `p` twice: row appears, then disappears.  Verifies the
+        // toggle is a true flip-flop, not a one-shot.
+        let backend = TestBackend::new(160, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut a = App::with_rows(vec!["row".to_string()]);
+        a.active_tab_mut().standalone_materialized.parse_stats = ParseStats {
+            records: 42,
+            walked_bytes: ByteLen::from(4096),
+            elapsed: Duration::from_millis(100),
+        };
+        a.handle_key(key(KeyCode::Char('p')));
+        a.handle_key(key(KeyCode::Char('p')));
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        assert!(!dump.contains("fetched"), "dump:\n{dump}");
     }
 
     // ---------- progress bar ----------

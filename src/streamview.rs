@@ -1053,6 +1053,7 @@ impl StreamView {
             return 0;
         }
         let started = Instant::now();
+        let was_empty = self.records.is_empty();
         let mut stepper =
             engine.stepper(self.filter.clone(), &self.back_cursor);
         let mut fetched = 0;
@@ -1073,7 +1074,43 @@ impl StreamView {
         self.parse_stats.records += fetched as u64;
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.elapsed += started.elapsed();
+        // First fetch into an empty window: anchor `front_cursor` at
+        // the actual byte position of `records[0]` rather than leaving
+        // it at the (possibly far-earlier) seek point.  Without this,
+        // a selective filter that skips the first chunk of every file
+        // leaves the user-status line reporting "byte offset 0" even
+        // though the first visible record is hundreds of bytes deep.
+        if was_empty {
+            self.anchor_front_cursor_to_first_record();
+        }
         fetched
+    }
+
+    /// Updates `front_cursor` so it captures the byte position the
+    /// stepper had to walk *past* in each source to surface
+    /// `records.front()` as the first match, then rolls the source
+    /// that record came from back to the record's own offset.
+    ///
+    /// Without the multi-source-aware basis, a filter that excludes
+    /// every record in one source (e.g. a sled-hostname filter against
+    /// a per-sled log file) would leave the user-status byte offset
+    /// reading 0 — the visible record's source might genuinely sit at
+    /// byte 0 in its own file, but the engine has scanned past every
+    /// byte of the other source's file to confirm it had no matches.
+    /// The stepper's post-batch [`super::merge::Stepper::cursor`]
+    /// captures that walked-past state (the matching merge.rs
+    /// position-advance covers the EOF-no-matches case), so we copy it
+    /// in wholesale and then roll back only the one source.
+    fn anchor_front_cursor_to_first_record(&mut self) {
+        if let Some(first) = self.records.front() {
+            let first_source = first.record.source_id.clone();
+            let first_offset = first.record.offset;
+            // `self.back_cursor` was just set to `stepper.cursor()` by
+            // the caller; both extend_forward paths write it
+            // immediately before invoking us.
+            self.front_cursor = self.back_cursor.clone();
+            self.front_cursor.set(first_source, first_offset);
+        }
     }
 
     /// Like [`Self::extend_forward_batch`] but uses a stepper with a
@@ -1097,6 +1134,7 @@ impl StreamView {
             return 0;
         }
         let started = Instant::now();
+        let was_empty = self.records.is_empty();
         let mut stepper = engine.stepper_with(
             self.filter.clone(),
             &self.back_cursor,
@@ -1131,6 +1169,10 @@ impl StreamView {
         self.parse_stats.walked_bytes += stepper.walked_bytes();
         self.parse_stats.records += fetched as u64;
         self.parse_stats.elapsed += started.elapsed();
+        // See `extend_forward_batch` for the rationale.
+        if was_empty {
+            self.anchor_front_cursor_to_first_record();
+        }
         fetched
     }
 

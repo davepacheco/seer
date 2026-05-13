@@ -239,21 +239,26 @@ impl<'a> SourceWindow<'a> {
                     self.set_eof(dir, EofMark::Reached);
                 }
                 let walked = batch.walked_bytes;
-                // When the bounded query walked records without
-                // finding any match (budget exhausted in a sparse
-                // filter region), advance our position to the scan's
-                // end so the next fill picks up where this one
-                // stopped — otherwise we'd loop forever re-scanning
-                // the same prefix.  When matches *were* found, leave
-                // position alone: `pop` will set it to the
-                // most-recently-popped record's offset, which is the
-                // right cursor for both `stepper.cursor()` and the
-                // next refill.  (Some records in the scanned region
-                // past the last match may be re-walked on the next
-                // refill; that redundancy is bounded by `batch_size`
-                // and is the cost of keeping `pop`'s position
-                // semantics intact.)
-                if batch.records.is_empty() && !batch.eof {
+                // When the query walked records without finding any
+                // match — whether because the budget expired in a
+                // sparse filter region or because the walk ran clear
+                // through to EOF without a hit — advance our position
+                // to the scan's end.  The budget case is the "don't
+                // loop forever re-scanning the same prefix" case; the
+                // EOF case is needed so `stepper.cursor()` reflects
+                // how far we've walked in a fully-filtered source
+                // (otherwise the StreamView's user-status byte offset
+                // under-reports — see `front_cursor` use in
+                // `cursor_before_record`).  When matches *were*
+                // found, leave position alone: `pop` will set it to
+                // the most-recently-popped record's offset, which is
+                // the right cursor for both `stepper.cursor()` and
+                // the next refill.  (Some records in the scanned
+                // region past the last match may be re-walked on the
+                // next refill; that redundancy is bounded by
+                // `batch_size` and is the cost of keeping `pop`'s
+                // position semantics intact.)
+                if batch.records.is_empty() {
                     match dir {
                         Direction::Forward => self.position += walked,
                         Direction::Backward => {
