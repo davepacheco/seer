@@ -28,6 +28,24 @@ use std::collections::BTreeMap;
 /// missing from the map resolve to [`ByteOffset::ZERO`] when used as
 /// input to [`crate::engine::Engine::stepper`], so a default `Cursor`
 /// walks each source from its beginning.
+///
+/// ## Absent vs. zero
+///
+/// For navigation, "source not in the map" and "source mapped to
+/// [`ByteOffset::ZERO`]" mean the same thing — both place the stepper
+/// at the start of that source.  The map shape is *not* normalized on
+/// construction (we'd have to know the full engine source set to do
+/// that, which the type doesn't), so two cursors that produce identical
+/// navigation behavior can still differ as `BTreeMap`s and therefore
+/// compare unequal under the derived [`PartialEq`].
+///
+/// Today nothing observable depends on this distinction: bookmark
+/// dedup and session save/load all round-trip the exact map the
+/// caller built.  But a future caller comparing two cursors for
+/// "do they refer to the same logical position?" must walk the
+/// shared key set with [`Self::get`] (which returns `None` →
+/// `ByteOffset::ZERO`) rather than relying on `==`, or normalize both
+/// against a shared source set first.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
 )]
