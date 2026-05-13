@@ -101,16 +101,33 @@ pub fn short_hostname(hostname: &str) -> String {
     head.to_string()
 }
 
+/// Whether [`format_time`] should include the `YYYY-MM-DD` date
+/// prefix on the rendered timestamp.  Replaces a bare `bool` so call
+/// sites read self-documentingly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShowDate {
+    Yes,
+    No,
+}
+
+impl From<bool> for ShowDate {
+    fn from(b: bool) -> Self {
+        if b { Self::Yes } else { Self::No }
+    }
+}
+
 /// Formats a UTC timestamp the way both binaries display it.
 ///
-/// With `show_date` true the result is a full ISO-8601 date-time at
-/// millisecond precision (`2026-04-30T15:30:00.743Z`); with it false the
-/// date prefix is stripped, leaving only `15:30:00.743Z`.  The `Z`
-/// suffix is preserved either way so the value is still unambiguously
-/// UTC when the user copies it out.
-pub fn format_time(time: &DateTime<Utc>, show_date: bool) -> String {
-    let pattern =
-        if show_date { "%Y-%m-%dT%H:%M:%S%.3fZ" } else { "%H:%M:%S%.3fZ" };
+/// With [`ShowDate::Yes`] the result is a full ISO-8601 date-time at
+/// millisecond precision (`2026-04-30T15:30:00.743Z`); with
+/// [`ShowDate::No`] the date prefix is stripped, leaving only
+/// `15:30:00.743Z`.  The `Z` suffix is preserved either way so the
+/// value is still unambiguously UTC when the user copies it out.
+pub fn format_time(time: &DateTime<Utc>, show_date: ShowDate) -> String {
+    let pattern = match show_date {
+        ShowDate::Yes => "%Y-%m-%dT%H:%M:%S%.3fZ",
+        ShowDate::No => "%H:%M:%S%.3fZ",
+    };
     time.format(pattern).to_string()
 }
 
@@ -197,7 +214,7 @@ pub fn format_event(event: &Event, opts: &RenderOpts) -> Vec<String> {
     };
     lines.push(format!(
         "{} {}{}{:<5} {}",
-        format_time(&event.time, opts.show_date),
+        format_time(&event.time, opts.show_date.into()),
         host_field,
         proc_field,
         event.level,
@@ -567,13 +584,10 @@ mod tests {
         let time: DateTime<Utc> =
             "2026-04-30T15:30:00.743162222Z".parse().unwrap();
         assert_eq!(
-            format_time(&time, /* show_date = */ true),
+            format_time(&time, ShowDate::Yes),
             "2026-04-30T15:30:00.743Z",
         );
-        assert_eq!(
-            format_time(&time, /* show_date = */ false),
-            "15:30:00.743Z",
-        );
+        assert_eq!(format_time(&time, ShowDate::No), "15:30:00.743Z",);
     }
 
     #[test]

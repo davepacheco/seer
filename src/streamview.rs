@@ -187,6 +187,16 @@ pub enum SearchDir {
     Backward,
 }
 
+/// Whether the search anchor (the row the user is currently parked on)
+/// counts as a candidate match.  `Include` is the natural starting
+/// position; `Skip` is what `n` / `N` repeats want so the cursor
+/// advances instead of re-landing on the row it's already on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchAnchor {
+    Include,
+    Skip,
+}
+
 /// Whether [`StreamView::ensure_window_step`] needs more batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowFillStatus {
@@ -1315,10 +1325,11 @@ impl StreamView {
     /// stepping through the merged stream as needed.  When found, the
     /// viewport anchor moves to the matching line.
     ///
-    /// `exclusive`: if true, skips the current anchor's line in the
-    /// initial scan (so `n` after a previous match doesn't re-find the
-    /// same line); if false, includes it (the initial `/<pattern>` does
-    /// match a line at the cursor's current position if applicable).
+    /// `anchor` controls whether the row the user is currently parked
+    /// on counts as a match candidate.  [`SearchAnchor::Skip`] is what
+    /// `n` after a previous match wants (so the cursor advances rather
+    /// than re-landing); [`SearchAnchor::Include`] is what the initial
+    /// `/<pattern>` wants (the cursor's current line is eligible).
     ///
     /// Walks at most [`SEARCH_BUDGET`] records per call before
     /// returning [`SearchOutcome::BudgetExhausted`].  When that
@@ -1337,7 +1348,7 @@ impl StreamView {
         engine: &Engine,
         regex: &Regex,
         direction: SearchDir,
-        exclusive: bool,
+        anchor: SearchAnchor,
         viewport_height: u16,
         cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
@@ -1345,7 +1356,7 @@ impl StreamView {
             engine,
             regex,
             direction,
-            exclusive,
+            anchor,
             viewport_height,
             SEARCH_BUDGET,
             cancel,
@@ -1364,7 +1375,7 @@ impl StreamView {
         engine: &Engine,
         regex: &Regex,
         direction: SearchDir,
-        exclusive: bool,
+        anchor: SearchAnchor,
         viewport_height: u16,
         budget: usize,
         cancel: &mut dyn FnMut() -> bool,
@@ -1381,7 +1392,7 @@ impl StreamView {
             SearchDir::Forward => self.search_step_forward(
                 engine,
                 regex,
-                exclusive,
+                anchor,
                 &mut budget,
                 viewport_height,
                 resume_idx,
@@ -1390,7 +1401,7 @@ impl StreamView {
             SearchDir::Backward => self.search_step_backward(
                 engine,
                 regex,
-                exclusive,
+                anchor,
                 &mut budget,
                 viewport_height,
                 resume_idx,
@@ -1443,7 +1454,7 @@ impl StreamView {
         &mut self,
         engine: &Engine,
         regex: &Regex,
-        exclusive: bool,
+        anchor: SearchAnchor,
         budget: &mut usize,
         viewport_height: u16,
         resume: Option<(usize, usize)>,
@@ -1451,7 +1462,11 @@ impl StreamView {
     ) -> SearchOutcome {
         let (mut idx, mut start_line) = resume.unwrap_or_else(|| {
             let (anchor_idx, anchor_line) = self.anchor_indices();
-            (anchor_idx, if exclusive { anchor_line + 1 } else { anchor_line })
+            let start_line = match anchor {
+                SearchAnchor::Skip => anchor_line + 1,
+                SearchAnchor::Include => anchor_line,
+            };
+            (anchor_idx, start_line)
         });
         loop {
             while idx < self.records.len() {
@@ -1502,29 +1517,30 @@ impl StreamView {
         &mut self,
         engine: &Engine,
         regex: &Regex,
-        exclusive: bool,
+        anchor: SearchAnchor,
         budget: &mut usize,
         viewport_height: u16,
         resume: Option<(usize, usize)>,
         cancel: &mut dyn FnMut() -> bool,
     ) -> SearchOutcome {
+        let skip_anchor = matches!(anchor, SearchAnchor::Skip);
         let (mut idx, mut end_line): (isize, isize) = match resume {
             Some((i, line)) => (i as isize, line as isize),
             None => {
                 let (anchor_idx, anchor_line) = self.anchor_indices();
                 let mut idx = anchor_idx as isize;
                 // Initial scan upper bound: the anchor's line, or one
-                // before it under `exclusive`.  When `exclusive` and
-                // the anchor is on line 0, skip the current record
-                // entirely and start at the previous one.
-                let end = if exclusive && anchor_line == 0 {
+                // before it when `Skip`.  When skipping and the anchor
+                // is on line 0, skip the current record entirely and
+                // start at the previous one.
+                let end = if skip_anchor && anchor_line == 0 {
                     idx -= 1;
                     if idx < 0 {
                         -1
                     } else {
                         self.records[idx as usize].lines.len() as isize - 1
                     }
-                } else if exclusive {
+                } else if skip_anchor {
                     anchor_line.saturating_sub(1) as isize
                 } else {
                     anchor_line as isize
@@ -2047,7 +2063,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             10,
             &mut never_cancel(),
         );
@@ -2079,7 +2095,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             &mut never_cancel(),
         );
@@ -2100,7 +2116,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             &mut never_cancel(),
         );
@@ -2121,7 +2137,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             &mut never_cancel(),
         );
@@ -2131,7 +2147,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            true,
+            SearchAnchor::Skip,
             20,
             &mut never_cancel(),
         );
@@ -2158,7 +2174,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Backward,
-            true,
+            SearchAnchor::Skip,
             20,
             &mut never_cancel(),
         );
@@ -2182,7 +2198,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             2,
             &mut never_cancel(),
@@ -2196,7 +2212,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             5,
             &mut never_cancel(),
@@ -2219,7 +2235,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             2,
             &mut never_cancel(),
@@ -2235,7 +2251,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             100,
             &mut never_cancel(),
@@ -2256,7 +2272,7 @@ mod tests {
             &engine,
             &r1,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             2,
             &mut never_cancel(),
@@ -2270,7 +2286,7 @@ mod tests {
             &engine,
             &r2,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             2,
             &mut never_cancel(),
@@ -2298,7 +2314,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             10,
             &mut never_cancel(),
@@ -2315,7 +2331,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            true,
+            SearchAnchor::Skip,
             20,
             1,
             &mut never_cancel(),
@@ -2343,7 +2359,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             10,
             &mut || true,
@@ -2357,7 +2373,7 @@ mod tests {
             &engine,
             &regex,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             20,
             10,
             &mut never_cancel(),

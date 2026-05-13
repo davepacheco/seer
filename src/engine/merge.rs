@@ -170,6 +170,20 @@ impl From<SourceError> for MergeError {
     }
 }
 
+/// Whether a directional scan has exhausted the source.  Used by
+/// [`SourceWindow::set_eof`] in place of a bare `bool` so the call
+/// sites read self-documentingly (`set_eof(dir, EofMark::Reached)`
+/// vs. `set_eof(dir, true)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EofMark {
+    /// The scan in this direction has hit EOF; further fetches in
+    /// this direction are short-circuited until the flag is cleared.
+    Reached,
+    /// The scan has not (or no longer has) hit EOF; future fetches
+    /// will exercise the storage layer.
+    Cleared,
+}
+
 /// Internal cloneable buffer entry — same fields as [`MergeRecord`] but
 /// without the per-record `source_id` (it's a property of the owning
 /// [`SourceWindow`]).
@@ -246,7 +260,8 @@ impl<'a> SourceWindow<'a> {
         }
     }
 
-    fn set_eof(&mut self, dir: Direction, value: bool) {
+    fn set_eof(&mut self, dir: Direction, mark: EofMark) {
+        let value = matches!(mark, EofMark::Reached);
         match dir {
             Direction::Forward => self.forward_eof = value,
             Direction::Backward => self.backward_eof = value,
@@ -271,7 +286,7 @@ impl<'a> SourceWindow<'a> {
         // A backward query at offset 0 has no records to return — short
         // circuit so we don't even open the file.
         if matches!(dir, Direction::Backward) && self.position.get() == 0 {
-            self.set_eof(dir, true);
+            self.set_eof(dir, EofMark::Reached);
             return 0;
         }
         match self.source.query_bounded(
@@ -283,7 +298,7 @@ impl<'a> SourceWindow<'a> {
         ) {
             Ok(batch) => {
                 if batch.eof {
-                    self.set_eof(dir, true);
+                    self.set_eof(dir, EofMark::Reached);
                 }
                 let walked = batch.walked_bytes;
                 // When the bounded query walked records without
@@ -333,7 +348,7 @@ impl<'a> SourceWindow<'a> {
                     raw: String::new(),
                 };
                 self.buf_mut(dir).push_back(synth);
-                self.set_eof(dir, true);
+                self.set_eof(dir, EofMark::Reached);
                 0
             }
         }
@@ -354,7 +369,7 @@ impl<'a> SourceWindow<'a> {
         // direction, so any prior "exhausted" determination there is
         // stale.  Trimming below would clear it again; we set it once
         // up front and let the trim be a pure size operation.
-        self.set_eof(opp, false);
+        self.set_eof(opp, EofMark::Cleared);
         while self.buf(opp).len() > BUFFER_LIMIT {
             self.buf_mut(opp).pop_back();
         }

@@ -27,12 +27,13 @@ use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
 use seer::{
-    Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Engine, EngineEvent,
-    Filter, Form, HostnameDisplay, LogStream, LogStreamId, LogStreamPosition,
-    MatchKind, ParseStats, Predicate, RenderOpts, SavePolicy, SearchDir,
-    SearchOutcome, Selector, Session, SessionId, SessionMatch, SessionSource,
-    SessionStore, SourceId, StoreError, StreamView, SummaryBuilder, TabKind,
-    WindowFillStatus, build_seeit_command, format_summary,
+    Bookmark, BookmarkId, BookmarkName, Cadence, Cursor, Direction, Engine,
+    EngineEvent, Filter, Form, HostnameDisplay, LogStream, LogStreamId,
+    LogStreamPosition, MatchKind, ParseStats, Predicate, RenderOpts,
+    SavePolicy, SearchAnchor, SearchDir, SearchOutcome, Selector, Session,
+    SessionId, SessionMatch, SessionSource, SessionStore, SourceId, StoreError,
+    StreamView, SummaryBuilder, TabKind, WindowFillStatus, build_seeit_command,
+    format_summary,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1071,10 +1072,10 @@ struct SearchOp {
     tab_idx: usize,
     regex: Regex,
     direction: SearchDir,
-    /// Skip the current anchor on the very first chunk so `n` after a
-    /// previous match advances rather than re-finding it.  Cleared
-    /// after the first chunk runs.
-    exclusive: bool,
+    /// Whether the very first chunk skips the anchor row so `n` after
+    /// a previous match advances rather than re-finding it.  Reset to
+    /// [`SearchAnchor::Include`] after the first chunk runs.
+    anchor: SearchAnchor,
     /// `parse_stats.bytes` from the streamview at op start.  Subtract
     /// from the current value to get bytes processed by *this* op.
     bytes_at_start: u64,
@@ -1099,7 +1100,7 @@ impl SearchOp {
         tab_idx: usize,
         regex: Regex,
         direction: SearchDir,
-        exclusive: bool,
+        anchor: SearchAnchor,
         bytes_at_start: u64,
         records_at_start: u64,
         total_bytes: u64,
@@ -1108,7 +1109,7 @@ impl SearchOp {
             tab_idx,
             regex,
             direction,
-            exclusive,
+            anchor,
             bytes_at_start,
             records_at_start,
             total_bytes,
@@ -1750,7 +1751,7 @@ impl Tab {
     /// an anchor; returns `None` only when there are no parsed events
     /// at all.  Used by [`Self::advance_time`] to decide what timestamp
     /// to add the step to.
-    fn time_anchor_idx(&self, prefer_forward: bool) -> Option<usize> {
+    fn time_anchor_idx(&self, prefer: Direction) -> Option<usize> {
         // Translate the line-indexed viewport_top to its enclosing
         // record so the search range matches the user's visual
         // position.  When the viewport is parked past the last line
@@ -1776,7 +1777,10 @@ impl Tab {
             .take(backward_take)
             .rev()
             .find_map(|(i, e)| e.as_ref().map(|_| i));
-        if prefer_forward { forward.or(backward) } else { backward.or(forward) }
+        match prefer {
+            Direction::Forward => forward.or(backward),
+            Direction::Backward => backward.or(forward),
+        }
     }
 
     /// Moves `viewport_top` forward (positive `delta`) or backward
@@ -1806,8 +1810,12 @@ impl Tab {
         }
         // Fallback for tabs without a StreamView (test fixtures and
         // Summary tabs): scan the materialized events vector.
-        let go_forward = delta.num_milliseconds() > 0;
-        let Some(anchor_idx) = self.time_anchor_idx(go_forward) else {
+        let dir = if delta.num_milliseconds() > 0 {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        };
+        let Some(anchor_idx) = self.time_anchor_idx(dir) else {
             return;
         };
         let anchor_time = self.events[anchor_idx]
@@ -1817,22 +1825,28 @@ impl Tab {
             .time;
         let target = anchor_time + delta;
         let max = self.max_top(viewport_height, viewport_width);
-        let new_event = if go_forward {
-            self.events.iter().enumerate().skip(anchor_idx).find_map(
-                |(i, e)| {
+        let new_event = match dir {
+            Direction::Forward => self
+                .events
+                .iter()
+                .enumerate()
+                .skip(anchor_idx)
+                .find_map(|(i, e)| {
                     e.as_ref().filter(|ee| ee.event.time >= target).map(|_| i)
-                },
-            )
-        } else {
-            self.events.iter().enumerate().take(anchor_idx + 1).rev().find_map(
-                |(i, e)| {
+                }),
+            Direction::Backward => self
+                .events
+                .iter()
+                .enumerate()
+                .take(anchor_idx + 1)
+                .rev()
+                .find_map(|(i, e)| {
                     e.as_ref().filter(|ee| ee.event.time <= target).map(|_| i)
-                },
-            )
+                }),
         };
         let new_top = match new_event {
             Some(idx) => self.first_line_for_event[idx],
-            None if go_forward => max,
+            None if dir == Direction::Forward => max,
             None => 0,
         };
         self.viewport_top = new_top.min(max);
@@ -2332,7 +2346,7 @@ impl App {
             engine,
             &s.regex,
             s.direction,
-            s.exclusive,
+            s.anchor,
             viewport_height,
             LONG_OP_CHUNK_RECORDS,
             &mut || false,
@@ -2340,7 +2354,7 @@ impl App {
         // After the first chunk subsequent chunks must not skip the
         // anchor again — the streamview's saved resume point handles
         // "where did we leave off."
-        s.exclusive = false;
+        s.anchor = SearchAnchor::Include;
         let stats = view.parse_stats();
         s.bytes_done = stats.bytes.saturating_sub(s.bytes_at_start);
         s.records = stats.records.saturating_sub(s.records_at_start);
@@ -3126,7 +3140,7 @@ impl App {
         self.tabs[active].search =
             Some(TabSearch { pattern: pattern.clone(), regex, matches });
         self.last_search = Some(LastSearch { pattern, direction });
-        self.jump_to_match(direction, /* exclusive = */ false);
+        self.jump_to_match(direction, SearchAnchor::Include);
     }
 
     /// Repeats the most recent search (used by `/<enter>` and
@@ -3140,7 +3154,7 @@ impl App {
         };
         self.ensure_tab_search(&pattern);
         self.last_search = Some(LastSearch { pattern, direction });
-        self.jump_to_match(direction, /* exclusive = */ true);
+        self.jump_to_match(direction, SearchAnchor::Skip);
     }
 
     /// Steps to the next match in `direction` without changing which
@@ -3153,7 +3167,7 @@ impl App {
             None => return,
         };
         self.ensure_tab_search(&pattern);
-        self.jump_to_match(direction, /* exclusive = */ true);
+        self.jump_to_match(direction, SearchAnchor::Skip);
     }
 
     /// Re-derives `tab.search` from `pattern` if it's missing or stale.
@@ -3187,22 +3201,27 @@ impl App {
     /// For tabs without one (test fixtures, Summary): scans the
     /// precomputed `matches` list relative to `viewport_top`.
     ///
-    /// `exclusive`: skip a match at the current position (used by `n`
-    /// repeats so the cursor advances rather than re-landing).
-    fn jump_to_match(&mut self, direction: SearchDirection, exclusive: bool) {
+    /// `anchor`: pass [`SearchAnchor::Skip`] to skip a match at the
+    /// current position (used by `n` repeats so the cursor advances
+    /// rather than re-landing) and [`SearchAnchor::Include`] otherwise.
+    fn jump_to_match(
+        &mut self,
+        direction: SearchDirection,
+        anchor: SearchAnchor,
+    ) {
         self.policy.record(Cadence::Debounced);
         let active = self.active;
         if self.tabs[active].streamview.is_some() {
-            self.jump_to_match_via_streamview(direction, exclusive);
+            self.jump_to_match_via_streamview(direction, anchor);
         } else {
-            self.jump_to_match_via_matches(direction, exclusive);
+            self.jump_to_match_via_matches(direction, anchor);
         }
     }
 
     fn jump_to_match_via_streamview(
         &mut self,
         direction: SearchDirection,
-        exclusive: bool,
+        anchor: SearchAnchor,
     ) {
         let active = self.active;
         let Some(regex) =
@@ -3237,7 +3256,7 @@ impl App {
             active,
             regex,
             dir,
-            exclusive,
+            anchor,
             bytes_at_start,
             records_at_start,
             total_bytes,
@@ -3247,24 +3266,24 @@ impl App {
     fn jump_to_match_via_matches(
         &mut self,
         direction: SearchDirection,
-        exclusive: bool,
+        anchor: SearchAnchor,
     ) {
         let tab = &self.tabs[self.active];
         let Some(search) = &tab.search else {
             return;
         };
         let cur = tab.viewport_top;
-        let target = match (direction, exclusive) {
-            (SearchDirection::Forward, true) => {
+        let target = match (direction, anchor) {
+            (SearchDirection::Forward, SearchAnchor::Skip) => {
                 search.matches.iter().copied().find(|&m| m > cur)
             }
-            (SearchDirection::Forward, false) => {
+            (SearchDirection::Forward, SearchAnchor::Include) => {
                 search.matches.iter().copied().find(|&m| m >= cur)
             }
-            (SearchDirection::Backward, true) => {
+            (SearchDirection::Backward, SearchAnchor::Skip) => {
                 search.matches.iter().rev().copied().find(|&m| m < cur)
             }
-            (SearchDirection::Backward, false) => {
+            (SearchDirection::Backward, SearchAnchor::Include) => {
                 search.matches.iter().rev().copied().find(|&m| m <= cur)
             }
         };
@@ -3300,10 +3319,10 @@ impl App {
 
     /// Advances the active tab forward (or backward) by the current
     /// step.  No-op when the tab holds no parsed events.
-    fn advance_time(&mut self, forward: bool) {
+    fn advance_time(&mut self, dir: Direction) {
         self.policy.record(Cadence::Debounced);
         let mut delta = self.current_step_duration();
-        if !forward {
+        if dir == Direction::Backward {
             delta = -delta;
         }
         let h = self.viewport_height;
@@ -4065,13 +4084,13 @@ impl App {
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                self.advance_time(/* forward = */ true);
+                self.advance_time(Direction::Forward);
             }
             KeyEvent { code: KeyCode::Char('<'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                self.advance_time(/* forward = */ false);
+                self.advance_time(Direction::Backward);
             }
             _ => {}
         }
@@ -5135,9 +5154,9 @@ fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
             // way and copy-paste between them is unambiguous.
             let row = format!(
                 "{} · {} · {} · {}{}",
-                seer::format_time(&bm.created_at, true),
+                seer::format_time(&bm.created_at, seer::ShowDate::Yes),
                 basename,
-                seer::format_time(&bm.display_time, true),
+                seer::format_time(&bm.display_time, seer::ShowDate::Yes),
                 bm.display_msg,
                 name,
             );

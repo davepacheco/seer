@@ -26,7 +26,8 @@ pub use engine::{
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{Filter, FilterParseError, Form, Predicate, TimeOp};
 pub use render::{
-    HostnameDisplay, RenderOpts, format_event, format_time, short_hostname,
+    HostnameDisplay, RenderOpts, ShowDate, format_event, format_time,
+    short_hostname,
 };
 pub use save_policy::{Cadence, SavePolicy};
 pub use session::{
@@ -42,8 +43,8 @@ pub use source::{
 };
 pub use stream::{LogStream, LogStreamId, LogStreamPosition};
 pub use streamview::{
-    ParseStats, RecordKey, RenderedLine, SEARCH_BUDGET, SearchDir,
-    SearchOutcome, StreamView, WindowFillStatus,
+    ParseStats, RecordKey, RenderedLine, SEARCH_BUDGET, SearchAnchor,
+    SearchDir, SearchOutcome, StreamView, WindowFillStatus,
 };
 pub use summary::{
     FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,
