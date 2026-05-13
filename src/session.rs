@@ -231,6 +231,16 @@ pub struct Bookmark {
     pub display_msg: String,
 }
 
+impl IdOrdItem for Bookmark {
+    type Key<'a> = BookmarkId;
+
+    fn key(&self) -> Self::Key<'_> {
+        self.id
+    }
+
+    id_upcast!();
+}
+
 /// What a [`Tab`] displays.
 ///
 /// Today this is a binary distinction: regular log-record view versus
@@ -334,7 +344,15 @@ pub struct Session {
     /// impl of its own.
     #[schemars(with = "Vec<LogStream>")]
     pub streams: IdOrdMap<LogStream>,
-    pub user_bookmarks: BTreeMap<LogStreamId, Vec<Bookmark>>,
+    /// Bookmarks indexed by the stream they target.  Inner buckets are
+    /// [`IdOrdMap`]s so the per-stream uniqueness invariant is encoded
+    /// in the type — `add_bookmark` becomes `insert_unique` and
+    /// `remove_bookmark` an O(log n) lookup rather than a linear scan.
+    /// Each inner bucket serializes as a JSON array via the
+    /// `schemars(with = …)` shim, same trick as [`Self::streams`] and
+    /// [`Self::sources`].
+    #[schemars(with = "BTreeMap<LogStreamId, Vec<Bookmark>>")]
+    pub user_bookmarks: BTreeMap<LogStreamId, IdOrdMap<Bookmark>>,
 }
 
 impl Session {
@@ -362,7 +380,11 @@ impl Session {
 
     /// Inserts `bookmark` into `user_bookmarks` under `stream`.
     pub fn add_bookmark(&mut self, stream: LogStreamId, bookmark: Bookmark) {
-        self.user_bookmarks.entry(stream).or_default().push(bookmark);
+        self.user_bookmarks
+            .entry(stream)
+            .or_default()
+            .insert_unique(bookmark)
+            .expect("bookmark ids are freshly minted at creation time");
     }
 
     /// Removes the bookmark with the given id, returning `true` if it
@@ -374,8 +396,7 @@ impl Session {
         let mut empty_streams: Vec<LogStreamId> = Vec::new();
         let mut removed = false;
         for (stream_id, bms) in self.user_bookmarks.iter_mut() {
-            if let Some(idx) = bms.iter().position(|b| b.id == id) {
-                bms.remove(idx);
+            if bms.remove(&id).is_some() {
                 removed = true;
                 if bms.is_empty() {
                     empty_streams.push(*stream_id);
@@ -448,10 +469,8 @@ mod tests {
             kind: TabKind::Stream,
             cursor: Some(cursor_at(42 * 100)),
         });
-        s.user_bookmarks.insert(
-            stream_id,
-            vec![make_bookmark(0, Some("start")), make_bookmark(100, None)],
-        );
+        s.add_bookmark(stream_id, make_bookmark(0, Some("start")));
+        s.add_bookmark(stream_id, make_bookmark(100, None));
 
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
@@ -467,13 +486,20 @@ mod tests {
 
         let bms = back.user_bookmarks.get(&stream_id).unwrap();
         assert_eq!(bms.len(), 2);
-        assert_eq!(
-            bms[0].name.as_ref().map(|n| n.to_string()),
-            Some("start".to_string())
-        );
-        assert_eq!(bms[0].cursor, cursor_at(0));
-        assert_eq!(bms[1].name, None);
-        assert_eq!(bms[1].cursor, cursor_at(100 * 100));
+        let by_name: Vec<&Bookmark> = bms.iter().collect();
+        let start = by_name
+            .iter()
+            .find(|b| {
+                b.name.as_ref().map(|n| n.to_string()).as_deref()
+                    == Some("start")
+            })
+            .expect("named bookmark round-trips");
+        assert_eq!(start.cursor, cursor_at(0));
+        let unnamed = by_name
+            .iter()
+            .find(|b| b.name.is_none())
+            .expect("unnamed bookmark round-trips");
+        assert_eq!(unnamed.cursor, cursor_at(100 * 100));
     }
 
     #[test]

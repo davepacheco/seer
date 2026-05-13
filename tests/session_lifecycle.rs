@@ -105,8 +105,9 @@ fn inline_save_pattern_keeps_disk_state_current() {
         .get(&stream_id)
         .expect("bookmark bucket should round-trip");
     assert_eq!(bms.len(), 1);
-    assert_eq!(bms[0].id, bookmark_id);
-    assert_eq!(bms[0].display_msg, "marked");
+    let only = bms.iter().next().unwrap();
+    assert_eq!(only.id, bookmark_id);
+    assert_eq!(only.display_msg, "marked");
     assert!(!policy.dirty());
 }
 
@@ -210,8 +211,9 @@ fn resume_flow_recovers_user_bookmarks_and_streams_across_processes() {
     assert!(resumed.streams.get(&stream_id).is_some());
     assert_eq!(resumed.bookmark_count(), 1);
     let bms = resumed.user_bookmarks.get(&stream_id).unwrap();
-    assert_eq!(bms[0].name.as_ref().unwrap(), &bookmark_name);
-    assert_eq!(bms[0].display_msg, "captured");
+    let only = bms.iter().next().unwrap();
+    assert_eq!(only.name.as_ref().unwrap(), &bookmark_name);
+    assert_eq!(only.display_msg, "captured");
 }
 
 #[test]

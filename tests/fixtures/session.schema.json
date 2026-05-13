@@ -60,6 +60,7 @@
       }
     },
     "user_bookmarks": {
+      "description": "Bookmarks indexed by the stream they target.  Inner buckets are [`IdOrdMap`]s so the per-stream uniqueness invariant is encoded in the type — `add_bookmark` becomes `insert_unique` and `remove_bookmark` an O(log n) lookup rather than a linear scan. Each inner bucket serializes as a JSON array via the `schemars(with = …)` shim, same trick as [`Self::streams`] and [`Self::sources`].",
       "type": "object",
       "additionalProperties": {
         "type": "array",

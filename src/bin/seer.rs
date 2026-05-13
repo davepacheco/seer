@@ -8400,11 +8400,12 @@ mod tests {
         let stream_id = a.tabs[0].stream;
         let bms = restored.user_bookmarks.get(&stream_id).unwrap();
         assert_eq!(bms.len(), 2);
-        assert_eq!(
-            bms[0].name.as_ref().map(|n| n.to_string()),
-            Some("first".to_string()),
-        );
-        assert!(bms[1].name.is_none());
+        let names: std::collections::HashSet<Option<String>> = bms
+            .iter()
+            .map(|b| b.name.as_ref().map(|n| n.to_string()))
+            .collect();
+        assert!(names.contains(&Some("first".to_string())));
+        assert!(names.contains(&None));
         // The stream itself made the trip too — opening a fresh App
         // with the restored session would have access to its filter.
         assert!(restored.streams.get(&stream_id).is_some());
@@ -9560,7 +9561,8 @@ mod tests {
         let reloaded = reload_session(&a);
         let bms = reloaded.user_bookmarks.get(&stream_id).unwrap();
         assert_eq!(bms.len(), 1);
-        assert_eq!(bms[0].display_msg, "marked");
+        let only = bms.iter().next().unwrap();
+        assert_eq!(only.display_msg, "marked");
     }
 
     #[test]
@@ -9574,7 +9576,7 @@ mod tests {
             display_msg: "doomed".to_string(),
         };
         a.add_bookmark(None, draft);
-        let id = a.session.user_bookmarks[&stream_id][0].id;
+        let id = a.session.user_bookmarks[&stream_id].iter().next().unwrap().id;
 
         a.delete_bookmark(id);
         assert!(!a.policy.dirty());
