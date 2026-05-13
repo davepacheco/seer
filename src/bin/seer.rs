@@ -8946,23 +8946,6 @@ mod tests {
         assert_eq!(a.active_tab().viewport_top, 1);
     }
 
-    #[test]
-    fn show_extras_persists_into_session_round_trip() {
-        // Toggling extras on must survive a session save/load cycle:
-        // the user shouldn't have to flip F again every time they
-        // re-open the project.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[("k", "1")])]);
-        // multi_line_app starts with extras enabled; flip off so we
-        // exercise a non-default value through the round-trip.
-        a.handle_key(shift('F'));
-        assert!(!a.active_stream().show_extras);
-        let json = serde_json::to_string(&a.session).unwrap();
-        let restored: Session = serde_json::from_str(&json).unwrap();
-        let stream_id = a.tabs[a.active].stream;
-        let stream = restored.streams.get(&stream_id).unwrap();
-        assert!(!stream.show_extras);
-    }
-
     // ---------- show_raw toggle (R) ----------
 
     #[test]
@@ -8995,20 +8978,6 @@ mod tests {
         assert!(!a.active_stream().show_raw);
         assert_eq!(a.active_tab().formatted.len(), 2);
         assert!(a.active_tab().formatted[0].contains("INFO"));
-    }
-
-    #[test]
-    fn show_raw_persists_into_session_round_trip() {
-        // Toggling raw on must survive a session save/load cycle so
-        // the user doesn't have to flip R again every session.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        a.handle_key(shift('R'));
-        assert!(a.active_stream().show_raw);
-        let json = serde_json::to_string(&a.session).unwrap();
-        let restored: Session = serde_json::from_str(&json).unwrap();
-        let stream_id = a.tabs[a.active].stream;
-        let stream = restored.streams.get(&stream_id).unwrap();
-        assert!(stream.show_raw);
     }
 
     // ---------- show_date toggle (D) ----------
@@ -9069,22 +9038,6 @@ mod tests {
         a.handle_key(shift('D'));
         assert_eq!(a.active_tab().viewport_top, 1);
         assert_eq!(a.active_tab().formatted.len(), lines_before);
-    }
-
-    #[test]
-    fn show_date_persists_into_session_round_trip() {
-        // The `D` toggle should round-trip through a session save/load
-        // for the same reason `F` does: the preference outlives one
-        // session.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert!(a.active_stream().show_date);
-        a.handle_key(shift('D'));
-        assert!(!a.active_stream().show_date);
-        let json = serde_json::to_string(&a.session).unwrap();
-        let restored: Session = serde_json::from_str(&json).unwrap();
-        let stream_id = a.tabs[a.active].stream;
-        let stream = restored.streams.get(&stream_id).unwrap();
-        assert!(!stream.show_date);
     }
 
     #[test]
@@ -9270,41 +9223,54 @@ mod tests {
     }
 
     #[test]
-    fn display_fields_persists_into_session_round_trip() {
-        // Open the dialog, switch to full hostname, apply, then
-        // confirm the new value rides through serde.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Short);
-        a.handle_key(key(KeyCode::Char('h')));
-        focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
-        a.handle_key(key(KeyCode::Char(' ')));
-        a.handle_key(key(KeyCode::Enter));
-        assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Full);
-        let json = serde_json::to_string(&a.session).unwrap();
-        let restored: Session = serde_json::from_str(&json).unwrap();
+    fn all_render_opts_persist_into_session_round_trip() {
+        // Flip every `RenderOpts` dimension to a non-default value
+        // and confirm the whole set rides through a serde round-trip.
+        // Item 3's destructure-on-copy in `LogStream::render_opts` /
+        // `set_render_opts` is what enforces propagation when a new
+        // field lands; this test confirms the persistence layer
+        // preserves whatever the stream is carrying.
+        let (mut a, _dir) = multi_line_app(&[(10, "first", &[("k", "1")])]);
         let stream_id = a.tabs[a.active].stream;
-        let stream = restored.streams.get(&stream_id).unwrap();
-        assert_eq!(stream.hostname_display, HostnameDisplay::Full);
-    }
-
-    #[test]
-    fn show_pid_persists_into_session_round_trip() {
-        // pid defaults off; flip via the dialog and verify the new
-        // value rides through serde, including legacy session JSON
-        // that omits the field defaulting to off on load.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
-        let stream_id = a.tabs[a.active].stream;
-        let initial = a.session.streams.get(&stream_id).unwrap();
+        let initial = a.active_stream();
+        assert!(initial.show_extras, "multi_line_app starts with extras on");
+        assert!(!initial.show_raw);
+        assert!(initial.show_date);
         assert!(!initial.show_pid);
         assert!(initial.show_name);
+        assert_eq!(initial.hostname_display, HostnameDisplay::Short);
+
+        // Keybinding toggles for the three with dedicated shortcuts.
+        a.handle_key(shift('F')); // extras off
+        a.handle_key(shift('R')); // raw on
+        a.handle_key(shift('D')); // date off
+        // Dialog handles the rest: pid on, name off, hostname Full.
         a.handle_key(key(KeyCode::Char('h')));
         focus_display_field(&mut a, DisplayFieldItem::Pid);
         a.handle_key(key(KeyCode::Char(' ')));
+        focus_display_field(&mut a, DisplayFieldItem::Name);
+        a.handle_key(key(KeyCode::Char(' ')));
+        focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
+        a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
+
+        let after = a.active_stream();
+        assert!(!after.show_extras);
+        assert!(after.show_raw);
+        assert!(!after.show_date);
+        assert!(after.show_pid);
+        assert!(!after.show_name);
+        assert_eq!(after.hostname_display, HostnameDisplay::Full);
+
         let json = serde_json::to_string(&a.session).unwrap();
         let restored: Session = serde_json::from_str(&json).unwrap();
         let stream = restored.streams.get(&stream_id).unwrap();
+        assert!(!stream.show_extras);
+        assert!(stream.show_raw);
+        assert!(!stream.show_date);
         assert!(stream.show_pid);
+        assert!(!stream.show_name);
+        assert_eq!(stream.hostname_display, HostnameDisplay::Full);
     }
 
     #[test]
