@@ -187,13 +187,6 @@ pub enum SearchDir {
     Backward,
 }
 
-/// Direction of `<` / `>` time navigation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TimeDir {
-    Forward,
-    Backward,
-}
-
 /// Whether [`StreamView::ensure_window_step`] needs more batches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowFillStatus {
@@ -1198,19 +1191,19 @@ impl StreamView {
         viewport_height: u16,
     ) {
         let dir = if delta.num_milliseconds() >= 0 {
-            TimeDir::Forward
+            Direction::Forward
         } else {
-            TimeDir::Backward
+            Direction::Backward
         };
         let Some(anchor_time) = self.anchor_event_time(dir) else {
             return;
         };
         let target = anchor_time + delta;
         match dir {
-            TimeDir::Forward => {
+            Direction::Forward => {
                 self.advance_time_forward(engine, target, viewport_height)
             }
-            TimeDir::Backward => {
+            Direction::Backward => {
                 self.advance_time_backward(engine, target, viewport_height)
             }
         }
@@ -1219,7 +1212,7 @@ impl StreamView {
     /// Returns the timestamp of the closest event to the anchor in
     /// the requested direction (preferring same-direction; falling
     /// back to opposite).  None when no event is in the window.
-    fn anchor_event_time(&self, dir: TimeDir) -> Option<DateTime<Utc>> {
+    fn anchor_event_time(&self, dir: Direction) -> Option<DateTime<Utc>> {
         if self.records.is_empty() {
             return None;
         }
@@ -1228,10 +1221,10 @@ impl StreamView {
             self.records[i].record.event.as_ref().ok().map(|e: &Event| e.time)
         };
         match dir {
-            TimeDir::Forward => (anchor_idx..self.records.len())
+            Direction::Forward => (anchor_idx..self.records.len())
                 .find_map(event_time)
                 .or_else(|| (0..anchor_idx).rev().find_map(event_time)),
-            TimeDir::Backward => {
+            Direction::Backward => {
                 (0..=anchor_idx).rev().find_map(event_time).or_else(|| {
                     ((anchor_idx + 1)..self.records.len()).find_map(event_time)
                 })
