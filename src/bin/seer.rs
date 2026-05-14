@@ -3201,7 +3201,8 @@ impl App {
     }
 
     /// Installs `regex` as the active search on the current tab,
-    /// records it as the most recent search at the app level, and
+    /// records it as the most recent search at the app level,
+    /// promotes it to the front of [`Session::search_history`], and
     /// scrolls so the first match at or after the current viewport
     /// top sits at the top of the viewport.  "At or after" applies
     /// to fresh searches only — repeats and `n`/`N` advance strictly
@@ -3216,20 +3217,24 @@ impl App {
         let matches = self.tabs[active].match_indices(&regex);
         self.tabs[active].search =
             Some(TabSearch { pattern: pattern.clone(), regex, matches });
+        self.session.record_search(&pattern);
         self.last_search = Some(LastSearch { pattern, direction });
         self.jump_to_match(direction, SearchAnchor::Include);
     }
 
     /// Repeats the most recent search (used by `/<enter>` and
     /// `?<enter>` with an empty buffer).  Updates the stored direction
-    /// so a follow-up `n` continues the way the user just chose.  No-op
-    /// if there is no previous search.
+    /// so a follow-up `n` continues the way the user just chose, and
+    /// bumps the pattern to the front of
+    /// [`Session::search_history`] so re-running a search through the
+    /// prompt counts as a use.  No-op if there is no previous search.
     fn repeat_last_search(&mut self, direction: SearchDirection) {
         let pattern = match &self.last_search {
             Some(l) => l.pattern.clone(),
             None => return,
         };
         self.ensure_tab_search(&pattern);
+        self.session.record_search(&pattern);
         self.last_search = Some(LastSearch { pattern, direction });
         self.jump_to_match(direction, SearchAnchor::Skip);
     }
@@ -4077,13 +4082,17 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => {
-                self.dialog = Some(Dialog::search(SearchDirection::Forward));
+                let history = self.session.search_history.clone();
+                self.dialog =
+                    Some(Dialog::search(SearchDirection::Forward, history));
             }
             KeyEvent { code: KeyCode::Char('?'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
             {
-                self.dialog = Some(Dialog::search(SearchDirection::Backward));
+                let history = self.session.search_history.clone();
+                self.dialog =
+                    Some(Dialog::search(SearchDirection::Backward, history));
             }
             // `n` repeats the last search in its stored direction; `N`
             // reverses it for one move (and does NOT update the stored
@@ -4423,6 +4432,20 @@ impl LineEditor {
     }
 }
 
+/// Browsing position within the search prompt's history.
+///
+/// `typed` records what the user had in the editor before they first
+/// pressed Up — it's the prefix used to filter the history snapshot,
+/// and what the editor is restored to when Down walks past the last
+/// matching entry.  `pos` is an index into the dialog's `history`
+/// vector; the editor's buffer always reflects `history[pos]` while a
+/// nav is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchHistoryNav {
+    typed: String,
+    pos: usize,
+}
+
 /// All the data a freshly-created bookmark carries through the
 /// name-dialog flow until the user commits it.  The cursor anchors
 /// navigation; the display fields are cached so the Bookmarks tab can
@@ -4454,10 +4477,22 @@ enum Dialog {
     /// Re-compiles on every change so a regex parse error is visible
     /// live; Enter on a non-empty buffer commits, Enter on an empty
     /// buffer repeats the last search via [`App::repeat_last_search`].
+    /// Up/Down walk the session's [`Session::search_history`] filtered
+    /// by the prefix the user originally typed; see [`SearchHistoryNav`].
     Search {
         editor: LineEditor,
         direction: SearchDirection,
         parse_error: Option<String>,
+        /// Snapshot of [`Session::search_history`] taken when the
+        /// dialog was opened, most-recently-used first.  Copying it
+        /// rather than borrowing keeps the dialog free of a `Session`
+        /// reference.
+        history: Vec<String>,
+        /// `Some` while the user is browsing history (Up has been
+        /// pressed at least once and the editor still shows a
+        /// history entry); `None` while the editor shows freshly
+        /// typed text.
+        nav: Option<SearchHistoryNav>,
     },
     /// Naming a new bookmark just created via the `b` flow.  Carries
     /// the draft (cursor + display fields) the bookmark will anchor
@@ -4638,11 +4673,13 @@ impl Dialog {
         Self::Rename { editor: LineEditor::new(current_name.to_string()) }
     }
 
-    fn search(direction: SearchDirection) -> Self {
+    fn search(direction: SearchDirection, history: Vec<String>) -> Self {
         Self::Search {
             editor: LineEditor::new(String::new()),
             direction,
             parse_error: None,
+            history,
+            nav: None,
         }
     }
 
@@ -4812,6 +4849,32 @@ impl Dialog {
         {
             return DialogResult::Cancel;
         }
+        // Up/Down walk the search-prompt history.  Routed here ahead of
+        // the editor so the line editor's plain-text handler never sees
+        // these keys — they're meaningful only on the search dialog.
+        if let Self::Search { .. } = self {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Up,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.search_history_back();
+                    self.reparse_search();
+                    return DialogResult::Stay;
+                }
+                KeyEvent {
+                    code: KeyCode::Down,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } => {
+                    self.search_history_forward();
+                    self.reparse_search();
+                    return DialogResult::Stay;
+                }
+                _ => {}
+            }
+        }
         let editor_result = match self {
             Self::Filter { editor, .. }
             | Self::Rename { editor }
@@ -4831,10 +4894,78 @@ impl Dialog {
             }
         };
         if let EditAction::Handled = editor_result {
+            // The user pressed a line-editor key while browsing
+            // history; subsequent Up presses should treat the new
+            // buffer as the prefix rather than continuing to walk
+            // matches of the originally-typed text.
+            if let Self::Search { nav, .. } = self {
+                *nav = None;
+            }
             self.reparse_filter();
             self.reparse_search();
         }
         DialogResult::Stay
+    }
+
+    /// Walks one step back through the search history (oldest
+    /// direction).  No-op on non-Search dialogs and on Search dialogs
+    /// whose history has no further entries matching the original
+    /// prefix.
+    fn search_history_back(&mut self) {
+        let Self::Search { editor, history, nav, .. } = self else {
+            return;
+        };
+        if history.is_empty() {
+            return;
+        }
+        let (typed, start): (String, usize) = match nav {
+            Some(n) => (n.typed.clone(), n.pos + 1),
+            None => (editor.text.clone(), 0),
+        };
+        let found = history
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, p)| p.starts_with(&typed))
+            .map(|(i, p)| (i, p.clone()));
+        let Some((pos, pattern)) = found else {
+            return;
+        };
+        *nav = Some(SearchHistoryNav { typed, pos });
+        editor.text = pattern;
+        editor.cursor = editor.text.len();
+    }
+
+    /// Walks one step forward through the search history (newer
+    /// direction).  Past the most-recently-used match restores the
+    /// editor to the prefix the user originally typed.  No-op on
+    /// non-Search dialogs and on Search dialogs not currently
+    /// browsing history.
+    fn search_history_forward(&mut self) {
+        let Self::Search { editor, history, nav, .. } = self else {
+            return;
+        };
+        let Some(n) = nav else {
+            return;
+        };
+        let typed = n.typed.clone();
+        let pos = n.pos;
+        let found = (0..pos)
+            .rev()
+            .find(|&i| history[i].starts_with(&typed))
+            .map(|i| (i, history[i].clone()));
+        match found {
+            Some((new_pos, pattern)) => {
+                *nav = Some(SearchHistoryNav { typed, pos: new_pos });
+                editor.text = pattern;
+                editor.cursor = editor.text.len();
+            }
+            None => {
+                editor.text = typed;
+                editor.cursor = editor.text.len();
+                *nav = None;
+            }
+        }
     }
 
     fn try_apply(&mut self) -> DialogResult {
@@ -4851,7 +4982,7 @@ impl Dialog {
             Self::Rename { editor } => {
                 DialogResult::ApplyRename(editor.text.clone())
             }
-            Self::Search { editor, direction, parse_error } => {
+            Self::Search { editor, direction, parse_error, .. } => {
                 if editor.text.is_empty() {
                     DialogResult::RepeatSearch(*direction)
                 } else {
@@ -4978,6 +5109,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             ("?", "backward search"),
             ("n", "repeat last search"),
             ("N", "repeat last search, reversed"),
+            ("Up, Down", "walk search history (at the search prompt)"),
         ],
     },
     HelpSection {
@@ -5374,7 +5506,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 
     // Bottom strip: search prompt or footer, never both.
     match app.dialog.as_ref() {
-        Some(Dialog::Search { editor, direction, parse_error }) => {
+        Some(Dialog::Search { editor, direction, parse_error, .. }) => {
             render_search_prompt(
                 frame,
                 editor,
@@ -7345,6 +7477,122 @@ mod tests {
         assert_eq!(a.dialog.as_ref().unwrap().editor().unwrap().text, "");
         a.handle_key(key(KeyCode::Backspace));
         assert!(a.dialog.is_some(), "filter dialog should stay open");
+    }
+
+    /// Returns the current search-dialog editor buffer, panicking
+    /// (with a clear message) if the dialog isn't open or isn't a
+    /// search dialog.  Keeps the history navigation tests compact.
+    fn search_buffer(a: &App) -> &str {
+        match a.dialog.as_ref().expect("search dialog should be open") {
+            Dialog::Search { editor, .. } => editor.text.as_str(),
+            _ => panic!("expected Dialog::Search"),
+        }
+    }
+
+    #[test]
+    fn applying_search_records_pattern_in_session_history() {
+        let mut a = search_app();
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.session.search_history, vec!["alpha"]);
+
+        // A second, distinct search lands at the front.
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "beta");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.session.search_history, vec!["beta", "alpha"]);
+
+        // Re-running "alpha" moves it back to the front rather than
+        // duplicating it.
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "alpha");
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.session.search_history, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn search_dialog_up_walks_history_oldest_direction() {
+        let mut a = search_app();
+        a.session.search_history =
+            vec!["gamma".into(), "beta".into(), "alpha".into()];
+        a.handle_key(key(KeyCode::Char('/')));
+        // No prefix typed: Up walks every entry in MRU order.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "gamma");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "beta");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "alpha");
+        // Past the end: stays on the oldest entry.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "alpha");
+    }
+
+    #[test]
+    fn search_dialog_down_restores_originally_typed_text() {
+        let mut a = search_app();
+        a.session.search_history = vec!["gamma".into(), "beta".into()];
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "ne");
+        // No history entry starts with "ne", so Up should be a no-op
+        // and Down with nothing to walk back to is also a no-op.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "ne");
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(search_buffer(&a), "ne");
+    }
+
+    #[test]
+    fn search_dialog_up_filters_history_by_typed_prefix() {
+        let mut a = search_app();
+        a.session.search_history = vec![
+            "nexus".into(),
+            "beta".into(),
+            "name=nexus".into(),
+            "needle".into(),
+        ];
+        a.handle_key(key(KeyCode::Char('/')));
+        type_into(a.dialog.as_mut().unwrap(), "ne");
+        // Up walks only entries that start with "ne".
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "nexus");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "needle");
+        // Past the end: stays on "needle".
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "needle");
+        // Down walks back through the same matches.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(search_buffer(&a), "nexus");
+        // Down past the front: the editor returns to "ne", the
+        // prefix the user originally typed.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(search_buffer(&a), "ne");
+        // And subsequent Down does nothing.
+        a.handle_key(key(KeyCode::Down));
+        assert_eq!(search_buffer(&a), "ne");
+    }
+
+    #[test]
+    fn editing_after_history_walk_uses_new_buffer_as_prefix() {
+        // Bring "alpha" into the editor via history, then append `1`.
+        // The next Up press should look for entries starting with
+        // "alpha1" (none here), not continue walking "alpha"-prefixed
+        // history.
+        let mut a = search_app();
+        a.session.search_history =
+            vec!["alpha2".into(), "alpha".into(), "beta".into()];
+        a.handle_key(key(KeyCode::Char('/')));
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "alpha2");
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "alpha");
+        a.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(search_buffer(&a), "alpha1");
+        // No history entry begins with "alpha1"; Up is a no-op.
+        a.handle_key(key(KeyCode::Up));
+        assert_eq!(search_buffer(&a), "alpha1");
     }
 
     #[test]

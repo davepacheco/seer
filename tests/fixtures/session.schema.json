@@ -8,6 +8,7 @@
     "id",
     "last_pid",
     "last_saved_at",
+    "search_history",
     "sources",
     "streams",
     "tabs",
@@ -38,6 +39,13 @@
       "description": "When the saver last successfully wrote this session to disk.",
       "type": "string",
       "format": "date-time"
+    },
+    "search_history": {
+      "description": "Recently submitted search patterns, most-recently-used first. Capped at [`MAX_SEARCH_HISTORY`].  Populated by successful search submissions in the TUI; used to drive the search prompt's history navigation (Up/Down).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     },
     "sources": {
       "description": "Sources this session was opened against.  Stored as an [`IdOrdMap`] keyed by id so the uniqueness invariant is encoded in the type, but serialized as a JSON array (same as [`Self::streams`]) — the `schemars(with = …)` annotation surfaces that shape to the schema generator, which has no `JsonSchema` impl for `IdOrdMap` of its own.",

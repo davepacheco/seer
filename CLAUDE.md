@@ -217,55 +217,6 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## TODO list
 
-### Summarizing fields in the view
-
-When we process each log, keep track of distinct top-level JSON field names.  Keep only the top 10.
-
-Let's add a new *kind* of tab, called a summary.  If the user hits `S` in the main view, a new tab is opened, starting with the filter dialog like usual.  But instead of displaying individual records, it displays summary stats.  For each of the top 10 fields (unioned across all sources), draw a histogram showing the top N distinct values, along with a histogram.  Here's inspiration, though I'd rather you put the most common values up top.
-
-```
-              key  ------------- Distribution ------------- count
-           getpid |                                         1
-        getrandom |                                         1
-        getrlimit |                                         1
-         lwp_exit |                                         1
-           munmap |                                         1
-        nanosleep |                                         1
-            rexit |                                         1
-         schedctl |                                         1
-           sysi86 |                                         1
- lwp_cond_broadcast |                                         3
-             mmap |                                         4
-         readlink |                                         4
-      resolvepath |                                         4
-             stat |                                         4
-        sigaction |                                         5
-        sysconfig |                                         5
-              brk |                                         9
-             open |                                         10
-       setcontext |                                         12
-            gtime |                                         15
-            pread |                                         39
-             read |                                         84
-            write |▏                                        96
-         lwp_park |▏                                        152
-          pollsys |▏                                        168
-         p_online |▎                                        256
-      lwp_sigmask |▋                                        505
-            fcntl |█▉                                       1370
-           openat |█▉                                       1370
-            fstat |█▉                                       1378
-            close |█▉                                       1379
-         getdents |█▉                                       1382
-            ioctl |█████▍                                   3836
-          fstatat |██████████▍                              7310
-            lstat |████████████▍                            8754
-```
-
-"Time" should be treated specially.  Take the whole time range represented by the log file and figure out which of these intervals would produce about 30 buckets: 1m, 1h, 1d.  Then create buckets with that interval size and show the count of records in each bucket (again, with a histogram).
-
-Make sure there are comprehensive tests for the accuracy of this display.
-
 ### "Create filter" dialog
 
 I want to make the "create filter" dialog easier to use.  I want folks to be presented with:
@@ -284,7 +235,13 @@ It should still be possible to edit the filter string directly.  If it's parseab
 
 New tabs should still open with this dialog.
 
-### TODO
+### Misc TODO
+
+Relatively straightforward:
+
+- press 'Y' over bookmark should open the `seeit` command dialog too
+
+Other:
 
 - parse SMF entries
 - parse CockroachDB log
@@ -295,15 +252,12 @@ New tabs should still open with this dialog.
   - super slow navigation after that (not as slow as re-parsing everything)
     - even showing all fields with F is super slow
   - setting a bookmark, closing the tap, and going to that bookmark is fast
-- search history
 - long-op coverage gaps left after the `G`/`g`/filter rebuild work:
   - `scroll_lines` at the window edge still uses unbounded `extend_*_batch`, so the first `k` after `G` on a selective filter can still freeze briefly.  Same long-op pattern as `LongOp::Seek` would address it.
   - `<` / `>` (`advance_time`) wasn't long-op'd; large time jumps under selective filters will freeze the UI.
   - `SeekFinalize::FrontOrBackFallback` runs `view.ensure_window` synchronously when the forward-from-cursor fetch came up empty.  Fine for typical bookmark navigation; a pathological filter with no matches anywhere could still freeze during finalize.
 - add a marker in the logstream where there are bookmarks
 - should bookmarks be navigable from any tab?
-- press 'Y' over bookmark should open the `seeit` command dialog too
 - loading saved session takes a long time with no feedback
 - creating new tab when you have a filter applied takes a long time with no feedback
-- bookmarks should be listed in timestamp order
 - when entering any mode that involves selection, there should be some instructions about it

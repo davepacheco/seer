@@ -362,7 +362,17 @@ pub struct Session {
     /// [`Self::sources`].
     #[schemars(with = "BTreeMap<LogStreamId, Vec<Bookmark>>")]
     pub user_bookmarks: BTreeMap<LogStreamId, IdOrdMap<Bookmark>>,
+    /// Recently submitted search patterns, most-recently-used first.
+    /// Capped at [`MAX_SEARCH_HISTORY`].  Populated by successful
+    /// search submissions in the TUI; used to drive the search
+    /// prompt's history navigation (Up/Down).
+    pub search_history: Vec<String>,
 }
+
+/// Maximum number of distinct search patterns retained in
+/// [`Session::search_history`].  When the history is at capacity and a
+/// new pattern is recorded, the oldest entry falls off the end.
+pub const MAX_SEARCH_HISTORY: usize = 30;
 
 impl Session {
     /// Returns a fresh session with a new random id, the current
@@ -384,7 +394,26 @@ impl Session {
             tabs: Vec::new(),
             streams: IdOrdMap::new(),
             user_bookmarks: BTreeMap::new(),
+            search_history: Vec::new(),
         }
+    }
+
+    /// Records `pattern` as the most recently used search.
+    ///
+    /// If an equal entry already exists it is moved to the front
+    /// (rather than duplicated); if the history is at
+    /// [`MAX_SEARCH_HISTORY`] the oldest entry is dropped.  Empty
+    /// patterns are not recorded.
+    pub fn record_search(&mut self, pattern: &str) {
+        if pattern.is_empty() {
+            return;
+        }
+        if let Some(pos) = self.search_history.iter().position(|p| p == pattern)
+        {
+            self.search_history.remove(pos);
+        }
+        self.search_history.insert(0, pattern.to_string());
+        self.search_history.truncate(MAX_SEARCH_HISTORY);
     }
 
     /// Inserts `bookmark` into `user_bookmarks` under `stream`.
@@ -556,5 +585,42 @@ mod tests {
     fn remove_unknown_bookmark_returns_false() {
         let mut s = Session::new();
         assert!(!s.remove_bookmark(BookmarkId::new_v4()));
+    }
+
+    #[test]
+    fn record_search_orders_most_recent_first() {
+        let mut s = Session::new();
+        s.record_search("alpha");
+        s.record_search("beta");
+        s.record_search("gamma");
+        assert_eq!(s.search_history, vec!["gamma", "beta", "alpha"]);
+    }
+
+    #[test]
+    fn record_search_moves_duplicates_to_front_without_duplicating() {
+        let mut s = Session::new();
+        s.record_search("alpha");
+        s.record_search("beta");
+        s.record_search("alpha");
+        assert_eq!(s.search_history, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn record_search_caps_at_max_history() {
+        let mut s = Session::new();
+        for i in 0..(MAX_SEARCH_HISTORY + 5) {
+            s.record_search(&format!("p{i}"));
+        }
+        assert_eq!(s.search_history.len(), MAX_SEARCH_HISTORY);
+        // Most recent entry sits at the front; oldest five fell off.
+        assert_eq!(s.search_history[0], format!("p{}", MAX_SEARCH_HISTORY + 4));
+        assert_eq!(s.search_history[MAX_SEARCH_HISTORY - 1], format!("p{}", 5));
+    }
+
+    #[test]
+    fn record_search_ignores_empty_patterns() {
+        let mut s = Session::new();
+        s.record_search("");
+        assert!(s.search_history.is_empty());
     }
 }
