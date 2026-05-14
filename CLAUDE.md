@@ -237,15 +237,7 @@ New tabs should still open with this dialog.
 
 ### Misc TODO
 
-Relatively straightforward:
-
-- press 'Y' over bookmark should open the `seeit` command dialog too
-
-Other:
-
-- parse SMF entries
-- parse CockroachDB log
-- need to teach Claude about slog_error_chain -- see SourceError
+Polish / bugs:
 - confirmation dialog boxes need work
 - second search (e.g., by time):
   - no feedback
@@ -256,8 +248,15 @@ Other:
   - `scroll_lines` at the window edge still uses unbounded `extend_*_batch`, so the first `k` after `G` on a selective filter can still freeze briefly.  Same long-op pattern as `LongOp::Seek` would address it.
   - `<` / `>` (`advance_time`) wasn't long-op'd; large time jumps under selective filters will freeze the UI.
   - `SeekFinalize::FrontOrBackFallback` runs `view.ensure_window` synchronously when the forward-from-cursor fetch came up empty.  Fine for typical bookmark navigation; a pathological filter with no matches anywhere could still freeze during finalize.
-- add a marker in the logstream where there are bookmarks
-- should bookmarks be navigable from any tab?
 - loading saved session takes a long time with no feedback
 - creating new tab when you have a filter applied takes a long time with no feedback
 - when entering any mode that involves selection, there should be some instructions about it
+
+Features:
+- parse SMF entries
+- parse CockroachDB log
+- add a marker in the logstream where there are bookmarks
+- should bookmarks be navigable from any tab?
+
+Code cleanup:
+- need to teach Claude about slog_error_chain -- see SourceError
