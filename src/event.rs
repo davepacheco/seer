@@ -18,15 +18,13 @@ use std::fmt;
 /// A single log record.
 ///
 /// Field set tracks the bunyan format: a fixed core (time, level, name,
-/// hostname, pid, msg, v) plus arbitrary additional structured fields
-/// captured in `extra`.
+/// hostname, pid, msg, v) plus arbitrary additional structured fields captured
+/// in `extra`.
 ///
-/// Deserialization tolerates duplicate keys: the first occurrence of
-/// each key wins and subsequent duplicates are silently dropped.
-/// Real-world Oxide bunyan logs occasionally repeat keys when nested
-/// slog scopes both attach a context value (e.g. two layers each
-/// setting `component`); failing the whole record over that loses more
-/// information than it preserves.
+/// Deserialization tolerates duplicate keys: the first occurrence of each key
+/// wins and subsequent duplicates are silently dropped.  Real-world Oxide
+/// bunyan logs repeat keys when nested slog scopes both attach a context value
+/// (e.g. two layers each setting `component`).
 #[derive(Debug, Clone)]
 pub struct Event {
     pub time: DateTime<Utc>,
@@ -35,8 +33,6 @@ pub struct Event {
     pub hostname: Hostname,
     pub pid: Pid,
     pub msg: String,
-    /// bunyan record-format version
-    pub v: u32,
     /// any additional structured fields beyond the bunyan core
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -99,6 +95,17 @@ impl<'de> Deserialize<'de> for Event {
                         },
                     }
                 }
+
+                // Only v0 bunyan records are supported.
+                let v: u32 =
+                    v.ok_or_else(|| serde::de::Error::missing_field("v"))?;
+                if v != 0 {
+                    return Err(serde::de::Error::unknown_variant(
+                        &v.to_string(),
+                        &["0"],
+                    ));
+                }
+
                 Ok(Event {
                     time: time.ok_or_else(|| {
                         serde::de::Error::missing_field("time")
@@ -118,7 +125,6 @@ impl<'de> Deserialize<'de> for Event {
                     msg: msg.ok_or_else(|| {
                         serde::de::Error::missing_field("msg")
                     })?,
-                    v: v.ok_or_else(|| serde::de::Error::missing_field("v"))?,
                     extra,
                 })
             }
@@ -130,8 +136,8 @@ impl<'de> Deserialize<'de> for Event {
 
 /// Bunyan log level.
 ///
-/// Variants are ordered from least to most severe so derived `Ord` matches
-/// severity (e.g. `Level::Warn > Level::Info`).
+/// Variants are ordered from least to most severe so that the derived `Ord`
+/// matches severity (e.g. `Level::Warn > Level::Info`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
     Trace,
@@ -143,14 +149,9 @@ pub enum Level {
 }
 
 /// Single source of truth for the bunyan numeric ↔ [`Level`] mapping.
-/// Walked by [`Level::as_bunyan_number`], the [`TryFrom<u8>`] impl, and
-/// the [`schemars::JsonSchema`] impl below.  Ordered by ascending
-/// severity, matching the `Level` variant order.
-///
-/// The pair is `(bunyan number, level)`; adding a new severity is a
-/// one-line edit here.  The round-trip test
-/// `tests::level_round_trip_numbers` catches a missing entry by
-/// failing `as_bunyan_number` for the unlisted variant.
+// Ordered by ascending severity, matching the `Level` variant order.
+// The round-trip test `tests::level_round_trip_numbers` catches a
+// missing entry by failing `as_bunyan_number` for the unlisted variant.
 const BUNYAN_LEVELS: &[(u8, Level)] = &[
     (10, Level::Trace),
     (20, Level::Debug),
@@ -192,8 +193,8 @@ impl fmt::Display for Level {
     }
 }
 
-/// Error returned when a numeric value does not correspond to a bunyan
-/// log level.
+/// Error returned when a numeric value does not correspond to a bunyan log
+/// level.
 #[derive(Debug, thiserror::Error)]
 #[error("unknown bunyan log level: {0}")]
 pub struct UnknownLevel(pub u8);
@@ -331,7 +332,6 @@ mod tests {
         assert_eq!(event.level, Level::Info);
         assert_eq!(event.name.to_string(), "myapp");
         assert_eq!(event.msg, "hello world");
-        assert_eq!(event.v, 0);
         assert_eq!(
             event.extra.get("component").and_then(|v| v.as_str()),
             Some("Nexus")

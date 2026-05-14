@@ -142,23 +142,12 @@
     },
     "CoreField": {
       "description": "One of the bunyan log record's structured top-level fields.\n\nEnumerated rather than carried as a string so that [`crate::source::SourceMetadata::excludes_all`] (and the per-record [`field_matches`] helper) can match exhaustively — adding a new core field is a compile error in those methods until threaded through.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "Name",
-            "Hostname",
-            "Pid",
-            "Msg"
-          ]
-        },
-        {
-          "description": "Bunyan version field (`v`).  Not usually filtered on but modeled for consistency with the other core fields.",
-          "type": "string",
-          "enum": [
-            "V"
-          ]
-        }
+      "type": "string",
+      "enum": [
+        "Name",
+        "Hostname",
+        "Pid",
+        "Msg"
       ]
     },
     "EventPredicate": {

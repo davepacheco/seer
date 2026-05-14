@@ -165,9 +165,6 @@ pub enum CoreField {
     Hostname,
     Pid,
     Msg,
-    /// Bunyan version field (`v`).  Not usually filtered on but
-    /// modeled for consistency with the other core fields.
-    V,
 }
 
 impl CoreField {
@@ -179,7 +176,6 @@ impl CoreField {
             CoreField::Hostname => "hostname",
             CoreField::Pid => "pid",
             CoreField::Msg => "msg",
-            CoreField::V => "v",
         }
     }
 }
@@ -206,7 +202,6 @@ impl From<&str> for FieldName {
             "hostname" => FieldName::Core(CoreField::Hostname),
             "pid" => FieldName::Core(CoreField::Pid),
             "msg" => FieldName::Core(CoreField::Msg),
-            "v" => FieldName::Core(CoreField::V),
             other => FieldName::Extra(other.to_string()),
         }
     }
@@ -377,9 +372,6 @@ fn field_matches(event: &Event, name: &FieldName, value: &str) -> bool {
         }
         FieldName::Core(CoreField::Pid) => event.pid.to_string() == value,
         FieldName::Core(CoreField::Msg) => event.msg == value,
-        // Bunyan version isn't usually filtered, but it's a core
-        // field so handle it consistently.
-        FieldName::Core(CoreField::V) => event.v.to_string() == value,
         // Anything else is in `extra`.  Strings compare directly;
         // bools and numbers compare against the obvious lexical form
         // the user would type after seeing the JSON
@@ -1691,7 +1683,6 @@ mod tests {
             Just(FieldName::Core(CoreField::Hostname)),
             Just(FieldName::Core(CoreField::Pid)),
             Just(FieldName::Core(CoreField::Msg)),
-            Just(FieldName::Core(CoreField::V)),
             prop::sample::select(vec!["build", "component", "absent"])
                 .prop_map(|s| FieldName::Extra(s.to_string())),
         ]

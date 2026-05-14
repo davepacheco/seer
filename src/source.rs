@@ -287,7 +287,7 @@ impl SourceMetadata {
                     None => continue,
                 },
                 FieldName::Core(
-                    CoreField::Pid | CoreField::Msg | CoreField::V,
+                    CoreField::Pid | CoreField::Msg
                 )
                 | FieldName::Extra(_) => continue,
             };

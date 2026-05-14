@@ -389,7 +389,6 @@ fn iter_fields(event: &Event) -> Vec<(String, serde_json::Value)> {
         .unwrap_or(serde_json::Value::String(pid_str));
     out.push(("pid".to_string(), pid_value));
     out.push(("msg".to_string(), serde_json::Value::String(event.msg.clone())));
-    out.push(("v".to_string(), json!(event.v)));
     for (k, v) in &event.extra {
         out.push((k.clone(), v.clone()));
     }

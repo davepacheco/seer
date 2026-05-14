@@ -7,18 +7,7 @@
 //! These are the smallest, most persistent shapes in the codebase: a
 //! [`Cursor`] is a `(source_id → byte_offset)` snapshot that the merge
 //! stepper resumes from, the bookmarks list refers to, and the session
-//! serializes to disk.  Keeping them in a top-level module (rather than
-//! nested under `engine::merge`, which is a low-level merge
-//! implementation) makes the layering match the data: the session and
-//! the streamview can talk about positions without depending on the
-//! merge implementation.
-//!
-//! [`SourceId`], [`ByteOffset`], and [`ByteLen`] live here too —
-//! they're the primitive position types that the [`Cursor`] and
-//! [`LogStreamPosition`] are built on, and putting them at this layer
-//! lets `crate::filter` reference [`SourceId`] without taking a
-//! dependency on `crate::source` (closing the
-//! `filter ↔ source` cycle that the old placement created).
+//! serializes to disk.
 
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
@@ -58,9 +47,7 @@ pub struct SourceId(String);
 ///
 /// A newtype around `u64` so an offset can't be silently confused
 /// with a length, count, or any other unsigned quantity that turns up
-/// in adjacent code.  `Copy + Ord` so it can be used as a `BTreeMap`
-/// key (the engine's eventual merged-stream cursor is a
-/// `BTreeMap<SourceId, ByteOffset>`).
+/// in adjacent code.
 ///
 /// Convention: an offset always names the byte at which the *next*
 /// record would start when scanning forward — equivalently, the byte
@@ -104,9 +91,7 @@ impl ByteOffset {
 /// two in any other shape is a compile error, which catches the
 /// otherwise-invisible bug of (e.g.) adding two offsets.
 ///
-/// `#[serde(transparent)]` so persisted shapes are bare `u64`s on
-/// disk — switching a previously-`u64` field to `ByteLen` is a
-/// type-only change with no schema impact.
+/// `#[serde(transparent)]` so persisted shapes are bare `u64`s on disk.
 #[derive(
     Debug,
     Clone,
@@ -277,10 +262,6 @@ impl Cursor {
 /// that adding/removing predicates from the active filter never moves
 /// what a saved position refers to: only the row index that position
 /// resolves to in a filtered view changes.
-///
-/// The fields are private so future representations (e.g. a content
-/// fingerprint to survive file rewrites) can be added without breaking
-/// callers.
 #[derive(
     Debug,
     Clone,
