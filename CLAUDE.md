@@ -251,6 +251,7 @@ Polish / bugs:
 - loading saved session takes a long time with no feedback
 - creating new tab when you have a filter applied takes a long time with no feedback
 - when entering any mode that involves selection, there should be some instructions about it
+- should look at more than just one first/last record in source in case there are SMF records
 
 Features:
 - parse SMF entries
@@ -260,3 +261,4 @@ Features:
 
 Code cleanup:
 - need to teach Claude about slog_error_chain -- see SourceError
+- need a better way to report out-of-order sources

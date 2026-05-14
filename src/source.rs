@@ -29,9 +29,7 @@ use std::iter;
 ///
 /// `Forward` reads records starting at the requested offset and
 /// advancing toward EOF.  `Backward` reads the record whose end is at
-/// the requested offset and walks toward BOF.  Using an enum (rather
-/// than a `bool reverse` parameter) keeps call sites self-documenting
-/// and makes the code unambiguous to read at a distance.
+/// the requested offset and walks toward BOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Forward,
@@ -68,8 +66,7 @@ pub struct QueryRecord {
 }
 
 /// One scan's worth of records plus accounting that lets the caller
-/// drive a progress bar and resume cleanly when a walks budget is in
-/// effect.
+/// drive a progress bar and resume cleanly when querying in steps.
 ///
 /// `walked_bytes` is the total bytes the scan consumed off disk —
 /// including records that were rejected by the filter and never made
@@ -244,25 +241,22 @@ pub struct SourceMetadata {
 }
 
 impl SourceMetadata {
-    /// Returns `true` iff this source provably contains no events
-    /// matching `filter`, given only the metadata.
+    /// Returns `true` iff this source is assumed to contain no events matching
+    /// `filter`, given only the metadata.
     ///
     /// Today this checks `name` and `hostname` equality predicates
-    /// (`name=Nexus`, `hostname!=foo`, etc.) against the recorded
-    /// first-record values.  When the metadata's value disagrees with
-    /// what such a predicate would accept, the predicate is taken to
-    /// reject every event in the source and the source is excluded
-    /// without ever being read.
+    /// (`name=Nexus`, `hostname!=foo`, etc.) against the recorded first-record
+    /// values.  When the metadata's value disagrees with what such a predicate
+    /// would accept, the predicate is taken to reject every event in the source
+    /// and the source is excluded without ever being read.
     ///
-    /// This is heuristic.  It assumes that `name` and `hostname` are
-    /// uniform within a source, which is true of every Oxide bunyan
-    /// log file in practice — each file is one component on one
-    /// host — but a hand-mixed file would defeat the heuristic.  The
-    /// cost of being wrong is missed records, not incorrect output
-    /// from records that *are* returned.  Predicates we can't
-    /// evaluate at this layer (`level`, `msg=~`, extra-field
-    /// matchers, etc.) are simply ignored here and applied during
-    /// the per-record scan.
+    /// This is heuristic.  It assumes that `name` and `hostname` are uniform
+    /// within a source, which is generally true in practice — each file is one
+    /// component on one host — but a hand-mixed file would defeat the
+    /// heuristic.  The cost of being wrong is missed records, not incorrect
+    /// output from records that *are* returned.  Predicates we can't evaluate
+    /// at this layer (`level`, `msg=~`, extra-field matchers, etc.) are simply
+    /// ignored here and applied during the per-record scan.
     pub fn excludes_all(&self, filter: &Filter) -> bool {
         for predicate in filter.predicates() {
             let Predicate::Event(EventPredicate::FieldEquals {

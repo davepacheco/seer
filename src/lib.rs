@@ -31,7 +31,7 @@ pub use filter::{
 };
 pub use position::{ByteLen, ByteOffset, LogStreamPosition, SourceId};
 pub use render::{
-    HostnameDisplay, RenderOpts, ShowDate, format_event, format_time,
+    HostnameDisplay, RenderOpts, TimestampDisplay, format_event, format_time,
     short_hostname,
 };
 pub use save_policy::{Cadence, SavePolicy};

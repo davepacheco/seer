@@ -32,10 +32,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 /// How [`format_event`] should render the bunyan `hostname` field.
-///
-/// Selected via the `h` field-display dialog in the TUI and persisted
-/// on the host [`crate::stream::LogStream`] so the choice outlives a
-/// session.
 #[derive(
     Clone,
     Copy,
@@ -102,36 +98,32 @@ pub fn short_hostname(hostname: &str) -> String {
 }
 
 /// Whether [`format_time`] should include the `YYYY-MM-DD` date
-/// prefix on the rendered timestamp.  Replaces a bare `bool` so call
-/// sites read self-documentingly.
+/// prefix on the rendered timestamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShowDate {
-    Yes,
-    No,
-}
-
-impl From<bool> for ShowDate {
-    fn from(b: bool) -> Self {
-        if b { Self::Yes } else { Self::No }
-    }
+pub enum TimestampDisplay {
+    DateAndTime,
+    TimeOnly,
 }
 
 /// Formats a UTC timestamp the way both binaries display it.
 ///
-/// With [`ShowDate::Yes`] the result is a full ISO-8601 date-time at
-/// millisecond precision (`2026-04-30T15:30:00.743Z`); with
-/// [`ShowDate::No`] the date prefix is stripped, leaving only
-/// `15:30:00.743Z`.  The `Z` suffix is preserved either way so the
-/// value is still unambiguously UTC when the user copies it out.
-pub fn format_time(time: &DateTime<Utc>, show_date: ShowDate) -> String {
+/// With [`TimestampDisplay::DateAndTime`] the result is a full ISO-8601
+/// date-time at millisecond precision (`2026-04-30T15:30:00.743Z`); with
+/// [`TimeStampDisplay::TimeOnly`] the date prefix is stripped, leaving only
+/// `15:30:00.743Z`.  The `Z` suffix is preserved either way so the value is
+/// still unambiguously UTC when the user copies it out.
+pub fn format_time(
+    time: &DateTime<Utc>,
+    show_date: TimestampDisplay,
+) -> String {
     let pattern = match show_date {
-        ShowDate::Yes => "%Y-%m-%dT%H:%M:%S%.3fZ",
-        ShowDate::No => "%H:%M:%S%.3fZ",
+        TimestampDisplay::DateAndTime => "%Y-%m-%dT%H:%M:%S%.3fZ",
+        TimestampDisplay::TimeOnly => "%H:%M:%S%.3fZ",
     };
     time.format(pattern).to_string()
 }
 
-/// Bundle of per-stream display knobs threaded through [`format_event`].
+/// Bundle of per-stream display knobs
 ///
 /// Lives in `render` rather than `stream` because it's the function
 /// signature that needs the shape; [`crate::stream::LogStream`] holds
@@ -139,10 +131,7 @@ pub fn format_time(time: &DateTime<Utc>, show_date: ShowDate) -> String {
 /// over via [`crate::stream::LogStream::render_opts`].
 ///
 /// Defaults match what a fresh stream renders: extras hidden, date
-/// prefix shown, short hostname, name shown, pid hidden.  Pid is off by
-/// default because Oxide processes typically restart often enough that
-/// the number is noise; users opt in via the field-display dialog when
-/// they need it.
+/// prefix shown, short hostname, name shown, pid hidden.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderOpts {
     pub show_extras: bool,
@@ -212,9 +201,15 @@ pub fn format_event(event: &Event, opts: &RenderOpts) -> Vec<String> {
         (false, true) => format!("{} ", event.pid),
         (false, false) => String::new(),
     };
+    let timestamp_format = if opts.show_date {
+        TimestampDisplay::DateAndTime
+    } else {
+        TimestampDisplay::TimeOnly
+    };
+
     lines.push(format!(
         "{} {}{}{:<5} {}",
-        format_time(&event.time, opts.show_date.into()),
+        format_time(&event.time, timestamp_format),
         host_field,
         proc_field,
         event.level,
@@ -584,10 +579,13 @@ mod tests {
         let time: DateTime<Utc> =
             "2026-04-30T15:30:00.743162222Z".parse().unwrap();
         assert_eq!(
-            format_time(&time, ShowDate::Yes),
+            format_time(&time, TimestampDisplay::DateAndTime),
             "2026-04-30T15:30:00.743Z",
         );
-        assert_eq!(format_time(&time, ShowDate::No), "15:30:00.743Z",);
+        assert_eq!(
+            format_time(&time, TimestampDisplay::TimeOnly),
+            "15:30:00.743Z",
+        );
     }
 
     #[test]

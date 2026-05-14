@@ -5647,7 +5647,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 }
 
 /// Width (in display columns) of a timestamp rendered by
-/// [`seer::format_time`] with [`seer::ShowDate::Yes`] —
+/// [`seer::format_time`] with [`seer::TimestampDisplay::DateAndTime`] —
 /// `2026-04-30T15:30:00.743Z`.  Used to reserve the leftmost column of
 /// each Bookmarks-tab entry.
 const BOOKMARK_TS_WIDTH: usize = 24;
@@ -5724,10 +5724,16 @@ fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
         let msg_rows = wrap_to_width(&app_and_msg, msg_col_w);
         let created_line = format!(
             "bookmark created at {}",
-            seer::format_time(&bm.created_at, seer::ShowDate::Yes),
+            seer::format_time(
+                &bm.created_at,
+                seer::TimestampDisplay::DateAndTime
+            ),
         );
         let total_rows = name_rows.len().max(msg_rows.len() + 1);
-        let ts_str = seer::format_time(&bm.display_time, seer::ShowDate::Yes);
+        let ts_str = seer::format_time(
+            &bm.display_time,
+            seer::TimestampDisplay::DateAndTime,
+        );
         let highlighted = Some(bm.id) == cursor_id;
 
         for row_idx in 0..total_rows {
@@ -5776,7 +5782,10 @@ fn compact_bookmark_line<'a>(
 ) -> Line<'a> {
     let row = format!(
         "{} · {}",
-        seer::format_time(&bm.display_time, seer::ShowDate::Yes),
+        seer::format_time(
+            &bm.display_time,
+            seer::TimestampDisplay::DateAndTime
+        ),
         bm.display_msg,
     );
     let mut line = Line::raw(row);
