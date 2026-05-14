@@ -284,7 +284,7 @@ impl Engine {
         let mut next_visible_after: Option<usize> = None;
         for item in merge {
             let Ok(ee) = item else { continue };
-            let visible = filter.matches(&ee.event);
+            let visible = filter.matches_event(&ee.event);
             if found_anchor {
                 if visible {
                     next_visible_after = Some(row_in_filtered);
@@ -355,7 +355,7 @@ impl Engine {
         let mut last_before: Option<usize> = None;
         for item in (MergeIter { cursors }) {
             let Ok(ee) = item else { continue };
-            if !filter.matches(&ee.event) {
+            if !filter.matches_event(&ee.event) {
                 continue;
             }
             if ee.event.time > anchor_time {
@@ -533,7 +533,7 @@ impl<'a> Iterator for EventStream<'a> {
                 self.records_parsed += 1;
             }
             if let Ok(ee) = &item
-                && !self.filter.matches(&ee.event)
+                && !self.filter.matches_event(&ee.event)
             {
                 continue;
             }

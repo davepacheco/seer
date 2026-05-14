@@ -286,9 +286,7 @@ impl SourceMetadata {
                     Some(h) => h.as_ref(),
                     None => continue,
                 },
-                FieldName::Core(
-                    CoreField::Pid | CoreField::Msg
-                )
+                FieldName::Core(CoreField::Pid | CoreField::Msg)
                 | FieldName::Extra(_) => continue,
             };
             let predicate_passes = form.applied_to(known_value == value);
@@ -584,7 +582,7 @@ fn push_if_accepted(
 ) {
     match parsed {
         Ok(event) => {
-            if filter.matches(&event) {
+            if filter.matches_event(&event) {
                 results.push(QueryRecord {
                     offset,
                     length,

@@ -141,7 +141,7 @@
       }
     },
     "CoreField": {
-      "description": "One of the bunyan log record's structured top-level fields.\n\nEnumerated rather than carried as a string so that [`crate::source::SourceMetadata::excludes_all`] (and the per-record [`field_matches`] helper) can match exhaustively — adding a new core field is a compile error in those methods until threaded through.",
+      "description": "One of the bunyan log record's structured top-level fields.\n\nEnumerated rather than carried as a string so that consumers can match exhaustively.",
       "type": "string",
       "enum": [
         "Name",
@@ -274,7 +274,7 @@
       ]
     },
     "FieldName": {
-      "description": "Name of a field a `field=value` predicate matches against.\n\nBunyan core fields are typed by [`CoreField`]; anything else lives in the event's `extra` map and is carried as the raw key string. The DSL parser converts a token's left-hand side via the `From<&str>` impl, which routes the known core names into [`Self::Core`] and everything else into [`Self::Extra`].\n\nSerializes / deserializes as a bare DSL spelling string (`\"name\"`, `\"hostname\"`, `\"build\"`, ...) via the `#[serde(into = ..., from = ...)]` round-trip, so the on-disk form mirrors what a user would type into the filter dialog.",
+      "description": "Name of a field that a predicate matches against.\n\nBunyan core fields are typed by [`CoreField`]; anything else lives in the event's `extra` map and is carried as the raw key string. The DSL parser converts a token's left-hand side via the `From<&str>` impl, which routes the known core names into [`Self::Core`] and everything else into [`Self::Extra`].\n\nSerializes / deserializes as a bare DSL spelling string (`\"name\"`, `\"hostname\"`, `\"build\"`, ...) via the `#[serde(into = ..., from = ...)]` round-trip, so the on-disk form mirrors what a user would type into the filter dialog.",
       "oneOf": [
         {
           "type": "object",
@@ -318,7 +318,7 @@
       }
     },
     "Form": {
-      "description": "Whether a predicate is satisfied when its underlying condition holds (the affirmed form, e.g. `name=Nexus`) or when it doesn't (the negated form, e.g. `name!=Nexus`).  Replaces a bare `bool` so every match site has to enumerate both variants and the DSL parser no longer has `/* negated = */ false` comments at each call.",
+      "description": "Whether a predicate is satisfied when its underlying condition holds (the affirmed form, e.g. `name=Nexus`) or when it doesn't (the negated form, e.g. `name!=Nexus`).",
       "oneOf": [
         {
           "description": "The predicate accepts events for which the condition is true (e.g. `name=Nexus`, `msg=~\"oh no\"`).",
@@ -435,7 +435,7 @@
       }
     },
     "Predicate": {
-      "description": "A single predicate in a [`Filter`].\n\nSplit into two domains so that per-event matching and per-source matching are statically distinguishable.  Before the split, a single `Predicate::matches(event)` had a `SourceIdMatches` arm that returned `true` unconditionally — a silent no-op buried inside an otherwise honest method.  The wrapper keeps a single persisted list (so DSL ordering round-trips) while [`EventPredicate::matches`] and [`SourcePredicate::matches`] are each exhaustive over the variants they're called on.\n\nNew predicates land in [`EventPredicate`] if they read from an [`Event`], or in [`SourcePredicate`] if they read from a [`SourceId`].",
+      "description": "A single predicate in a [`Filter`].",
       "oneOf": [
         {
           "type": "object",

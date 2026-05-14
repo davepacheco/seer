@@ -30,8 +30,7 @@
 //! never-matching field equality.
 //!
 //! Both [`Filter`] and [`Predicate`] are also `serde`-serializable so
-//! they can ride along in a persisted session; the regex's source string
-//! is what's stored.
+//! they can ride along in a persisted session.
 
 use crate::event::{Event, Level};
 use crate::position::SourceId;
@@ -60,9 +59,9 @@ impl Filter {
     /// conjunction here.  The engine is responsible for filtering whole
     /// sources up front so this method is only ever called for events
     /// that already cleared the source-id check.
-    pub fn matches(&self, event: &Event) -> bool {
+    pub fn matches_event(&self, event: &Event) -> bool {
         self.predicates.iter().all(|p| match p {
-            Predicate::Event(ep) => ep.matches(event),
+            Predicate::Event(ep) => ep.matches_event(event),
             Predicate::Source(_) => true,
         })
     }
@@ -76,7 +75,7 @@ impl Filter {
     /// them — a filtered-out source is never queried for events.
     pub fn matches_source_id(&self, source_id: &SourceId) -> bool {
         self.predicates.iter().all(|p| match p {
-            Predicate::Source(sp) => sp.matches(source_id),
+            Predicate::Source(sp) => sp.matches_source_id(source_id),
             Predicate::Event(_) => true,
         })
     }
@@ -96,9 +95,7 @@ impl Filter {
 
 /// Whether a predicate is satisfied when its underlying condition
 /// holds (the affirmed form, e.g. `name=Nexus`) or when it doesn't
-/// (the negated form, e.g. `name!=Nexus`).  Replaces a bare `bool` so
-/// every match site has to enumerate both variants and the DSL parser
-/// no longer has `/* negated = */ false` comments at each call.
+/// (the negated form, e.g. `name!=Nexus`).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
 )]
@@ -113,9 +110,7 @@ pub enum Form {
 
 impl Form {
     /// Combines a raw condition outcome with this form: `Affirmed`
-    /// returns it as-is; `Negated` inverts it.  Used by every match
-    /// site that previously XOR'd a `negated` bool with the
-    /// condition.
+    /// returns it as-is; `Negated` inverts it.
     pub fn applied_to(self, condition: bool) -> bool {
         match self {
             Form::Affirmed => condition,
@@ -124,7 +119,7 @@ impl Form {
     }
 }
 
-/// Name of a field a `field=value` predicate matches against.
+/// Name of a field that a predicate matches against.
 ///
 /// Bunyan core fields are typed by [`CoreField`]; anything else lives
 /// in the event's `extra` map and is carried as the raw key string.
@@ -147,42 +142,6 @@ pub enum FieldName {
 impl From<FieldName> for String {
     fn from(name: FieldName) -> String {
         name.to_string()
-    }
-}
-
-/// One of the bunyan log record's structured top-level fields.
-///
-/// Enumerated rather than carried as a string so that
-/// [`crate::source::SourceMetadata::excludes_all`] (and the per-record
-/// [`field_matches`] helper) can match exhaustively — adding a new
-/// core field is a compile error in those methods until threaded
-/// through.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
-pub enum CoreField {
-    Name,
-    Hostname,
-    Pid,
-    Msg,
-}
-
-impl CoreField {
-    /// Returns the DSL spelling for this core field.  Round-trips
-    /// through [`FieldName::from`].
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CoreField::Name => "name",
-            CoreField::Hostname => "hostname",
-            CoreField::Pid => "pid",
-            CoreField::Msg => "msg",
-        }
-    }
-}
-
-impl fmt::Display for CoreField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -217,20 +176,40 @@ impl From<String> for FieldName {
     }
 }
 
+/// One of the bunyan log record's structured top-level fields.
+///
+/// Enumerated rather than carried as a string so that consumers can match
+/// exhaustively.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
+pub enum CoreField {
+    Name,
+    Hostname,
+    Pid,
+    Msg,
+}
+
+impl CoreField {
+    /// Returns the DSL spelling for this core field.  Round-trips
+    /// through [`FieldName::from`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CoreField::Name => "name",
+            CoreField::Hostname => "hostname",
+            CoreField::Pid => "pid",
+            CoreField::Msg => "msg",
+        }
+    }
+}
+
+impl fmt::Display for CoreField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single predicate in a [`Filter`].
-///
-/// Split into two domains so that per-event matching and per-source
-/// matching are statically distinguishable.  Before the split, a
-/// single `Predicate::matches(event)` had a `SourceIdMatches` arm that
-/// returned `true` unconditionally — a silent no-op buried inside an
-/// otherwise honest method.  The wrapper keeps a single persisted
-/// list (so DSL ordering round-trips) while [`EventPredicate::matches`]
-/// and [`SourcePredicate::matches`] are each exhaustive over the
-/// variants they're called on.
-///
-/// New predicates land in [`EventPredicate`] if they read from an
-/// [`Event`], or in [`SourcePredicate`] if they read from a
-/// [`SourceId`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub enum Predicate {
     Event(EventPredicate),
@@ -332,7 +311,7 @@ impl TimeOp {
 }
 
 impl EventPredicate {
-    pub fn matches(&self, event: &Event) -> bool {
+    pub fn matches_event(&self, event: &Event) -> bool {
         match self {
             Self::LevelAtLeast(threshold) => event.level >= *threshold,
             Self::LevelEquals { level, form } => {
@@ -355,7 +334,7 @@ impl EventPredicate {
 }
 
 impl SourcePredicate {
-    pub fn matches(&self, source_id: &SourceId) -> bool {
+    pub fn matches_source_id(&self, source_id: &SourceId) -> bool {
         match self {
             Self::SourceIdMatches { regex, form } => {
                 form.applied_to(regex.is_match(source_id.as_ref()))
@@ -366,9 +345,13 @@ impl SourcePredicate {
 
 fn field_matches(event: &Event, name: &FieldName, value: &str) -> bool {
     match name {
-        FieldName::Core(CoreField::Name) => event.name.to_string() == value,
+        FieldName::Core(CoreField::Name) => {
+            <crate::event::LoggerName as AsRef<str>>::as_ref(&event.name)
+                == value
+        }
         FieldName::Core(CoreField::Hostname) => {
-            event.hostname.to_string() == value
+            <crate::event::Hostname as AsRef<str>>::as_ref(&event.hostname)
+                == value
         }
         FieldName::Core(CoreField::Pid) => event.pid.to_string() == value,
         FieldName::Core(CoreField::Msg) => event.msg == value,
@@ -734,9 +717,9 @@ mod tests {
     #[test]
     fn level_at_least_matches_above_and_equal() {
         let e = base_event(); // info
-        assert!(EventPredicate::LevelAtLeast(Level::Info).matches(&e));
-        assert!(EventPredicate::LevelAtLeast(Level::Debug).matches(&e));
-        assert!(!EventPredicate::LevelAtLeast(Level::Warn).matches(&e));
+        assert!(EventPredicate::LevelAtLeast(Level::Info).matches_event(&e));
+        assert!(EventPredicate::LevelAtLeast(Level::Debug).matches_event(&e));
+        assert!(!EventPredicate::LevelAtLeast(Level::Warn).matches_event(&e));
     }
 
     #[test]
@@ -747,14 +730,14 @@ mod tests {
                 level: Level::Info,
                 form: Form::Affirmed
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             !EventPredicate::LevelEquals {
                 level: Level::Warn,
                 form: Form::Affirmed
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -767,7 +750,7 @@ mod tests {
                 value: "Nexus".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             !EventPredicate::FieldEquals {
@@ -775,7 +758,7 @@ mod tests {
                 value: "SledAgent".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::FieldEquals {
@@ -783,7 +766,7 @@ mod tests {
                 value: "sled-01".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::FieldEquals {
@@ -791,7 +774,7 @@ mod tests {
                 value: "1234".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -804,7 +787,7 @@ mod tests {
                 value: "nexus".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             !EventPredicate::FieldEquals {
@@ -812,7 +795,7 @@ mod tests {
                 value: "sled-agent".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -843,7 +826,7 @@ mod tests {
                 value: value.into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         };
 
         // Integer extras compare against the obvious decimal form.
@@ -887,7 +870,7 @@ mod tests {
                     value: value.into(),
                     form: Form::Affirmed,
                 }
-                .matches(&e),
+                .matches_event(&e),
                 "tags should not match {value:?}",
             );
         }
@@ -898,7 +881,7 @@ mod tests {
                     value: value.into(),
                     form: Form::Affirmed,
                 }
-                .matches(&e),
+                .matches_event(&e),
                 "context should not match {value:?}",
             );
         }
@@ -913,7 +896,7 @@ mod tests {
                 value: "anything".into(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -925,28 +908,28 @@ mod tests {
                 regex: Regex::new("blueprint").unwrap(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::MsgMatches {
                 regex: Regex::new("^blueprint exec").unwrap(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             !EventPredicate::MsgMatches {
                 regex: Regex::new("nope").unwrap(),
                 form: Form::Affirmed,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
     #[test]
     fn empty_filter_matches_everything() {
         let e = base_event();
-        assert!(Filter::default().matches(&e));
+        assert!(Filter::default().matches_event(&e));
     }
 
     #[test]
@@ -963,7 +946,7 @@ mod tests {
                 .into(),
             ],
         };
-        assert!(f.matches(&e));
+        assert!(f.matches_event(&e));
 
         let f = Filter {
             predicates: vec![
@@ -976,7 +959,7 @@ mod tests {
                 .into(),
             ],
         };
-        assert!(!f.matches(&e));
+        assert!(!f.matches_event(&e));
     }
 
     // ---------- parser ----------
@@ -1088,14 +1071,14 @@ mod tests {
                 level: Level::Info,
                 form: Form::Negated
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::LevelEquals {
                 level: Level::Warn,
                 form: Form::Negated
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -1108,7 +1091,7 @@ mod tests {
                 value: "Nexus".into(),
                 form: Form::Negated,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::FieldEquals {
@@ -1116,7 +1099,7 @@ mod tests {
                 value: "Other".into(),
                 form: Form::Negated,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -1133,7 +1116,7 @@ mod tests {
                 value: "anything".into(),
                 form: Form::Negated,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -1145,14 +1128,14 @@ mod tests {
                 regex: Regex::new("blueprint").unwrap(),
                 form: Form::Negated,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
         assert!(
             EventPredicate::MsgMatches {
                 regex: Regex::new("nope").unwrap(),
                 form: Form::Negated,
             }
-            .matches(&e)
+            .matches_event(&e)
         );
     }
 
@@ -1416,8 +1399,8 @@ mod tests {
             regex: Regex::new("nexus").unwrap(),
             form: Form::Affirmed,
         };
-        assert!(p.matches(&sid("/var/log/nexus.log")));
-        assert!(!p.matches(&sid("/var/log/sled-agent.log")));
+        assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
+        assert!(!p.matches_source_id(&sid("/var/log/sled-agent.log")));
     }
 
     #[test]
@@ -1426,15 +1409,9 @@ mod tests {
             regex: Regex::new("debug").unwrap(),
             form: Form::Negated,
         };
-        assert!(p.matches(&sid("/var/log/nexus.log")));
-        assert!(!p.matches(&sid("/var/log/debug.log")));
+        assert!(p.matches_source_id(&sid("/var/log/nexus.log")));
+        assert!(!p.matches_source_id(&sid("/var/log/debug.log")));
     }
-
-    // The earlier `source_id_predicate_is_noop_at_event_level` regression
-    // test for `Predicate::SourceIdMatches => true` in `matches(&event)`
-    // is now enforced by the type split: `SourcePredicate::matches`
-    // takes a `SourceId`, not an `&Event`, so the misuse it guarded
-    // against won't compile.
 
     #[test]
     fn filter_matches_source_id_is_conjunction() {
@@ -1486,36 +1463,36 @@ mod tests {
         let cutoff = t("2026-05-09T12:00:00Z");
         let p =
             EventPredicate::TimeBound { op: TimeOp::AtLeast, value: cutoff };
-        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
-        assert!(p.matches(&ev_at("2026-05-09T12:00:01Z")));
-        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T11:59:59Z")));
     }
 
     #[test]
     fn time_bound_after_matches_strictly_after() {
         let cutoff = t("2026-05-09T12:00:00Z");
         let p = EventPredicate::TimeBound { op: TimeOp::After, value: cutoff };
-        assert!(!p.matches(&ev_at("2026-05-09T12:00:00Z")));
-        assert!(p.matches(&ev_at("2026-05-09T12:00:01Z")));
-        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T11:59:59Z")));
     }
 
     #[test]
     fn time_bound_at_most_matches_at_and_before() {
         let cutoff = t("2026-05-09T12:00:00Z");
         let p = EventPredicate::TimeBound { op: TimeOp::AtMost, value: cutoff };
-        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
-        assert!(!p.matches(&ev_at("2026-05-09T12:00:01Z")));
-        assert!(p.matches(&ev_at("2026-05-09T11:59:59Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T11:59:59Z")));
     }
 
     #[test]
     fn time_bound_before_matches_strictly_before() {
         let cutoff = t("2026-05-09T12:00:00Z");
         let p = EventPredicate::TimeBound { op: TimeOp::Before, value: cutoff };
-        assert!(!p.matches(&ev_at("2026-05-09T12:00:00Z")));
-        assert!(!p.matches(&ev_at("2026-05-09T12:00:01Z")));
-        assert!(p.matches(&ev_at("2026-05-09T11:59:59Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T12:00:01Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T11:59:59Z")));
     }
 
     #[test]
@@ -1523,8 +1500,8 @@ mod tests {
         // Non-UTC offsets in the filter must be normalized to UTC
         // before comparison so equivalent instants compare equal.
         let p: Filter = "time>=2026-05-09T07:00:00-05:00".parse().unwrap();
-        assert!(p.matches(&ev_at("2026-05-09T12:00:00Z")));
-        assert!(!p.matches(&ev_at("2026-05-09T11:59:59Z")));
+        assert!(p.matches_event(&ev_at("2026-05-09T12:00:00Z")));
+        assert!(!p.matches_event(&ev_at("2026-05-09T11:59:59Z")));
     }
 
     #[test]
@@ -1841,7 +1818,7 @@ mod tests {
             filter in arb_filter(),
             event in arb_event(),
         ) {
-            let direct = filter.matches(&event);
+            let direct = filter.matches_event(&event);
             let manual = filter
                 .predicates()
                 .iter()
@@ -1849,7 +1826,7 @@ mod tests {
                     Predicate::Event(ep) => Some(ep),
                     Predicate::Source(_) => None,
                 })
-                .all(|ep| ep.matches(&event));
+                .all(|ep| ep.matches_event(&event));
             prop_assert_eq!(direct, manual);
         }
     }

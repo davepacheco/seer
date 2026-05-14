@@ -3206,7 +3206,7 @@ impl App {
             .stepper(Filter::default(), &cursor)
             .step_forward()
             .and_then(|r| r.event.ok())
-            .is_some_and(|e| filter.matches(&e));
+            .is_some_and(|e| filter.matches_event(&e));
         // `tab_idx` was just made active above, so this routes through
         // the standard seek-active-to-cursor path that installs a
         // [`LongOp::Seek`] (progress bar + Ctrl-C cancellation).
