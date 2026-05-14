@@ -1978,12 +1978,6 @@ struct App {
     /// active.  Cleared (set to `None`) when the bookmark it pointed at
     /// is deleted or no bookmarks remain.
     bookmark_cursor: Option<BookmarkId>,
-    /// True when the Bookmarks tab is armed for a `seeit`-command pick:
-    /// `Y` enters this mode, j/k keep moving [`Self::bookmark_cursor`],
-    /// Enter then opens the `seeit` popup for the bookmark under that
-    /// cursor (instead of navigating to it).  Cleared on Esc, on tab
-    /// switch, and after the popup opens.
-    bookmarks_seeit_pending: bool,
     /// One-shot status text shown in the footer for one render — used
     /// to tell the user "the bookmarked entry is hidden by the active
     /// filter" or "the bookmarked entry is gone" after a navigation.
@@ -2065,7 +2059,6 @@ impl App {
             last_search: None,
             time_step_idx: DEFAULT_TIME_STEP_IDX,
             bookmark_cursor: None,
-            bookmarks_seeit_pending: false,
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
@@ -3446,19 +3439,14 @@ impl App {
         let n = self.pane_count();
         self.active = (self.active + 1) % n;
         // Switching panes resets a one-shot notice so it doesn't spook
-        // the user on an unrelated screen.  The bookmarks "pick for
-        // seeit" mode is similarly scoped to the Bookmarks pane —
-        // dropping it on tab change keeps the modal indicator from
-        // outliving the context it makes sense in.
+        // the user on an unrelated screen.
         self.notice = None;
-        self.bookmarks_seeit_pending = false;
     }
 
     fn prev_tab(&mut self) {
         let n = self.pane_count();
         self.active = (self.active + n - 1) % n;
         self.notice = None;
-        self.bookmarks_seeit_pending = false;
     }
 
     /// Removes the active tab.  When the last regular tab is closed a
@@ -3554,14 +3542,13 @@ impl App {
     ///
     /// Supported keys: j/k (move bookmark cursor), Enter (navigate to
     /// the bookmark — switches tabs or opens a new one), x (open the
-    /// delete-confirmation dialog), Tab/BackTab (cycle panes), q/Esc/
-    /// Ctrl-C (open the quit-confirmation dialog).  `Y` arms a
-    /// transient "pick a bookmark to reproduce" mode where Enter opens
-    /// the `seeit`-command popup for the bookmark under the cursor
-    /// instead of navigating to it; Esc cancels the mode.  Everything
-    /// else is dropped: filter edits, search, time-step navigation,
-    /// and Ctrl-T/Ctrl-W make no sense in a list of bookmarks and would
-    /// leave the user in a confusing state if half-handled.
+    /// delete-confirmation dialog), Y (open the `seeit`-command popup
+    /// for the bookmark under the cursor), Tab/BackTab (cycle panes),
+    /// q (open the quit-confirmation dialog), h (open help).
+    /// Everything else is dropped: filter edits, search, time-step
+    /// navigation, and Ctrl-T/Ctrl-W make no sense in a list of
+    /// bookmarks and would leave the user in a confusing state if
+    /// half-handled.
     fn handle_bookmarks_key(&mut self, key: KeyEvent) {
         match key {
             // Only `q` opens the quit prompt: Esc and Ctrl-C are easy
@@ -3597,12 +3584,13 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.move_bookmark_cursor(-1),
-            // `Y`: arm the seeit-reproduction mode.  Mirrors the
-            // regular-tab binding's modifier handling — terminals
-            // report `Y` with either NONE or SHIFT, accept both.  If
+            // `Y`: open the seeit-reproduction popup for the bookmark
+            // under the cursor — the Bookmarks pane's cursor *is* the
+            // selection, so there's no separate "arm" step.  Mirrors
+            // the regular-tab binding's modifier handling: terminals
+            // report `Y` with either NONE or SHIFT, accept both.  When
             // no row is highlighted yet, snap the cursor to the first
-            // bookmark so an immediate Enter is meaningful.  Idempotent
-            // if already pending.
+            // bookmark so the keypress isn't a silent no-op.
             KeyEvent { code: KeyCode::Char('Y'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
@@ -3610,34 +3598,13 @@ impl App {
                 if self.bookmark_cursor_idx().is_none() {
                     self.move_bookmark_cursor(0);
                 }
-                self.bookmarks_seeit_pending = true;
+                self.open_seeit_command_for_bookmark_cursor();
             }
-            // Esc cancels the pending seeit pick; outside that mode it
-            // would otherwise be unbound (see the docstring's
-            // muscle-memory rationale).
-            KeyEvent {
-                code: KeyCode::Esc,
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.bookmarks_seeit_pending => {
-                self.bookmarks_seeit_pending = false;
-            }
-            // Enter commits whichever mode is active.  In the default
-            // (navigate) mode it jumps to the bookmarked event; in
-            // seeit-pending mode it opens the read-only popup with the
-            // `--bookmark` reproduction command and exits the mode.
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => {
-                if self.bookmarks_seeit_pending {
-                    self.bookmarks_seeit_pending = false;
-                    self.open_seeit_command_for_bookmark_cursor();
-                } else {
-                    self.navigate_to_bookmark_cursor();
-                }
-            }
+            } => self.navigate_to_bookmark_cursor(),
             KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::NONE,
@@ -3817,7 +3784,6 @@ impl App {
             last_search: None,
             time_step_idx: DEFAULT_TIME_STEP_IDX,
             bookmark_cursor: None,
-            bookmarks_seeit_pending: false,
             notice: None,
             long_op: None,
             pending_summary_builds: std::collections::VecDeque::new(),
@@ -5874,12 +5840,6 @@ fn render_bookmarks_footer(frame: &mut Frame, app: &App, area: Rect) {
     let count = app.session.bookmark_count();
     let footer = if let Some(notice) = app.notice.as_deref() {
         notice.to_string()
-    } else if app.bookmarks_seeit_pending {
-        // Mode indicator mirrors the main-tab `Selection` footer:
-        // teach the keys that mean something right now and hide the
-        // ones (Enter-to-open, x-to-delete) whose default semantics
-        // are suppressed.
-        "seeit: j/k select · Enter show cmd · Esc cancel".to_string()
     } else {
         format!(
             "q quit · j/k select · Enter open · x delete · Y seeit · \
@@ -11782,62 +11742,57 @@ mod tests {
     }
 
     #[test]
-    fn capital_y_in_bookmarks_arms_seeit_pending() {
-        // Y in the Bookmarks pane shouldn't open the popup right
-        // away — it arms the mode so the user can keep walking the
-        // list with j/k before committing with Enter.
-        let (mut a, _dir) = app_with_store_and_one_tab();
-        enter_bookmarks_pane_with(&mut a, 3);
-
-        a.handle_key(shift('Y'));
-
-        assert!(a.bookmarks_seeit_pending);
-        assert!(a.dialog.is_none());
-        // The cursor snapped to the first bookmark so a follow-up
-        // Enter has somewhere to commit.
-        assert_eq!(a.bookmark_cursor_idx(), Some(0));
-    }
-
-    #[test]
-    fn capital_y_in_bookmarks_without_shift_modifier_also_arms() {
-        // Mirrors the regular-tab binding: terminals report `Y` with
-        // either NONE or SHIFT and both should arm the mode.
-        let (mut a, _dir) = app_with_store_and_one_tab();
-        enter_bookmarks_pane_with(&mut a, 1);
-
-        a.handle_key(key(KeyCode::Char('Y')));
-
-        assert!(a.bookmarks_seeit_pending);
-    }
-
-    #[test]
-    fn bookmarks_y_then_enter_opens_seeit_command_for_cursor() {
-        // The whole point of the binding: after arming with Y and
-        // walking to a specific bookmark, Enter pops up the
-        // reproduction command for that bookmark — not for the active
-        // tab, and not by navigating away.
+    fn capital_y_in_bookmarks_opens_seeit_for_cursor() {
+        // The Bookmarks pane's cursor *is* the selection — `Y` should
+        // pop the reproduction command for the highlighted bookmark
+        // without a separate "arm" step.
         let (mut a, _dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 3);
         let session_id = a.session.id;
-
-        a.handle_key(shift('Y'));
-        // Walk the cursor from bookmark 0 to bookmark 2.
+        // Walk the cursor from "unset" to bookmark 2 so the popup
+        // targets a specific row rather than the first one.
+        a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('j')));
         let cursor_id = a.bookmark_cursor.expect("cursor should be set");
 
-        a.handle_key(key(KeyCode::Enter));
+        a.handle_key(shift('Y'));
 
         let Some(Dialog::SeeitCommand { text }) = &a.dialog else {
-            panic!("expected SeeitCommand dialog after Y+Enter");
+            panic!("expected SeeitCommand dialog after Y");
         };
         let expected = format!(
             "seeit --session {session_id} --bookmark {}",
             shlex::try_quote(&cursor_id.to_string()).unwrap(),
         );
         assert_eq!(text, &expected);
-        // Mode is one-shot: it clears once the popup opens.
-        assert!(!a.bookmarks_seeit_pending);
+    }
+
+    #[test]
+    fn capital_y_in_bookmarks_without_shift_modifier_also_works() {
+        // Mirrors the regular-tab binding: terminals report `Y` with
+        // either NONE or SHIFT and both should open the popup.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        enter_bookmarks_pane_with(&mut a, 1);
+
+        a.handle_key(key(KeyCode::Char('Y')));
+
+        assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
+    }
+
+    #[test]
+    fn capital_y_in_bookmarks_initializes_cursor_when_unset() {
+        // The Bookmarks pane doesn't auto-highlight the first row on
+        // entry — pressing `Y` before any j/k should still target
+        // *some* bookmark rather than silently no-op.
+        let (mut a, _dir) = app_with_store_and_one_tab();
+        enter_bookmarks_pane_with(&mut a, 2);
+        assert!(a.bookmark_cursor_idx().is_none());
+
+        a.handle_key(shift('Y'));
+
+        assert_eq!(a.bookmark_cursor_idx(), Some(0));
+        assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
     }
 
     #[test]
@@ -11851,7 +11806,6 @@ mod tests {
         let cursor_id = a.flat_bookmarks()[0].id;
 
         a.handle_key(shift('Y'));
-        a.handle_key(key(KeyCode::Enter));
 
         let Some(Dialog::SeeitCommand { text }) = &a.dialog else {
             panic!("expected SeeitCommand dialog");
@@ -11870,23 +11824,9 @@ mod tests {
     }
 
     #[test]
-    fn bookmarks_esc_cancels_seeit_pending_mode() {
-        // Esc clears the pending flag and leaves no dialog behind.
-        let (mut a, _dir) = app_with_store_and_one_tab();
-        enter_bookmarks_pane_with(&mut a, 2);
-
-        a.handle_key(shift('Y'));
-        assert!(a.bookmarks_seeit_pending);
-        a.handle_key(key(KeyCode::Esc));
-
-        assert!(!a.bookmarks_seeit_pending);
-        assert!(a.dialog.is_none());
-    }
-
-    #[test]
-    fn bookmarks_enter_without_pending_still_navigates() {
-        // Regression guard: adding the Y-armed branch must not
-        // change the default Enter behavior on the Bookmarks pane.
+    fn bookmarks_enter_still_navigates() {
+        // Regression guard: the Y binding must not have stolen Enter's
+        // default semantics on the Bookmarks pane.
         let (mut a, _dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 1);
         // Initialize the bookmark cursor — `navigate_to_bookmark_cursor`
@@ -11898,23 +11838,9 @@ mod tests {
 
         assert!(
             !matches!(a.dialog, Some(Dialog::SeeitCommand { .. })),
-            "Enter without Y must not open the seeit popup",
+            "Enter must not open the seeit popup",
         );
         assert!(!a.bookmarks_active(), "Enter must have navigated away");
-    }
-
-    #[test]
-    fn bookmarks_seeit_pending_cleared_on_tab_switch() {
-        // The mode is scoped to the Bookmarks pane; switching panes
-        // should drop it so the indicator doesn't leak forward.
-        let (mut a, _dir) = app_with_store_and_one_tab();
-        enter_bookmarks_pane_with(&mut a, 1);
-
-        a.handle_key(shift('Y'));
-        assert!(a.bookmarks_seeit_pending);
-
-        a.handle_key(key(KeyCode::Tab));
-        assert!(!a.bookmarks_seeit_pending);
     }
 
     #[test]
@@ -11929,36 +11855,12 @@ mod tests {
         }
 
         a.handle_key(shift('Y'));
-        a.handle_key(key(KeyCode::Enter));
 
         assert!(a.dialog.is_none());
         let notice = a.notice.as_ref().expect("notice should be set");
         assert!(
             notice.contains("transient"),
             "expected transient-session notice, got: {notice}",
-        );
-        // Mode cleared even on the failure path so a follow-up Y
-        // re-arms cleanly.
-        assert!(!a.bookmarks_seeit_pending);
-    }
-
-    #[test]
-    fn bookmarks_footer_shows_seeit_mode_indicator() {
-        // The footer needs a teaching line when the pending mode is
-        // armed so the user can see why Enter has different
-        // semantics than usual.
-        let (mut a, _dir) = app_with_store_and_one_tab();
-        enter_bookmarks_pane_with(&mut a, 1);
-
-        let backend = TestBackend::new(120, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        a.handle_key(shift('Y'));
-        terminal.draw(|frame| render(frame, &mut a)).unwrap();
-        let dump = buffer_text(terminal.backend().buffer());
-
-        assert!(
-            dump.contains("seeit:") && dump.contains("Enter show cmd"),
-            "expected seeit-mode footer, got:\n{dump}",
         );
     }
 }
