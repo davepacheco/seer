@@ -84,6 +84,7 @@
         "created_at",
         "cursor",
         "display_msg",
+        "display_name",
         "display_source",
         "display_time",
         "id"
@@ -103,6 +104,10 @@
         },
         "display_msg": {
           "description": "First slice of the bookmarked event's `msg`, cached so the Bookmarks tab can show it without re-querying the engine.",
+          "type": "string"
+        },
+        "display_name": {
+          "description": "Bunyan `name` field of the bookmarked event (typically the component, e.g. `Nexus`), cached so the Bookmarks tab can show it without re-querying the engine.",
           "type": "string"
         },
         "display_source": {

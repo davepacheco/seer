@@ -43,6 +43,7 @@ fn synthetic_bookmark(msg: &str) -> Bookmark {
         name: None,
         display_source: SourceId::from("/log/a".to_string()),
         display_time: Utc::now(),
+        display_name: "Nexus".to_string(),
         display_msg: msg.to_string(),
     }
 }

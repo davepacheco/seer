@@ -577,6 +577,7 @@ mod tests {
             name: name.map(|n| BookmarkName::from(n.to_string())),
             display_source: SourceId::from(source.to_string()),
             display_time: t(1),
+            display_name: "Nexus".to_string(),
             display_msg: "msg".to_string(),
         }
     }

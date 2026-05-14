@@ -3063,6 +3063,7 @@ impl App {
             name,
             display_source: draft.display_source,
             display_time: draft.display_time,
+            display_name: draft.display_name,
             display_msg: draft.display_msg,
         };
         self.session.add_bookmark(stream_id, bookmark);
@@ -3087,12 +3088,26 @@ impl App {
         self.save_after_inline_mutation();
     }
 
-    /// All user bookmarks, flattened across streams in the same order
-    /// the Bookmarks tab renders them: streams in BTreeMap order, each
-    /// stream's bucket in insertion order.  Used by selection-cursor
-    /// movement and rendering.
+    /// All user bookmarks, flattened across streams and sorted by the
+    /// timestamp of the bookmarked event (`display_time`), with
+    /// `created_at` breaking ties so the order is total and stable.
+    /// This is the same order the Bookmarks tab renders rows in, and
+    /// the order `j`/`k` walk; sorting by event time lets the user
+    /// read the list chronologically regardless of when each bookmark
+    /// was created.
     fn flat_bookmarks(&self) -> Vec<&Bookmark> {
-        self.session.user_bookmarks.values().flat_map(|v| v.iter()).collect()
+        let mut bms: Vec<&Bookmark> = self
+            .session
+            .user_bookmarks
+            .values()
+            .flat_map(|v| v.iter())
+            .collect();
+        bms.sort_by(|a, b| {
+            a.display_time
+                .cmp(&b.display_time)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        bms
     }
 
     /// Index of `bookmark_cursor` in [`Self::flat_bookmarks`], if it
@@ -3675,6 +3690,7 @@ impl App {
                     cursor,
                     display_source: ee.position.source().clone(),
                     display_time: ee.event.time,
+                    display_name: ee.event.name.to_string(),
                     display_msg: preview_msg(&ee.event.msg),
                 };
                 self.dialog = Some(Dialog::bookmark_name(draft));
@@ -4415,6 +4431,7 @@ struct BookmarkDraft {
     cursor: Cursor,
     display_source: SourceId,
     display_time: chrono::DateTime<chrono::Utc>,
+    display_name: String,
     display_msg: String,
 }
 
@@ -4864,6 +4881,7 @@ impl Dialog {
                         cursor: draft.cursor.clone(),
                         display_source: draft.display_source.clone(),
                         display_time: draft.display_time,
+                        display_name: draft.display_name.clone(),
                         display_msg: draft.display_msg.clone(),
                     },
                 }
@@ -5453,12 +5471,29 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-/// Renders the Bookmarks pane: one row per bookmark, with the cursor
-/// highlight on the selected row.  Each row is `created · file · time
-/// · msg-snippet`.  The Bookmarks pane has no scrolling yet (matching
-/// the existing tab content area, which doesn't either when smaller
-/// than viewport); rows below the viewport simply don't render until
-/// we add scrolling.
+/// Width (in display columns) of a timestamp rendered by
+/// [`seer::format_time`] with [`seer::ShowDate::Yes`] —
+/// `2026-04-30T15:30:00.743Z`.  Used to reserve the leftmost column of
+/// each Bookmarks-tab entry.
+const BOOKMARK_TS_WIDTH: usize = 24;
+
+/// Inter-column separator on Bookmarks-tab rows.  Middle-dot is one
+/// column wide, so the literal is three display columns.
+const BOOKMARK_COL_SEP: &str = " · ";
+const BOOKMARK_COL_SEP_WIDTH: usize = 3;
+
+/// Renders the Bookmarks pane.
+///
+/// Each entry occupies a variable number of rows: column 1 is the
+/// bookmarked event's timestamp, column 2 is the user-given bookmark
+/// name (if any), column 3 is the bunyan `name` + message preview.
+/// Columns 2 and 3 wrap independently within their share of the pane
+/// width; the entry's height is the taller column.  A final indented
+/// line under column 3 shows when the bookmark was created.  The
+/// selected entry highlights every row it occupies.
+///
+/// The pane has no scrolling yet: entries past the visible height are
+/// truncated.
 fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
     let bookmarks = app.flat_bookmarks();
     if bookmarks.is_empty() {
@@ -5469,41 +5504,161 @@ fn render_bookmarks_pane(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let cursor_id = app.bookmark_cursor;
-    let lines: Vec<Line<'_>> = bookmarks
-        .iter()
-        .take(area.height as usize)
-        .map(|bm| {
-            let source_str: &str = bm.display_source.as_ref();
-            let basename = std::path::Path::new(source_str)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(source_str)
-                .to_string();
-            let name =
-                bm.name.as_ref().map(|n| format!(" [{n}]")).unwrap_or_default();
-            // Bookmark rows use the same compact, millisecond-precision
-            // timestamp as the main pane so the two views read the same
-            // way and copy-paste between them is unambiguous.
-            let row = format!(
-                "{} · {} · {} · {}{}",
-                seer::format_time(&bm.created_at, seer::ShowDate::Yes),
-                basename,
-                seer::format_time(&bm.display_time, seer::ShowDate::Yes),
-                bm.display_msg,
-                name,
+    let total_w = area.width as usize;
+    let overhead = BOOKMARK_TS_WIDTH + 2 * BOOKMARK_COL_SEP_WIDTH;
+
+    // Degenerate-narrow pane: collapse to a single-line-per-entry
+    // fallback so the user still sees their bookmarks rather than
+    // nothing.  Picks an arbitrary minimum that leaves at least two
+    // characters in each of the two wrappable columns.
+    if total_w < overhead + 4 {
+        let lines: Vec<Line<'_>> = bookmarks
+            .iter()
+            .take(area.height as usize)
+            .map(|bm| compact_bookmark_line(bm, cursor_id))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    let rest = total_w - overhead;
+    let name_col_w = rest / 2;
+    let msg_col_w = rest - name_col_w;
+    let cap = area.height as usize;
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    for bm in bookmarks {
+        if lines.len() >= cap {
+            break;
+        }
+        let user_name =
+            bm.name.as_ref().map(BookmarkName::to_string).unwrap_or_default();
+        let name_rows = wrap_to_width(&user_name, name_col_w);
+        // App name and message share column 3.  Glue them with `: ` so
+        // an empty name doesn't leave a dangling separator; an empty
+        // msg likewise just shows the name.
+        let app_and_msg =
+            match (bm.display_name.is_empty(), bm.display_msg.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => bm.display_msg.clone(),
+                (false, true) => bm.display_name.clone(),
+                (false, false) => {
+                    format!("{}: {}", bm.display_name, bm.display_msg)
+                }
+            };
+        let msg_rows = wrap_to_width(&app_and_msg, msg_col_w);
+        let created_line = format!(
+            "bookmark created at {}",
+            seer::format_time(&bm.created_at, seer::ShowDate::Yes),
+        );
+        let total_rows = name_rows.len().max(msg_rows.len() + 1);
+        let ts_str = seer::format_time(&bm.display_time, seer::ShowDate::Yes);
+        let highlighted = Some(bm.id) == cursor_id;
+
+        for row_idx in 0..total_rows {
+            if lines.len() >= cap {
+                break;
+            }
+            let ts_cell = if row_idx == 0 { ts_str.as_str() } else { "" };
+            let name_cell =
+                name_rows.get(row_idx).map(String::as_str).unwrap_or("");
+            let msg_cell: String = if row_idx < msg_rows.len() {
+                msg_rows[row_idx].clone()
+            } else if row_idx == msg_rows.len() {
+                created_line.clone()
+            } else {
+                String::new()
+            };
+            let row_text = format!(
+                "{ts:<ts_w$}{sep}{name:<name_w$}{sep}{msg}",
+                ts = ts_cell,
+                name = name_cell,
+                msg = msg_cell,
+                ts_w = BOOKMARK_TS_WIDTH,
+                name_w = name_col_w,
+                sep = BOOKMARK_COL_SEP,
             );
-            let mut line = Line::raw(row);
-            if Some(bm.id) == cursor_id {
+            let mut line = Line::raw(row_text);
+            if highlighted {
                 line = line.style(
                     Style::default()
                         .bg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
                 );
             }
-            line
-        })
-        .collect();
+            lines.push(line);
+        }
+    }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Single-line bookmark row used when the pane is too narrow for the
+/// three-column layout.  Renders just `<time> · <msg>` so the user
+/// still sees enough to recognize each entry.
+fn compact_bookmark_line<'a>(
+    bm: &'a Bookmark,
+    cursor_id: Option<BookmarkId>,
+) -> Line<'a> {
+    let row = format!(
+        "{} · {}",
+        seer::format_time(&bm.display_time, seer::ShowDate::Yes),
+        bm.display_msg,
+    );
+    let mut line = Line::raw(row);
+    if Some(bm.id) == cursor_id {
+        line = line.style(
+            Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        );
+    }
+    line
+}
+
+/// Wraps `text` to fit `width` display columns.
+///
+/// Breaks at whitespace when possible; if a single word exceeds
+/// `width` it is split at column boundaries via [`column_chunks`] so
+/// long unbroken tokens (e.g. UUIDs) don't overflow the column.  Empty
+/// input returns one empty line so callers always have at least one
+/// row to render against.  `width == 0` (degenerate column) returns
+/// one empty line.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    if width == 0 || text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_chars = 0usize;
+    for word in text.split_whitespace() {
+        let word_chars = word.chars().count();
+        if word_chars > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+            for chunk in column_chunks(word, width as u16) {
+                lines.push(chunk.to_string());
+            }
+            continue;
+        }
+        let space = usize::from(current_chars > 0);
+        if current_chars + space + word_chars > width {
+            lines.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        if current_chars > 0 {
+            current.push(' ');
+            current_chars += 1;
+        }
+        current.push_str(word);
+        current_chars += word_chars;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn render_bookmarks_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -9151,6 +9306,220 @@ mod tests {
         assert_eq!(bm.display_msg, "third");
     }
 
+    /// Inserts a synthetic bookmark with a controllable `display_time`
+    /// (`secs` epoch-seconds) and a user-given `label`.  Bypasses the
+    /// `b`-key flow so tests can construct out-of-order timestamps
+    /// directly — `create_bookmark` derives `display_time` from the
+    /// underlying event, and `ev()` events all share a single fixed
+    /// timestamp.
+    fn add_bookmark_at(
+        a: &mut App,
+        stream_id: LogStreamId,
+        secs: i64,
+        label: &str,
+    ) {
+        let bm = Bookmark {
+            id: BookmarkId::new_v4(),
+            created_at: chrono::Utc::now(),
+            cursor: Cursor::with([]),
+            name: Some(BookmarkName::from(label.to_string())),
+            display_source: SourceId::from("test".to_string()),
+            display_time: chrono::TimeZone::timestamp_opt(
+                &chrono::Utc,
+                secs,
+                0,
+            )
+            .single()
+            .unwrap(),
+            display_name: "Nexus".to_string(),
+            display_msg: format!("msg @ {secs}"),
+        };
+        a.session.add_bookmark(stream_id, bm);
+    }
+
+    #[test]
+    fn flat_bookmarks_sorted_by_display_time() {
+        let mut a = select_app(5, 5);
+        let stream_id = a.tabs[a.active].stream;
+        // Insert in reverse-chronological order on `display_time`.
+        // The returned order should still be ascending in `display_time`
+        // regardless of insertion (and regardless of `created_at`,
+        // which here advances monotonically with each call).
+        add_bookmark_at(&mut a, stream_id, 300, "third");
+        add_bookmark_at(&mut a, stream_id, 100, "first");
+        add_bookmark_at(&mut a, stream_id, 200, "second");
+        let names: Vec<String> = a
+            .flat_bookmarks()
+            .iter()
+            .map(|b| b.name.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn flat_bookmarks_ties_broken_by_created_at() {
+        // Two bookmarks at the same display_time must still come back
+        // in a stable, total order — the secondary key is created_at.
+        let mut a = select_app(5, 5);
+        let stream_id = a.tabs[a.active].stream;
+        let t1 =
+            chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_000, 0)
+                .single()
+                .unwrap();
+        let t2 =
+            chrono::TimeZone::timestamp_opt(&chrono::Utc, 1_700_000_001, 0)
+                .single()
+                .unwrap();
+        let same_display_time =
+            chrono::TimeZone::timestamp_opt(&chrono::Utc, 500, 0)
+                .single()
+                .unwrap();
+        a.session.add_bookmark(
+            stream_id,
+            Bookmark {
+                id: BookmarkId::new_v4(),
+                created_at: t2,
+                cursor: Cursor::with([]),
+                name: Some(BookmarkName::from("later".to_string())),
+                display_source: SourceId::from("test".to_string()),
+                display_time: same_display_time,
+                display_name: "Nexus".to_string(),
+                display_msg: "later-created".to_string(),
+            },
+        );
+        a.session.add_bookmark(
+            stream_id,
+            Bookmark {
+                id: BookmarkId::new_v4(),
+                created_at: t1,
+                cursor: Cursor::with([]),
+                name: Some(BookmarkName::from("earlier".to_string())),
+                display_source: SourceId::from("test".to_string()),
+                display_time: same_display_time,
+                display_name: "Nexus".to_string(),
+                display_msg: "earlier-created".to_string(),
+            },
+        );
+        let names: Vec<String> = a
+            .flat_bookmarks()
+            .iter()
+            .map(|b| b.name.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["earlier", "later"]);
+    }
+
+    #[test]
+    fn bookmarks_pane_renders_three_columns() {
+        // One bookmark rendered into a wide pane: every column's
+        // content should be present in the dump.
+        let mut a = select_app(5, 5);
+        let stream_id = a.tabs[a.active].stream;
+        add_bookmark_at(&mut a, stream_id, 100, "my-tag");
+        a.handle_key(key(KeyCode::Tab));
+        assert!(a.bookmarks_active());
+        let backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // Bookmarked event's timestamp (epoch 100 == 1970-01-01T00:01:40).
+        assert!(
+            dump.contains("1970-01-01T00:01:40.000Z"),
+            "missing display_time; dump:\n{dump}",
+        );
+        assert!(dump.contains("my-tag"), "missing user name; dump:\n{dump}");
+        assert!(
+            dump.contains("Nexus: msg @ 100"),
+            "missing app+msg; dump:\n{dump}",
+        );
+        assert!(
+            dump.contains("bookmark created at"),
+            "missing footer line; dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn bookmarks_pane_wraps_long_message() {
+        // A message far wider than the message column should wrap to
+        // multiple lines without dropping content; the trailing
+        // "bookmark created at" footer should still appear.
+        let mut a = select_app(5, 5);
+        let stream_id = a.tabs[a.active].stream;
+        let long = "alpha beta gamma delta epsilon zeta \
+                    eta theta iota kappa lambda";
+        a.session.add_bookmark(
+            stream_id,
+            Bookmark {
+                id: BookmarkId::new_v4(),
+                created_at: chrono::Utc::now(),
+                cursor: Cursor::with([]),
+                name: None,
+                display_source: SourceId::from("test".to_string()),
+                display_time: chrono::TimeZone::timestamp_opt(
+                    &chrono::Utc,
+                    100,
+                    0,
+                )
+                .single()
+                .unwrap(),
+                display_name: "App".to_string(),
+                display_msg: long.to_string(),
+            },
+        );
+        a.handle_key(key(KeyCode::Tab));
+        // Narrow pane: msg column ends up around 17 cols, forcing the
+        // long string to wrap into several rows.
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        let dump = buffer_text(terminal.backend().buffer());
+        // Every word in the message must appear somewhere in the dump
+        // — wrapping must not drop content.
+        for word in [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta",
+            "theta", "iota", "kappa", "lambda",
+        ] {
+            assert!(dump.contains(word), "missing word {word}; dump:\n{dump}",);
+        }
+        assert!(
+            dump.contains("bookmark created at"),
+            "missing footer; dump:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn wrap_to_width_breaks_on_whitespace() {
+        assert_eq!(
+            wrap_to_width("hello world", 5),
+            vec!["hello".to_string(), "world".to_string()],
+        );
+        assert_eq!(
+            wrap_to_width("a b c d", 3),
+            vec!["a b".to_string(), "c d".to_string()],
+        );
+    }
+
+    #[test]
+    fn wrap_to_width_breaks_oversized_word_by_column() {
+        // A single word longer than the column width falls back to
+        // column-boundary breaks via `column_chunks`.
+        let r = wrap_to_width("supercalifragilistic", 5);
+        assert_eq!(
+            r,
+            vec![
+                "super".to_string(),
+                "calif".to_string(),
+                "ragil".to_string(),
+                "istic".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn wrap_to_width_edge_cases() {
+        assert_eq!(wrap_to_width("", 10), vec!["".to_string()]);
+        assert_eq!(wrap_to_width("hi", 0), vec!["".to_string()]);
+    }
+
     #[test]
     fn bookmark_navigation_lands_on_bookmarked_event() {
         // Real-engine round-trip: bookmark the third event, scroll back
@@ -10243,6 +10612,7 @@ mod tests {
             cursor: Cursor::with([]),
             display_source: SourceId::from("test".to_string()),
             display_time: chrono::Utc::now(),
+            display_name: "Nexus".to_string(),
             display_msg: "marked".to_string(),
         };
         a.add_bookmark(Some(BookmarkName::from("here".to_string())), draft);
@@ -10263,6 +10633,7 @@ mod tests {
             cursor: Cursor::with([]),
             display_source: SourceId::from("test".to_string()),
             display_time: chrono::Utc::now(),
+            display_name: "Nexus".to_string(),
             display_msg: "doomed".to_string(),
         };
         a.add_bookmark(None, draft);
@@ -10931,6 +11302,7 @@ mod tests {
             cursor: Cursor::with([]),
             display_source: SourceId::from("test".to_string()),
             display_time: chrono::Utc::now(),
+            display_name: "Nexus".to_string(),
             display_msg: "marked".to_string(),
         };
         a.add_bookmark(None, draft);

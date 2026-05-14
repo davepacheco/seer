@@ -226,6 +226,10 @@ pub struct Bookmark {
     /// Timestamp of the bookmarked event, cached so the Bookmarks tab
     /// can show it without re-querying the engine.
     pub display_time: DateTime<Utc>,
+    /// Bunyan `name` field of the bookmarked event (typically the
+    /// component, e.g. `Nexus`), cached so the Bookmarks tab can show
+    /// it without re-querying the engine.
+    pub display_name: String,
     /// First slice of the bookmarked event's `msg`, cached so the
     /// Bookmarks tab can show it without re-querying the engine.
     pub display_msg: String,
@@ -447,6 +451,7 @@ mod tests {
             name: name.map(|s| BookmarkName::from(s.to_string())),
             display_source: SourceId::from("a.log".to_string()),
             display_time: t(secs),
+            display_name: "Nexus".to_string(),
             display_msg: format!("msg @ {secs}"),
         }
     }
