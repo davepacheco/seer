@@ -19,8 +19,8 @@ use seer::test_fixtures::{
 };
 use seer::{
     Cursor, Engine, Filter, LogStreamPosition, RecordKey, RenderOpts,
-    SearchDir, SearchOutcome, SourceError, StreamView, SummaryBuilder,
-    summarize,
+    SearchAnchor, SearchDir, SearchOutcome, SourceError, StreamView,
+    SummaryBuilder, summarize,
 };
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -493,7 +493,7 @@ fn search_step_forward_finds_match_near_end_with_resume() {
             &engine,
             &re,
             SearchDir::Forward,
-            false,
+            SearchAnchor::Include,
             viewport,
             small_budget,
             &mut || false,
