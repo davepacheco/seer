@@ -64,8 +64,7 @@ pub enum ResolvedMode {
 /// The caller is responsible for installing `sources` into an engine,
 /// constructing a stepper from `cursor` and `filter`, and rendering
 /// with `render_opts` (or building a summary, when `mode` is
-/// [`ResolvedMode::Summary`]).  CLI-level filter and render
-/// overrides layer on top of these values.
+/// [`ResolvedMode::Summary`]).
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     /// Canonical paths of the sources to open, in the order they
@@ -82,11 +81,7 @@ pub struct ResolvedTarget {
     pub mode: ResolvedMode,
 }
 
-/// One element of an ambiguous-match error's candidate list.
-///
-/// Carries both the bookmark id (always present) and the optional
-/// user-supplied name so the CLI error message can show whichever the
-/// user is likely to recognize.
+/// Identifying information about a bookmark
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookmarkChoice {
     /// Stable id of the candidate bookmark.
@@ -489,7 +484,7 @@ pub fn build_seeit_command(
             )
         }
         Selector::Tab(name) => {
-            format!("seeit --session {session_id} --tab {}", shell_quote(name),)
+            format!("seeit --session {session_id} --tab {}", shell_quote(name))
         }
         Selector::Bookmark(needle) => {
             format!(

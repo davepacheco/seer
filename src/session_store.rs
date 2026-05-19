@@ -17,9 +17,7 @@
 //!
 //! This module owns the filesystem mechanics — paths, atomic write,
 //! enumeration — and the path-set discovery that picks resumable
-//! sessions out of the directory.  Higher-level concerns (the save
-//! policy and the TUI's resume dialog) live elsewhere; see
-//! `plan-sessions.md` for the layering.
+//! sessions out of the directory.
 
 use crate::session::{Session, SessionId};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -221,10 +219,9 @@ impl SessionStore {
             }
         }
 
-        // Exact first (MatchKind ordering), most recent within each
-        // kind.  `last_saved_at` is set by the saver, so the latest
-        // session at the top is the one the user almost certainly
-        // wants.
+        // Sort matches in order that the user might want them.  That's
+        // `MatchKind` order first (which prioritizes exact matches), then most
+        // recent.
         matches.sort_by(|a, b| {
             a.kind.cmp(&b.kind).then_with(|| {
                 b.session.last_saved_at.cmp(&a.session.last_saved_at)
@@ -440,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn save_is_atomic_via_tmp_plus_rename() {
+    fn save_process() {
         // We don't have a way to actually crash mid-write inside a
         // test, but we can verify the contract: after a successful
         // save there is no `.tmp` file left behind, and the final

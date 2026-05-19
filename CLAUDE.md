@@ -258,6 +258,7 @@ Features:
 - parse CockroachDB log
 - add a marker in the logstream where there are bookmarks
 - should bookmarks be navigable from any tab?
+- 'Y' (`seer` command) should be able to show same records without reference to the session
 
 Code cleanup:
 - need to teach Claude about slog_error_chain -- see SourceError
