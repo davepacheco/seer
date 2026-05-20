@@ -115,6 +115,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "base62"
+version = "2.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd637ac531c60eb7fbc4684dc061c2d7d90d73d758181aa02eeff0464b9eee4b"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1760,6 +1766,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "seer"
 version = "0.1.0"
 dependencies = [
+ "base62",
  "camino",
  "camino-tempfile",
  "chrono",
@@ -1768,6 +1775,7 @@ dependencies = [
  "derive_more",
  "etcetera",
  "expectorate",
+ "getrandom 0.4.2",
  "iddqd",
  "proptest",
  "ratatui",

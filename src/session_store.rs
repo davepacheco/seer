@@ -366,31 +366,49 @@ mod tests {
     }
 
     #[test]
-    fn session_id_format_is_exactly_eight_lowercase_hex() {
+    fn session_id_format_is_base62() {
         let id = SessionId::random();
         let s = id.to_string();
-        assert_eq!(s.len(), 8);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(s, s.to_lowercase());
+        // A random `u64` lands above `62^10` (8.4e17) ~95.6% of the
+        // time, so the encoding will almost always be 11 chars; the
+        // remaining cases are still valid base62 of length 1..=10.
+        assert!(!s.is_empty());
+        assert!(
+            s.len() <= 11,
+            "u64 encodes to at most 11 base62 chars; got {s:?}"
+        );
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]
-    fn session_id_parse_rejects_wrong_length() {
+    fn session_id_parse_rejects_empty() {
+        assert_eq!("".parse::<SessionId>(), Err(SessionIdParseError::Empty));
+    }
+
+    #[test]
+    fn session_id_parse_rejects_chars_outside_base62() {
+        // Hyphen, underscore, and other ASCII punctuation are all
+        // outside `[0-9A-Za-z]`.  The error carries the byte position
+        // of the first offending character.
         assert_eq!(
-            "abc".parse::<SessionId>(),
-            Err(SessionIdParseError::WrongLength(3))
+            "abcdef-h".parse::<SessionId>(),
+            Err(SessionIdParseError::InvalidChar(6))
         );
         assert_eq!(
-            "abcdef0123".parse::<SessionId>(),
-            Err(SessionIdParseError::WrongLength(10))
+            "abcd efg".parse::<SessionId>(),
+            Err(SessionIdParseError::InvalidChar(4))
         );
     }
 
     #[test]
-    fn session_id_parse_rejects_non_hex() {
+    fn session_id_parse_rejects_values_exceeding_u64() {
+        // 11 z's encodes 62^11 - 1 ≈ 5.2e19, comfortably larger than
+        // u64::MAX (≈ 1.8e19), so this exercises the explicit
+        // u128-to-u64 narrowing in `FromStr` rather than base62's own
+        // u128 overflow path.
         assert_eq!(
-            "abcdefgh".parse::<SessionId>(),
-            Err(SessionIdParseError::NonHex)
+            "zzzzzzzzzzz".parse::<SessionId>(),
+            Err(SessionIdParseError::TooLarge)
         );
     }
 
@@ -483,15 +501,17 @@ mod tests {
     fn list_returns_saved_ids_and_skips_unrelated_files() {
         let dir = tempdir().unwrap();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
-        let a: SessionId = "00000001".parse().unwrap();
-        let b: SessionId = "00000002".parse().unwrap();
+        let a: SessionId = "1".parse().unwrap();
+        let b: SessionId = "2".parse().unwrap();
         store.save(a, &Session::new()).unwrap();
         store.save(b, &Session::new()).unwrap();
 
-        // Drop unrelated junk into the directory.
+        // Drop unrelated junk into the directory.  `bad-name.json`
+        // looks like a session file but the stem contains `-`, which
+        // is outside the base62 alphabet, so `list` should skip it.
         std::fs::write(store.sessions_dir().join("not-a-session.txt"), "hi")
             .unwrap();
-        std::fs::write(store.sessions_dir().join("badname.json"), "{}")
+        std::fs::write(store.sessions_dir().join("bad-name.json"), "{}")
             .unwrap();
 
         let mut ids = store.list().unwrap();

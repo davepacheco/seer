@@ -52,19 +52,6 @@ When done, clean up non-Rust files in the repo (e.g., plans)
 
 ------------------------------
 
-(done) For CLAUDE.md:
-- within a file, build top-down, not bottom-up
-- avoid unicode characters that have clear ASCII alternatives, like →, …, 
-- avoid run-on sentences.  Don't extend a sentence with parentheseis or hyphens.  Examples:
-  - Summary tabs are a separate case: their rows are histogram entries, not records, so the "Showing N records …" framing doesn't apply and `event_for_line` is empty (the line→event map only exists for tabs whose lines come from real events).
-- similarly, colons semicolons have their place, but don't over use them.
-  - Example:
-    - While a [`LongOp`] is active, the parse-stats line is replaced with a progress bar; Ctrl-C cancels and unwinds (no partial summary, no anchor change for search). 
-      Just use two sentences.
-    - The bar shrinks (and at very narrow widths is dropped entirely) so the numeric components are never truncated — losing the percent number is more confusing than losing bar resolution.
-    - "Toggled with `p` and not persisted across sessions: it's a debugging affordance, not part of the user's view state."
-- try harder to avoid unwrap/expect when you can structure stuff with `let else`, match, etc.
-
 
 
 
@@ -169,14 +156,8 @@ src/engine.rs:
   (that seems accurate based on my check)
 
 src/session.rs:
-- session id: why not pure random?  how about base62
+- done: session id: why not pure random?  how about base62
 - when would Tab.cursor actually be `None`?
-
-fixed: src/summary.rs:
-- fixed: do we actually need the per-source information?  I feel like we don't.
-- fixed: it's keeping every timestamp with nanosecond precision.  That's not great.  If there's a maximum resolution (e.g., 1m), then we should keep at most that.  If not...maybe there should be?
-- fixed: format_time_label (relates to above): granularity should probably be an enum with explicit values
-- fixed: finish(): has a comment about BTreeSet for deterministic iteration order but it doesn't seem like that matters
 
 src/test_fixtures.rs:
 - I don't like the feature.  Make this a separate package?
@@ -204,3 +185,25 @@ src/streamview.rs:
 
 seeit:
 - I'm thinking it was a mistake to have this accept a session id.  Instead, when constructing a `seeit` command, it should accept *equivalent* args for filter, source list, display, etc.
+
+
+FULLY FIXED:
+
+fixed: src/summary.rs:
+- fixed: do we actually need the per-source information?  I feel like we don't.
+- fixed: it's keeping every timestamp with nanosecond precision.  That's not great.  If there's a maximum resolution (e.g., 1m), then we should keep at most that.  If not...maybe there should be?
+- fixed: format_time_label (relates to above): granularity should probably be an enum with explicit values
+- fixed: finish(): has a comment about BTreeSet for deterministic iteration order but it doesn't seem like that matters
+
+(done) For CLAUDE.md:
+- within a file, build top-down, not bottom-up
+- avoid unicode characters that have clear ASCII alternatives, like →, …, 
+- avoid run-on sentences.  Don't extend a sentence with parentheseis or hyphens.  Examples:
+  - Summary tabs are a separate case: their rows are histogram entries, not records, so the "Showing N records …" framing doesn't apply and `event_for_line` is empty (the line→event map only exists for tabs whose lines come from real events).
+- similarly, colons semicolons have their place, but don't over use them.
+  - Example:
+    - While a [`LongOp`] is active, the parse-stats line is replaced with a progress bar; Ctrl-C cancels and unwinds (no partial summary, no anchor change for search). 
+      Just use two sentences.
+    - The bar shrinks (and at very narrow widths is dropped entirely) so the numeric components are never truncated — losing the percent number is more confusing than losing bar resolution.
+    - "Toggled with `p` and not persisted across sessions: it's a debugging affordance, not part of the user's view state."
+- try harder to avoid unwrap/expect when you can structure stuff with `let else`, match, etc.

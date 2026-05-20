@@ -40,63 +40,77 @@ pub const CURRENT_SESSION_VERSION: u32 = 1;
 
 /// Short, user-typeable session id.
 ///
-/// Eight lowercase hex characters drawn from the first four bytes of
-/// a UUIDv4.  Long enough that collisions are vanishingly rare in a
-/// single user's session directory; short enough to type after
-/// `--resume`.  The id is the filename stem on disk: `<id>.json`.
+/// A random 64-bit integer rendered in base62 (digits, then uppercase,
+/// then lowercase ASCII letters).  A `u64` gives 2^64 ≈ 1.8e19 values,
+/// so collisions are vanishingly rare in a single user's session
+/// directory; the base62 encoding is at most 11 characters
+/// (`62^11 > u64::MAX`), short enough to type after `--resume`.  The
+/// id is the filename stem on disk: `<id>.json`.
+///
+/// Variable length is a consequence of the canonical encoding —
+/// leading-zero values produce shorter strings — but the small values
+/// that yield very short strings are vanishingly rare for a
+/// well-distributed random `u64`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionId([u8; 4]);
+pub struct SessionId(u64);
 
 impl SessionId {
     /// Returns a freshly-generated random session id.
+    ///
+    /// Panics if the OS randomness source is unavailable, which on a
+    /// modern Linux/illumos/macOS host means the kernel's RNG is not
+    /// initialized — a condition seer cannot meaningfully recover
+    /// from.
     pub fn random() -> Self {
-        let bytes = Uuid::new_v4().into_bytes();
-        Self([bytes[0], bytes[1], bytes[2], bytes[3]])
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).expect("OS RNG unavailable");
+        Self(u64::from_le_bytes(bytes))
     }
 }
 
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:02x}{:02x}{:02x}{:02x}",
-            self.0[0], self.0[1], self.0[2], self.0[3]
-        )
+        f.write_str(&base62::encode(u128::from(self.0)))
     }
 }
 
 /// Error parsing a [`SessionId`] from a string.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SessionIdParseError {
-    /// Input was not 8 characters long.
-    #[error("session id must be 8 hex characters; got {0}")]
-    WrongLength(usize),
+    /// Input was empty.
+    #[error("session id must not be empty")]
+    Empty,
 
-    /// Input contained a non-hex character.
-    #[error("session id contains a non-hex character")]
-    NonHex,
+    /// Input contained a character outside `[0-9A-Za-z]`.  Carries the
+    /// byte position of the first offending character.
+    #[error("session id contains a non-base62 character at byte {0}")]
+    InvalidChar(usize),
+
+    /// Decoded value did not fit in a `u64`.
+    #[error("session id value exceeds the 64-bit range")]
+    TooLarge,
 }
 
 impl FromStr for SessionId {
     type Err = SessionIdParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() != 8 {
-            return Err(SessionIdParseError::WrongLength(s.len()));
-        }
-        let mut out = [0u8; 4];
-        for (i, byte) in out.iter_mut().enumerate() {
-            let chunk = &s[i * 2..i * 2 + 2];
-            *byte = u8::from_str_radix(chunk, 16)
-                .map_err(|_| SessionIdParseError::NonHex)?;
-        }
-        Ok(Self(out))
+        let v = base62::decode(s).map_err(|e| match e {
+            base62::DecodeError::EmptyInput => SessionIdParseError::Empty,
+            base62::DecodeError::InvalidBase62Byte(_, pos) => {
+                SessionIdParseError::InvalidChar(pos)
+            }
+            base62::DecodeError::ArithmeticOverflow => {
+                SessionIdParseError::TooLarge
+            }
+        })?;
+        u64::try_from(v).map(Self).map_err(|_| SessionIdParseError::TooLarge)
     }
 }
 
-// Serialize as the 8-char hex string the user sees, not as a byte
-// array — so the on-disk representation matches what `--resume`
-// takes on the command line.
+// Serialize as the base62 string the user sees, not as the
+// underlying `u64`, so the on-disk representation matches what
+// `--resume` takes on the command line.
 impl Serialize for SessionId {
     fn serialize<S: serde::Serializer>(
         &self,
@@ -115,10 +129,13 @@ impl<'de> Deserialize<'de> for SessionId {
     }
 }
 
-// Manual JsonSchema impl: SessionId serializes as the 8-char hex
-// string from `Display`, not as its underlying 4-byte array, so the
-// schema must describe a string with the right shape rather than
-// inheriting the byte-array shape a derive would produce.
+// Manual JsonSchema impl: SessionId serializes as the base62 string
+// from `Display`, not as its underlying u64, so the schema must
+// describe a string with the right shape rather than inheriting the
+// integer shape a derive would produce.  `maxLength` is 11 because
+// `62^11 > u64::MAX` (the schema is mildly over-permissive — values
+// in `(u64::MAX, 62^11)` are syntactically valid base62 of length 11
+// but rejected by `FromStr`).
 impl schemars::JsonSchema for SessionId {
     fn schema_name() -> String {
         "SessionId".to_owned()
@@ -134,9 +151,9 @@ impl schemars::JsonSchema for SessionId {
         schemars::schema::SchemaObject {
             instance_type: Some(schemars::schema::InstanceType::String.into()),
             string: Some(Box::new(schemars::schema::StringValidation {
-                pattern: Some(r"^[0-9a-f]{8}$".to_owned()),
-                min_length: Some(8),
-                max_length: Some(8),
+                pattern: Some(r"^[0-9A-Za-z]{1,11}$".to_owned()),
+                min_length: Some(1),
+                max_length: Some(11),
             })),
             ..Default::default()
         }

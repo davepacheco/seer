@@ -744,9 +744,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_session_id() {
-        // Wrong length and non-hex both fail parsing of SessionId.
-        parse(&["seeit", "--session", "abc"]).unwrap_err();
-        parse(&["seeit", "--session", "ghijklmn"]).unwrap_err();
+        // Empty and out-of-alphabet inputs both fail parsing of
+        // SessionId.
+        parse(&["seeit", "--session", ""]).unwrap_err();
+        parse(&["seeit", "--session", "abcdef-h"]).unwrap_err();
     }
 
     #[test]
