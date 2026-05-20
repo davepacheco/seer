@@ -1,0 +1,139 @@
+DONE/skipped:
+CLAUDE.md
+LICENSE
+.gitignore
+rustfmt.toml
+rust-toolchain.toml
+review/followups.md
+review/phase-1-orientation.md
+review/phase-2-layer-line.md
+review/phase-3-type-safety.md
+review/phase-4-abstractions.md
+review/phase-5-tests.md
+review/test-plan.md
+Cargo.lock
+
+done (Rust), with questions below:
+src/position.rs
+src/event.rs
+src/filter.rs
+src/source.rs
+src/render.rs
+Cargo.toml
+src/view_target.rs
+src/session_store.rs
+src/lib.rs
+
+done, revisit:
+src/bin/seer.rs
+
+TODO:
+benches/engine.rs
+examples/gen_fixture.rs
+src/bin/seeit.rs
+src/engine.rs
+src/engine/merge.rs
+src/save_policy.rs
+src/session.rs
+src/stream.rs
+src/streamview.rs
+src/summary.rs
+src/test_fixtures.rs
+tests/fixtures/sample.log
+tests/fixtures/session.schema.json
+tests/scale.rs
+tests/seeit_session.rs
+tests/session_lifecycle.rs
+tests/session_schema.rs
+
+When done, clean up non-Rust files in the repo (e.g., plans)
+
+------------------------------
+
+For CLAUDE.md:
+- within a file, build top-down, not bottom-up
+- avoid unicode characters that have clear ASCII alternatives, like →, …, 
+- avoid run-on sentences.  Don't extend a sentence with parentheseis or hyphens.  Examples:
+  - Summary tabs are a separate case: their rows are histogram entries, not records, so the "Showing N records …" framing doesn't apply and `event_for_line` is empty (the line→event map only exists for tabs whose lines come from real events).
+- similarly, colons semicolons have their place, but don't over use them.
+  - Example:
+    - While a [`LongOp`] is active, the parse-stats line is replaced with a progress bar; Ctrl-C cancels and unwinds (no partial summary, no anchor change for search). 
+      Just use two sentences.
+    - The bar shrinks (and at very narrow widths is dropped entirely) so the numeric components are never truncated — losing the percent number is more confusing than losing bar resolution.
+    - "Toggled with `p` and not persisted across sessions: it's a debugging affordance, not part of the user's view state."
+
+
+
+
+position.rs: what's the difference between a Cursor and a LogStreamPosition
+Does source still need events()?  Is EventStream not duplicative with Stepper?
+LogStream and Tab seem like maybe they should be merged?  Unclear what the responsibilities are, anyway.
+filter.rs: actually separate source predicates from other predicates?
+source.rs:
+- want to get rid of events().  But it's used for a SourceCursor.  What's *that* used for?  How can that be right?
+- FileSource::path() is basically only used by benchmark and only in stupid ways
+- the logic in query_bounded() for adding the whole file's byte count to
+  `walked_bytes` is misleading.  It acts like this whole source is "earlier" in
+  the stream than the current cursor, but that's not really true.
+  - if it's a source id exclusion, this isn't well-defined.
+  - if it's a timestamp-based exclusion, then it's either all or nothing, but
+    it's not clear which without knowing more about the exclusion
+  - we re-open the file for every query
+  - read_record_before() seems like it could be more efficient
+    - maybe this would all be much faster with `mmap`
+render.rs:
+- show_date should be a TimestampDisplay
+view_target.rs:
+- all tests using a tempdir should use an abstraction for testing
+- low prio: shell_quote() is infallible but janky.  We should maybe have a
+  newtype for names that prohibits control characters
+session_store.rs:
+- should not create the directory if we're not saving anything
+seer.rs:
+- `TabIdx` newtype:
+  - using `get` instead of `Deref`/`AsRef`?
+  - direct comparison to `usize`?
+- build_session_sources():
+  - error messages won't include source path
+  - what if given the same path twice -- will panic?
+- StartupDialog:
+  - management of index is a little wonky but ok
+- will probably want separate modules but I'm not yet sure what
+  - startup / session resumption
+- render_startup_dialog() reaches into `dialog.matches`
+- DarkGray -> LightGray?  Or some other reverse styling?
+- run_startup_dialog():
+  - why do we poll for 100ms?  why not much longer?
+- I would probably reverse the order of a lot of these things.  Maybe a CLAUDE.md instruction about this?  Start top-down?
+- parse_tab_number(): no
+- LongOp::targets_tab(): in practice, in the caller, how could this ever _not_ be the case?  Seems like we should disable tab switching.
+- WTF: SeekFinalize::FrontOrBackFallback
+- SeekOp::label: why not a static str?
+- I feel like a lot of the accounting in the LongOp variants overlaps and also looks error-prone.
+- SeekOp comment refers to Self::advance but that doesn't exist.  There's an inconsistency in the way the three LongOps do advance().  I can't tell if it's important or not.
+- format_long_op_progress(): Cap at 100 is sus
+- TabSearch use of `matches` looks dubious (strong type safety)
+- Tab has a bunch of fields tied to TabKind that should use stronger type safety
+- Tab: don't like the term "host stream".  "underlying stream"?
+- Tab: match_indices() seems weird
+  - refresh(), rerender(), and resync_from_streamview() seem pretty similar
+- Tab: revisit after I've understood viewstream/streamview whatever
+- Tab: it's weird that a bunch of these are noops that shouldn't be possible
+  - move_selection() when no selection is active
+- App:
+  - `last_search` seems like it belongs on the tab (and the session?)
+  - `time_step_idx` seems like it belongs on the tab (and the session)
+  - why do we need `bookmark_cursor`?
+  - why do we need `pending_summary_builds`?
+  - restore_tabs_or_default(): broken stream id pointer should be fatal
+  - why does Tab::new() accept a filter (in addition to the filter being on the stream)
+- I'm not sure it makes sense to distinguish tabs from LogStreams?
+- apply_filter(): shouldn't update other tabs synchronously?
+  - I think this means we can get rid of `refresh()`?
+- toggle_show_extras, etc.: it's really janky that we *remove* the stream from the session.  It seems to work because we save_after_inline_mutation(), which will re-populate it.
+- in handle_key, are the height/weight arguments to scroll_up/scroll_down ever *not* `h`, `w`?
+- I skimmed from partway through App impl through the rest of the file up to the tests (not including the tests).  Need to revisit after learning more and making several simplifications above.
+
+src/save_policy.rs:
+- seems like it belongs as part of the session store?
+- I'm not clear that this abstraction makes a lot of sense.  Intuitively it does but the specific shape seems weird.
