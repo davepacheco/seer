@@ -310,8 +310,8 @@ mod tests {
         Session, SessionIdParseError, SessionSource, Tab, TabKind,
     };
     use crate::stream::LogStream;
+    use crate::test_fixtures::t;
     use camino_tempfile::tempdir;
-    use chrono::{DateTime, TimeZone, Utc};
 
     fn session_with_one_tab() -> Session {
         let stream = LogStream::new("Tab 1".to_string());
@@ -328,10 +328,6 @@ mod tests {
             )])),
         });
         s
-    }
-
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().unwrap()
     }
 
     /// Builds and saves a session with the given source paths and

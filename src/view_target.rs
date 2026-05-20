@@ -513,13 +513,9 @@ mod tests {
     use crate::position::{ByteOffset, SourceId};
     use crate::session::{Bookmark, BookmarkId, BookmarkName, Session, Tab};
     use crate::stream::LogStream;
+    use crate::test_fixtures::t;
     use camino_tempfile::tempdir;
-    use chrono::TimeZone;
     use std::fs;
-
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().unwrap()
-    }
 
     /// Writes `body` to `dir/<name>` and returns a [`SessionSource`]
     /// whose fingerprint reflects the file as it sits on disk now.

@@ -626,13 +626,8 @@ fn render_bar(count: u64, max: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{TestDir, append_bunyan, append_bunyan_at};
-    use chrono::TimeZone;
+    use crate::test_fixtures::{TestDir, append_bunyan, append_bunyan_at, t};
     use slog::info;
-
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid timestamp")
-    }
 
     #[test]
     fn empty_engine_summary_has_no_fields_or_time() {
