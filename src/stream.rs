@@ -107,9 +107,6 @@ impl LogStream {
     /// Returns a new log stream with a freshly-generated id, the given
     /// display name, an empty filter, and the same field-visibility
     /// defaults as [`RenderOpts::default`].
-    // No `Default` impl: each call mints a distinct id, so a default
-    // value would silently produce non-equal objects.
-    #[allow(clippy::new_without_default)]
     pub fn new(name: String) -> Self {
         let opts = RenderOpts::default();
         Self {

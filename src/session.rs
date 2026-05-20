@@ -8,16 +8,14 @@
 //! their investigation: the open tabs and where each is scrolled to, the
 //! set of log streams that exist (whether or not a tab is currently
 //! showing them), and the user's named/unnamed bookmarks indexed by
-//! stream.  Sources, named filter groups, and the set of fields shown by
-//! each stream will join this struct as those concepts land.
+//! stream.
 //!
 //! ## Schema versioning
 //!
 //! `Session::version` is the schema version persisted to disk.  New
-//! fields should always be `#[serde(default)]` so older session files
-//! deserialize cleanly into newer code; restructuring or renaming an
-//! existing field is what bumps the version and requires a migration
-//! shim keyed on `version`.
+//! fields can be `#[serde(default)]` so that older session files deserialize
+//! cleanly into newer code; restructuring or renaming an existing field is what
+//! bumps the version and requires a migration shim keyed on `version`.
 
 use crate::engine::Cursor;
 use crate::position::SourceId;
@@ -38,7 +36,7 @@ use uuid::Uuid;
 /// shape of a [`Session`] changes — the `schemars`-derived schema
 /// fixture test will fail and prompt the author to refresh both
 /// this constant and the checked-in fixture.
-pub const CURRENT_SESSION_VERSION: u32 = 7;
+pub const CURRENT_SESSION_VERSION: u32 = 1;
 
 /// Short, user-typeable session id.
 ///
@@ -54,11 +52,6 @@ impl SessionId {
     pub fn random() -> Self {
         let bytes = Uuid::new_v4().into_bytes();
         Self([bytes[0], bytes[1], bytes[2], bytes[3]])
-    }
-
-    /// Returns the id as its four underlying bytes.
-    pub fn as_bytes(&self) -> [u8; 4] {
-        self.0
     }
 }
 
@@ -315,13 +308,12 @@ impl IdOrdItem for SessionSource {
 
 /// Top-level session state.
 ///
-/// Designed to be the unit of persistence: serialize this and you've
-/// captured enough to put the user back where they left off.
+/// Designed to be the unit of persistence: serialize this and you've captured
+/// enough to put the user back where they left off.
 ///
-/// Fields are not `#[serde(default)]`: there are no live session
-/// files on disk to be backwards-compatible with, and silently
-/// defaulting in fields would defeat the schema-tripwire test that
-/// guards `CURRENT_SESSION_VERSION`.
+/// For now, fields are not `#[serde(default)]`: there are no live session files
+/// on disk to be backwards-compatible with, and silently defaulting in fields
+/// would defeat the schema-tripwire test that guards `CURRENT_SESSION_VERSION`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Session {
     /// On-disk schema version.  Bumped on changes that aren't
@@ -329,13 +321,7 @@ pub struct Session {
     pub version: u32,
     /// Short id; also the filename stem on disk.
     pub id: SessionId,
-    /// Sources this session was opened against.  Stored as an
-    /// [`IdOrdMap`] keyed by id so the uniqueness invariant is encoded
-    /// in the type, but serialized as a JSON array (same as
-    /// [`Self::streams`]) — the `schemars(with = …)` annotation
-    /// surfaces that shape to the schema generator, which has no
-    /// `JsonSchema` impl for `IdOrdMap` of its own.
-    #[schemars(with = "Vec<SessionSource>")]
+    /// Sources this session was opened against.
     pub sources: IdOrdMap<SessionSource>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
@@ -346,21 +332,9 @@ pub struct Session {
     /// concurrent-access warning); not consulted for correctness.
     pub last_pid: u32,
     pub tabs: Vec<Tab>,
-    /// Log streams owned by this session, keyed by id.  Serialized
-    /// as a JSON array because [`IdOrdMap`] writes itself that way;
-    /// the explicit `schemars(with = …)` is what surfaces that to
-    /// the schema generator since `IdOrdMap` has no `JsonSchema`
-    /// impl of its own.
-    #[schemars(with = "Vec<LogStream>")]
+    /// Log streams owned by this session, keyed by id.
     pub streams: IdOrdMap<LogStream>,
-    /// Bookmarks indexed by the stream they target.  Inner buckets are
-    /// [`IdOrdMap`]s so the per-stream uniqueness invariant is encoded
-    /// in the type — `add_bookmark` becomes `insert_unique` and
-    /// `remove_bookmark` an O(log n) lookup rather than a linear scan.
-    /// Each inner bucket serializes as a JSON array via the
-    /// `schemars(with = …)` shim, same trick as [`Self::streams`] and
-    /// [`Self::sources`].
-    #[schemars(with = "BTreeMap<LogStreamId, Vec<Bookmark>>")]
+    /// Bookmarks indexed by the stream they target.
     pub user_bookmarks: BTreeMap<LogStreamId, IdOrdMap<Bookmark>>,
     /// Recently submitted search patterns, most-recently-used first.
     /// Capped at [`MAX_SEARCH_HISTORY`].  Populated by successful
@@ -381,7 +355,6 @@ impl Session {
     /// Mints a new id and timestamps on every call, so there is no
     /// `Default` impl — that contract would conflict with "default
     /// values are deterministic".
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         let now = Utc::now();
         Self {
@@ -459,11 +432,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::position::{ByteOffset, SourceId};
-    use chrono::TimeZone;
-
-    fn t(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().unwrap()
-    }
+    use crate::test_fixtures::t;
 
     fn cursor_at(offset: u64) -> Cursor {
         Cursor::with([(

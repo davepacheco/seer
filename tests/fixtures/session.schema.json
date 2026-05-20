@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Session",
-  "description": "Top-level session state.\n\nDesigned to be the unit of persistence: serialize this and you've captured enough to put the user back where they left off.\n\nFields are not `#[serde(default)]`: there are no live session files on disk to be backwards-compatible with, and silently defaulting in fields would defeat the schema-tripwire test that guards `CURRENT_SESSION_VERSION`.",
+  "description": "Top-level session state.\n\nDesigned to be the unit of persistence: serialize this and you've captured enough to put the user back where they left off.\n\nFor now, fields are not `#[serde(default)]`: there are no live session files on disk to be backwards-compatible with, and silently defaulting in fields would defeat the schema-tripwire test that guards `CURRENT_SESSION_VERSION`.",
   "type": "object",
   "required": [
     "created_at",
@@ -48,17 +48,41 @@
       }
     },
     "sources": {
-      "description": "Sources this session was opened against.  Stored as an [`IdOrdMap`] keyed by id so the uniqueness invariant is encoded in the type, but serialized as a JSON array (same as [`Self::streams`]) — the `schemars(with = …)` annotation surfaces that shape to the schema generator, which has no `JsonSchema` impl for `IdOrdMap` of its own.",
+      "title": "IdOrdMap",
+      "description": "Sources this session was opened against.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/SessionSource"
+      },
+      "uniqueItems": true,
+      "x-rust-type": {
+        "crate": "iddqd",
+        "parameters": [
+          {
+            "$ref": "#/definitions/SessionSource"
+          }
+        ],
+        "path": "iddqd::IdOrdMap",
+        "version": "*"
       }
     },
     "streams": {
-      "description": "Log streams owned by this session, keyed by id.  Serialized as a JSON array because [`IdOrdMap`] writes itself that way; the explicit `schemars(with = …)` is what surfaces that to the schema generator since `IdOrdMap` has no `JsonSchema` impl of its own.",
+      "title": "IdOrdMap",
+      "description": "Log streams owned by this session, keyed by id.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/LogStream"
+      },
+      "uniqueItems": true,
+      "x-rust-type": {
+        "crate": "iddqd",
+        "parameters": [
+          {
+            "$ref": "#/definitions/LogStream"
+          }
+        ],
+        "path": "iddqd::IdOrdMap",
+        "version": "*"
       }
     },
     "tabs": {
@@ -68,12 +92,24 @@
       }
     },
     "user_bookmarks": {
-      "description": "Bookmarks indexed by the stream they target.  Inner buckets are [`IdOrdMap`]s so the per-stream uniqueness invariant is encoded in the type — `add_bookmark` becomes `insert_unique` and `remove_bookmark` an O(log n) lookup rather than a linear scan. Each inner bucket serializes as a JSON array via the `schemars(with = …)` shim, same trick as [`Self::streams`] and [`Self::sources`].",
+      "description": "Bookmarks indexed by the stream they target.",
       "type": "object",
       "additionalProperties": {
+        "title": "IdOrdMap",
         "type": "array",
         "items": {
           "$ref": "#/definitions/Bookmark"
+        },
+        "uniqueItems": true,
+        "x-rust-type": {
+          "crate": "iddqd",
+          "parameters": [
+            {
+              "$ref": "#/definitions/Bookmark"
+            }
+          ],
+          "path": "iddqd::IdOrdMap",
+          "version": "*"
         }
       }
     },

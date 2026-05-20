@@ -8676,7 +8676,7 @@ mod tests {
         for (i, path) in paths.iter().enumerate() {
             let mut file = std::fs::File::create(path).unwrap();
             for j in 0..50 {
-                let secs = (i as i64) * 1000 + j as i64;
+                let secs = (i as i64) * 1000 + i64::from(j);
                 writeln!(
                     file,
                     r#"{{"hostname":"oxz-sled-{i:02}.oxide.test","level":30,"msg":"entry","name":"SledAgent","pid":1234,"time":"2024-03-09T16:{:02}:{:02}+00:00","v":0,"j":{j}}}"#,
@@ -8740,7 +8740,7 @@ mod tests {
         for (i, path) in paths.iter().enumerate() {
             let mut file = std::fs::File::create(path).unwrap();
             for j in 0..50 {
-                let secs = (i as i64) * 1000 + j as i64;
+                let secs = (i as i64) * 1000 + i64::from(j);
                 writeln!(
                     file,
                     r#"{{"hostname":"oxz-sled-{i:02}.oxide.test","level":30,"msg":"entry","name":"SledAgent","pid":1234,"time":"2024-03-09T16:{:02}:{:02}+00:00","v":0,"j":{j}}}"#,
@@ -9043,7 +9043,7 @@ mod tests {
         // 4-row fixture would clamp to 0 regardless of the match
         // location).
         let mut records: Vec<RecordSpec<'_>> =
-            (0..30).map(|i| (10 + i as i64 * 10, "filler", &[][..])).collect();
+            (0..30).map(|i| (10 + i64::from(i) * 10, "filler", &[][..])).collect();
         records[25] = (260, "match-here", &[]);
         let (mut a, _dir) = multi_line_app(&records);
         a.viewport_height = 5;

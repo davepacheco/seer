@@ -165,3 +165,7 @@ src/engine.rs:
 - fixed: resolve_position(): appears only to be used in tests
 - based on my read of EventStream, if summary uses this, then a very selective filter in a summary view will hang for a while
   (that seems accurate based on my check)
+
+src/session.rs:
+- session id: why not pure random?  how about base62
+- when would Tab.cursor actually be `None`?
