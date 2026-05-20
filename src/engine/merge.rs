@@ -23,6 +23,7 @@ use crate::source::{Direction, QueryRecord, Source, SourceError};
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use thiserror::Error;
 
 /// Returns the opposite direction.
 fn opposite(d: Direction) -> Direction {
@@ -86,39 +87,18 @@ pub struct MergeRecord {
 /// `serde_json::Error` are not `Clone`).  The original variant is
 /// preserved so consumers can match on parse vs. I/O if useful;
 /// most callers just render via [`Display`].
-#[derive(Debug, Clone)]
-pub struct MergeError(Arc<SourceError>);
+#[derive(Debug, Clone, Error)]
+#[error(transparent)]
+pub struct MergeError(#[from] Arc<SourceError>);
 
-impl MergeError {
-    /// Returns the underlying [`SourceError`].
-    pub fn source_error(&self) -> &SourceError {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for MergeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&*self.0, f)
-    }
-}
-
-impl From<SourceError> for MergeError {
-    fn from(err: SourceError) -> Self {
-        Self(Arc::new(err))
-    }
-}
-
-/// Whether a directional scan has exhausted the source.  Used by
-/// [`SourceWindow::set_eof`] in place of a bare `bool` so the call
-/// sites read self-documentingly (`set_eof(dir, EofMark::Reached)`
-/// vs. `set_eof(dir, true)`).
+/// Whether a directional scan has exhausted the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EofMark {
     /// The scan in this direction has hit EOF; further fetches in
     /// this direction are short-circuited until the flag is cleared.
     Reached,
     /// The scan has not (or no longer has) hit EOF; future fetches
-    /// will exercise the storage layer.
+    /// will hit the storage layer.
     Cleared,
 }
 
@@ -136,7 +116,12 @@ struct BufferedRecord {
 impl From<QueryRecord> for BufferedRecord {
     fn from(record: QueryRecord) -> Self {
         let QueryRecord { offset, length, event, raw } = record;
-        Self { offset, length, event: event.map_err(MergeError::from), raw }
+        Self {
+            offset,
+            length,
+            event: event.map_err(|e| MergeError::from(Arc::new(e))),
+            raw,
+        }
     }
 }
 
@@ -285,7 +270,9 @@ impl<'a> SourceWindow<'a> {
                 let synth = BufferedRecord {
                     offset: self.position,
                     length: ByteLen::ZERO,
-                    event: Err(MergeError::from(SourceError::from(e))),
+                    event: Err(MergeError::from(Arc::new(SourceError::from(
+                        e,
+                    )))),
                     raw: String::new(),
                 };
                 self.buf_mut(dir).push_back(synth);

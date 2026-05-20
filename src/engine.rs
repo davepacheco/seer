@@ -8,8 +8,7 @@
 //! queries over them.  Multi-source queries are time-merged: each source
 //! is assumed to be locally sorted by [`Event::time`] (when it is not,
 //! the engine emits a one-shot [`SourceError::OutOfOrder`] warning for
-//! that source and proceeds anyway).  Lazy access and richer queries
-//! will land here as the design develops.
+//! that source and proceeds anyway).
 
 use crate::event::Event;
 use crate::filter::Filter;
@@ -229,162 +228,6 @@ impl Engine {
         EventStream { cursors, filter, records_parsed: 0 }
     }
 
-    /// Resolves `position` against the current sources, viewed through
-    /// `filter`, into a row index in the corresponding
-    /// `query_events(filter)` output.
-    ///
-    /// Bookmarks anchor by `(source, time, ordinal_within_time)` rather
-    /// than by ordinal in a filtered view, so this method has to walk
-    /// the unfiltered stream to find the anchored event and then count
-    /// how many filter-matching events precede it.  See
-    /// [`ResolvePosition`] for the meaning of each outcome.
-    pub fn resolve_position(
-        &self,
-        filter: &Filter,
-        position: &LogStreamPosition,
-    ) -> ResolvePosition {
-        if !self.sources.iter().any(|s| s.id() == position.source()) {
-            return ResolvePosition::Gone;
-        }
-        // The anchor's source might still be attached but excluded by
-        // the source-id filter — in that case the merge never sees the
-        // anchor at all.  Handle this up front by finding the closest
-        // visible neighbor by *time*, matching the FilteredOut
-        // contract (prefer next-after, fall back to previous-before).
-        if !filter.matches_source_id(position.source()) {
-            return self.filtered_out_neighbor_by_time(filter, position.time());
-        }
-        let mut row_in_filtered: usize = 0;
-        let mut last_visible_before: Option<usize> = None;
-        // Walk the unfiltered merge.  For each Ok event, decide three
-        // things: is it the anchor (compare positions); is it visible
-        // under `filter`; is it earlier or later than the anchor in
-        // emit order.  Errors don't appear in `query_events(filter)`
-        // either when filter rejects no errors — but our Ok-only counter
-        // is what matters here, since callers index into events, and
-        // their events vec parallels query_events output.
-        //
-        // Sources whose ids fail the source-id filter are excluded from
-        // the merge, mirroring `query_events`.  The anchor's source has
-        // already been confirmed visible above, so the anchor (if it
-        // still exists in the file) will be reached.
-        let cursors = self
-            .sources
-            .iter()
-            .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| SourceCursor::new(s.as_ref()))
-            .collect();
-        let merge = MergeIter { cursors };
-        // We need to know if the anchor exists at all (to distinguish
-        // FilteredOut from Gone) and where the next visible event after
-        // the anchor sits.  Track these through a second pass over the
-        // tail.  Concretely: walk in one pass and react when we hit
-        // (or pass) the anchor.
-        let mut found_anchor = false;
-        let mut next_visible_after: Option<usize> = None;
-        for item in merge {
-            let Ok(ee) = item else { continue };
-            let visible = filter.matches_event(&ee.event);
-            if found_anchor {
-                if visible {
-                    next_visible_after = Some(row_in_filtered);
-                    break;
-                }
-                // Each filter-matched Ok event would advance the index;
-                // non-matched events are skipped, matching query_events.
-                continue;
-            }
-            if &ee.position == position {
-                found_anchor = true;
-                if visible {
-                    return ResolvePosition::Found(row_in_filtered);
-                }
-                // Anchor exists but is filtered out; next visible event
-                // (if any) wins.  Don't advance row_in_filtered for a
-                // filtered-out event.
-                continue;
-            }
-            if visible {
-                last_visible_before = Some(row_in_filtered);
-                row_in_filtered += 1;
-            }
-        }
-        if !found_anchor {
-            // Source is visible to the filter (the !visible branch
-            // returned earlier) but the anchor isn't in the merge —
-            // the underlying file has been rewritten or rotated since
-            // the bookmark was made.
-            return ResolvePosition::Gone;
-        }
-        // Anchor is present but filtered out; pick the closest visible
-        // neighbor.  Prefer the next event after the anchor (closer in
-        // time when scrolling forward through bookmarks); fall back to
-        // the previous event when nothing later is visible.
-        match (next_visible_after, last_visible_before) {
-            (Some(idx), _) => ResolvePosition::FilteredOut(idx),
-            (None, Some(idx)) => ResolvePosition::FilteredOut(idx),
-            (None, None) => ResolvePosition::FilteredOut(0),
-        }
-    }
-
-    /// Closest visible neighbor of an anchor whose source was excluded
-    /// by the source-id filter, indexed by time alone.
-    ///
-    /// Walks the source-id-filtered merge once and returns:
-    /// - the row of the first visible event whose `time > anchor_time`,
-    /// - or, when no later event is visible, the row of the latest
-    ///   visible event whose `time <= anchor_time`,
-    /// - or `0` when nothing is visible at all.
-    ///
-    /// Mirrors the next-then-previous preference of the in-merge
-    /// FilteredOut path so a bookmark whose source is regex-excluded
-    /// behaves the same as one whose anchored event was excluded by an
-    /// event-level predicate.
-    fn filtered_out_neighbor_by_time(
-        &self,
-        filter: &Filter,
-        anchor_time: DateTime<Utc>,
-    ) -> ResolvePosition {
-        let cursors = self
-            .sources
-            .iter()
-            .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| SourceCursor::new(s.as_ref()))
-            .collect();
-        let mut row = 0usize;
-        let mut last_before: Option<usize> = None;
-        for item in (MergeIter { cursors }) {
-            let Ok(ee) = item else { continue };
-            if !filter.matches_event(&ee.event) {
-                continue;
-            }
-            if ee.event.time > anchor_time {
-                return ResolvePosition::FilteredOut(row);
-            }
-            last_before = Some(row);
-            row += 1;
-        }
-        ResolvePosition::FilteredOut(last_before.unwrap_or(0))
-    }
-}
-
-/// Outcome of [`Engine::resolve_position`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolvePosition {
-    /// The bookmarked event is currently visible at the returned row
-    /// index in `query_events(filter)`.
-    Found(usize),
-    /// The bookmarked event still exists in the source but is hidden by
-    /// the active filter.  The returned index is the closest visible
-    /// neighbor: preferring the next visible event after the anchor,
-    /// falling back to the previous one when nothing later survives the
-    /// filter.  When no events at all survive the filter the index is
-    /// `0`, which is conventionally the top of the (empty) view.
-    FilteredOut(usize),
-    /// The source the bookmark refers to is no longer attached to this
-    /// engine, or the source is attached but the anchored event isn't
-    /// present (e.g. the file was rewritten between sessions).
-    Gone,
 }
 
 /// One-step lookahead over a single [`Source`]'s event stream, with
@@ -542,30 +385,8 @@ impl<'a> Iterator for EventStream<'a> {
     }
 }
 
-/// K-way merge over a `Vec<SourceCursor>`.
-///
-/// On each `next` call: scan all cursors and pick the one to emit from.
-/// A cursor whose head is a non-event (parse/IO error or out-of-order
-/// warning) is preferred over any cursor whose head is an event,
-/// regardless of time, so error and warning rows stay close to their
-/// position in the file that produced them.  Among event heads, the
-/// smallest timestamp wins.  All ties (errors-with-errors,
-/// equal-timestamp events) break by source-add order.
-struct MergeIter<'a> {
-    cursors: Vec<SourceCursor<'a>>,
-}
-
-impl<'a> Iterator for MergeIter<'a> {
-    type Item = Result<EngineEvent, SourceError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        pop_next(&mut self.cursors)
-    }
-}
-
-/// Pops the next item across `cursors` using the rule documented on
-/// [`MergeIter`]: error/warning heads are emitted ahead of any event
-/// head; among event heads, smallest timestamp wins; ties break by
+/// Pops the next item across `cursors`: error/warning heads are emitted ahead
+/// of any event head; among event heads, smallest timestamp wins; ties break by
 /// add-order.  Returns `None` once every cursor is drained.
 fn pop_next<'a>(
     cursors: &mut [SourceCursor<'a>],
@@ -904,26 +725,6 @@ mod tests {
         dir.cleanup();
     }
 
-    /// Build a fixture engine where each source has events at the
-    /// supplied epoch seconds (one per second, message `"<name> <i>"`).
-    /// Returns the engine plus the [`SourceId`] for each source so
-    /// tests can build anchors.
-    fn fixture_engine(
-        dir: &TestDir,
-        sources: &[(&str, &[i64])],
-    ) -> (Engine, Vec<SourceId>) {
-        let mut engine = Engine::new();
-        let mut ids = Vec::new();
-        for (name, seconds) in sources {
-            let p = dir.path().join(format!("{name}.log"));
-            for sec in *seconds {
-                append_bunyan_at(&p, "x", t(*sec), &format!("{name} {sec}"));
-            }
-            ids.push(engine.add_file_source(&p).unwrap());
-        }
-        (engine, ids)
-    }
-
     /// Walks `engine`'s default-filter merge and returns the position of
     /// the n-th `Ok` event.  Tests use this instead of building anchors
     /// by hand because `LogStreamPosition` carries a tiebreaker that
@@ -935,100 +736,6 @@ mod tests {
             .nth(n)
             .expect("event index in range")
             .position
-    }
-
-    #[test]
-    fn resolve_position_finds_anchored_event_under_default_filter() {
-        let dir = TestDir::new();
-        let (engine, _ids) = fixture_engine(&dir, &[("a", &[10, 20, 30])]);
-        let anchor = nth_position(&engine, 1);
-        assert_eq!(
-            engine.resolve_position(&Filter::default(), &anchor),
-            ResolvePosition::Found(1),
-        );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_survives_unrelated_filter_changes() {
-        // Anchor on a `name=Nexus` event then re-resolve under a
-        // filter that strips every `name=Other` event.  The anchor's
-        // row index should now be the first remaining row.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "Other", t(10), "a");
-        append_bunyan_at(&p, "Nexus", t(20), "b");
-        append_bunyan_at(&p, "Other", t(30), "c");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let anchor = nth_position(&engine, 1);
-        let filter: Filter = "name=Nexus".parse().unwrap();
-        assert_eq!(
-            engine.resolve_position(&filter, &anchor),
-            ResolvePosition::Found(0),
-        );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_when_anchored_event_is_filtered_out_picks_next() {
-        // Three events; anchor on the middle one.  Apply a filter that
-        // drops only the middle one — resolution should jump to the
-        // *next* still-visible row, which is the third event at row 1
-        // in the filtered view.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        append_bunyan_at(&p, "x", t(20), "b");
-        append_bunyan_at(&p, "x", t(30), "c");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let anchor = nth_position(&engine, 1);
-        let filter: Filter = "msg!=b".parse().unwrap();
-        assert_eq!(
-            engine.resolve_position(&filter, &anchor),
-            ResolvePosition::FilteredOut(1),
-        );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_falls_back_to_previous_when_no_later_visible() {
-        // Anchor on the last event, which the filter excludes.  No
-        // later visible event → fall back to the previous one.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        append_bunyan_at(&p, "x", t(20), "b");
-        append_bunyan_at(&p, "x", t(30), "tail");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let anchor = nth_position(&engine, 2);
-        let filter: Filter = "msg!=tail".parse().unwrap();
-        assert_eq!(
-            engine.resolve_position(&filter, &anchor),
-            ResolvePosition::FilteredOut(1),
-        );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_when_source_is_gone() {
-        // Anchor against engine A (with a source), then resolve against
-        // engine B (with no sources).  The bookmark cannot find its
-        // source.
-        let dir = TestDir::new();
-        let p = dir.path().join("a.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        let mut engine_a = Engine::new();
-        engine_a.add_file_source(&p).unwrap();
-        let anchor = nth_position(&engine_a, 0);
-        let engine_b = Engine::new();
-        assert_eq!(
-            engine_b.resolve_position(&Filter::default(), &anchor),
-            ResolvePosition::Gone,
-        );
-        dir.cleanup();
     }
 
     #[test]
@@ -1120,102 +827,6 @@ mod tests {
             .collect();
         assert_eq!(msgs, vec!["n-error"]);
 
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_treats_source_id_filter_as_filtered_out() {
-        // Anchor on a source's event, then apply a filter that
-        // excludes the anchor's source.  The bookmark's source is
-        // still attached, so the result is FilteredOut against the
-        // closest visible neighbor — not Gone.
-        let dir = TestDir::new();
-        let nexus = dir.path().join("nexus.log");
-        let sled = dir.path().join("sled.log");
-        append_bunyan_at(&nexus, "x", t(10), "n1");
-        append_bunyan_at(&sled, "x", t(5), "s-before");
-        append_bunyan_at(&sled, "x", t(20), "s-after");
-        let mut engine = Engine::new();
-        engine.add_file_source(&nexus).unwrap();
-        engine.add_file_source(&sled).unwrap();
-        // Anchor on the nexus event.  The merge order is
-        // s-before(5), n1(10), s-after(20); n1 is index 1.
-        let anchor = engine
-            .query_events(&Filter::default())
-            .filter_map(|r| r.ok())
-            .find(|ee| ee.event.msg == "n1")
-            .unwrap()
-            .position;
-
-        // Exclude nexus by source-id.  Visible-only sequence is
-        // s-before(5), s-after(20); the anchor (t=10) is between them,
-        // so the nearest visible-later event wins per the FilteredOut
-        // contract: s-after at filtered row 1.
-        let filter: Filter = "source_id!~nexus".parse().unwrap();
-        assert_eq!(
-            engine.resolve_position(&filter, &anchor),
-            ResolvePosition::FilteredOut(1),
-        );
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_falls_back_to_before_when_no_later_under_source_id_filter()
-     {
-        // Same shape as the previous test, but the anchor sits *after*
-        // every other source's events.  No later visible neighbor →
-        // fall back to the latest earlier visible event.
-        let dir = TestDir::new();
-        let nexus = dir.path().join("nexus.log");
-        let sled = dir.path().join("sled.log");
-        append_bunyan_at(&sled, "x", t(5), "s-1");
-        append_bunyan_at(&sled, "x", t(7), "s-2");
-        append_bunyan_at(&nexus, "x", t(20), "n-tail");
-        let mut engine = Engine::new();
-        engine.add_file_source(&nexus).unwrap();
-        engine.add_file_source(&sled).unwrap();
-        let anchor = engine
-            .query_events(&Filter::default())
-            .filter_map(|r| r.ok())
-            .find(|ee| ee.event.msg == "n-tail")
-            .unwrap()
-            .position;
-
-        let filter: Filter = "source_id!~nexus".parse().unwrap();
-        // Visible events: s-1(0), s-2(1).  Anchor t=20 is later than
-        // both, so we fall back to the latest before: row 1 (s-2).
-        assert_eq!(
-            engine.resolve_position(&filter, &anchor),
-            ResolvePosition::FilteredOut(1),
-        );
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn resolve_position_disambiguates_same_time_events() {
-        // Two events from the same source share a timestamp.  Anchor
-        // on the second; resolve must return its index, not the
-        // first's.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        append_bunyan_at(&p, "x", t(10), "b"); // same time
-        append_bunyan_at(&p, "x", t(20), "c");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let first = nth_position(&engine, 0);
-        let second = nth_position(&engine, 1);
-        assert_ne!(first, second, "same-time anchors must differ");
-        assert_eq!(
-            engine.resolve_position(&Filter::default(), &second),
-            ResolvePosition::Found(1),
-        );
-        assert_eq!(
-            engine.resolve_position(&Filter::default(), &first),
-            ResolvePosition::Found(0),
-        );
         dir.cleanup();
     }
 

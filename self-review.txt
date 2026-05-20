@@ -23,6 +23,9 @@ Cargo.toml
 src/view_target.rs
 src/session_store.rs
 src/lib.rs
+src/save_policy.rs
+src/engine/merge.rs
+src/engine.rs
 
 done, revisit:
 src/bin/seer.rs
@@ -31,9 +34,6 @@ TODO:
 benches/engine.rs
 examples/gen_fixture.rs
 src/bin/seeit.rs
-src/engine.rs
-src/engine/merge.rs
-src/save_policy.rs
 src/session.rs
 src/stream.rs
 src/streamview.rs
@@ -61,6 +61,7 @@ For CLAUDE.md:
       Just use two sentences.
     - The bar shrinks (and at very narrow widths is dropped entirely) so the numeric components are never truncated — losing the percent number is more confusing than losing bar resolution.
     - "Toggled with `p` and not persisted across sessions: it's a debugging affordance, not part of the user's view state."
+- try harder to avoid unwrap/expect when you can structure stuff with `let else`, match, etc.
 
 
 
@@ -137,3 +138,30 @@ seer.rs:
 src/save_policy.rs:
 - seems like it belongs as part of the session store?
 - I'm not clear that this abstraction makes a lot of sense.  Intuitively it does but the specific shape seems weird.
+
+src/engine/merge.rs:
+- FETCH_BATCH_SIZE: is that comment right?
+- fixed: MergeError: should use ThisError and strike `source_error`
+- there seems to be a lot of cloning.  Maybe MergeRecord should hold a BufferedRecord (and consumers should use accessors for fields).  This might be tricky since the stepper holds onto the BufferedRecord for an unspecified period of time.
+- SourceWindow: uses bools for EOF despite having an enum
+- max_walks (and related identifiers) should be like `max_scan` or `max_records_to_scan` or something
+- I'm feeling like we never want `max_walks` to be `None` and I'm not clear why we don't treat everything like a "long op"
+- Move `step_backward_n()` into `seeit`
+- step(): error condition should panic?  or restructure the code to avoid this condition
+- pick(): loop could be reworked to avoid "expect"
+
+Current status: almost done src/engine/merge.rs, looking at pick() last, then tests
+
+General: should SourceId have a borrowed string so it's more cheaply copy'able?  Owned by source itself.
+
+src/engine.rs:
+- cursor_for_position seems like it should be a LongOp
+  - it's a little surprising this can't be done more directly?  it's seeking to a LogStreamPosition but shouldn't it save a cursor for everything?
+- why does query_events() need to exist?  Looks like it's only for the summary view (and a lot of tests)
+- In general, do we need all these different ways to do thing?
+  - Stepper: used for general navigation *as well as* navigating to a bookmark
+  - EventStream: used for summary
+  - ??
+- fixed: resolve_position(): appears only to be used in tests
+- based on my read of EventStream, if summary uses this, then a very selective filter in a summary view will hang for a while
+  (that seems accurate based on my check)
