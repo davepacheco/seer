@@ -27,6 +27,8 @@ src/save_policy.rs
 src/engine/merge.rs
 src/engine.rs
 src/session.rs
+src/summary.rs
+src/test_fixtures.rs
 
 done, revisit:
 src/bin/seer.rs
@@ -37,8 +39,6 @@ examples/gen_fixture.rs
 src/bin/seeit.rs
 src/stream.rs
 src/streamview.rs
-src/summary.rs
-src/test_fixtures.rs
 tests/fixtures/sample.log
 tests/fixtures/session.schema.json
 tests/scale.rs
@@ -176,3 +176,7 @@ src/summary.rs:
 - finish(): has a comment about BTreeSet for deterministic iteration order but
   it doesn't seem like that matters
 - format_time_label (relates to above): granularity should probably be an enum with explicit values
+
+src/test_fixtures.rs:
+- I don't like the feature.  Make this a separate package?
+- There are 4-5 copies of `fn t()`.

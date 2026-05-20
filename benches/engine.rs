@@ -4,14 +4,13 @@
 
 //! Criterion benchmarks for the seer engine and streamview hot paths.
 //!
-//! Built only with `--features test-fixtures` enabled.  Each bench
-//! builds its fixture once outside `b.iter` so the measurement
+//! Each bench builds its fixture once outside `b.iter` so the measurement
 //! reflects only the operation under test, not fixture generation.
 //!
 //! Sample size is reduced to 10 (down from criterion's default 100)
 //! because most of these benches drain a 50K-record file each
 //! iteration; 100 samples would make a single bench run for several
-//! minutes.  Run with `cargo bench --features test-fixtures`.
+//! minutes.
 
 use camino_tempfile::Utf8TempDir;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};

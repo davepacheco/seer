@@ -14,10 +14,9 @@
 //!   (useful for deliberately malformed lines).  A `slog`-based
 //!   [`append_bunyan`] is also available, but only to crate-internal
 //!   unit tests because `slog` is a dev-dependency.
-//! - [`gen_single_source`] / [`gen_multi_source`] /
-//!   [`gen_with_parse_errors`]: bulk emitters that write hundreds or
-//!   thousands of records, used by scale tests under `tests/` and by
-//!   benches under `benches/`.
+//! - [`gen_single_source`] / [`gen_multi_source`]: bulk emitters that write
+//!   hundreds or thousands of records, used by scale tests under `tests/` and
+//!   by benches under `benches/`.
 //!
 //! The module is exposed publicly only when compiling under
 //! `#[cfg(test)]` or with the `test-fixtures` feature enabled (see
@@ -72,12 +71,6 @@ impl TestDir {
         if let Err(e) = inner.close() {
             panic!("cleanup of test temp dir failed: {e}");
         }
-    }
-}
-
-impl Default for TestDir {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -291,44 +284,4 @@ pub fn gen_multi_source(
         paths.push(path);
     }
     paths
-}
-
-/// Writes `count` records to `path`, where every `error_every`-th
-/// line (`error_every > 0`) is intentionally malformed and the rest
-/// are valid bunyan.
-///
-/// Useful for testing per-line error handling on files large enough to
-/// exercise the chunked-read paths.
-pub fn gen_with_parse_errors(
-    path: &Utf8Path,
-    count: usize,
-    error_every: usize,
-) {
-    let opts = GenOpts::default();
-    let mut f = File::options()
-        .create(true)
-        .append(true)
-        .open(path)
-        .expect("open log file for append");
-    for i in 0..count {
-        if error_every > 0 && i % error_every == 0 {
-            writeln!(f, "not a valid bunyan record at index {i}")
-                .expect("write malformed line");
-        } else {
-            let i_i32 = i32::try_from(i)
-                .expect("record index fits in i32 for fixtures");
-            let time = opts.base_time + opts.step * i_i32;
-            let record = serde_json::json!({
-                "v": 0,
-                "level": 30,
-                "name": "test",
-                "hostname": opts.hostname,
-                "pid": opts.pid,
-                "time": time
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                "msg": "valid record",
-            });
-            writeln!(f, "{record}").expect("write record");
-        }
-    }
 }
