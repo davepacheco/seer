@@ -72,7 +72,7 @@ expectorate = "1.2.0"
 proptest = "1.6.0"
 slog = "2.7.0"
 slog-bunyan = "2.5.0"
-strum = { version = "0.28", features = ["derive"] }
+strum = { version = "0.27", features = ["derive"] }
 
 [[test]]
 name = "scale"
