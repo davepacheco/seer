@@ -2,15 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `seer`: minimal interactive log viewer.
+//! `seer`: interactive log viewer.
 //!
 //! Builds a [`seer::Engine`] from the file paths on the command line and
 //! presents one or more tabs over it.  Each [`Tab`] is an independent
 //! view with its own [`Filter`] and scroll position; the engine itself
-//! (and therefore the underlying sources) is shared.  Future iterations
-//! will lazy-load and wire in bookmarks and richer log streams; this is
-//! the smallest end-to-end exercise of the parse → engine → render
-//! path.
+//! (and therefore the underlying sources) is shared.
 
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Utc};
@@ -79,7 +76,7 @@ struct Args {
     /// Resume a saved session by id.  Skips the resume dialog and
     /// opens the TUI directly on the loaded session; the engine is
     /// rebuilt from the session's own source list.  Aborts with an
-    /// error if any of the session's source files no longer exist.
+    /// error if any of the session's source files no longer exists.
     #[arg(long, value_name = "SESSION_ID", conflicts_with = "list")]
     resume: Option<SessionId>,
 
@@ -125,14 +122,14 @@ enum StartupChoice {
     /// [`SessionStore::find_matches`]), so no second `load()` is
     /// needed.  Boxed so the enum's other unit variants don't pay
     /// for the `Session`'s bulk.
-    Resume(Box<Session>),
+    ResumeSavedSession(Box<Session>),
     /// Mint a fresh saved session: write to disk, plumb the
     /// [`SessionStore`] into [`App`].
-    NewSaved,
+    NewSavedSession,
     /// Mint a fresh session but skip persistence entirely: no
     /// initial save, no [`SessionStore`] on the [`App`], and no
     /// "session saved" hint on exit.
-    NewTransient,
+    NewTransientSession,
     /// User dismissed the dialog (Esc / Ctrl-C).  Caller should
     /// exit immediately.
     Quit,
@@ -179,11 +176,11 @@ impl StartupDialog {
             // `swap_remove` is fine — we are dropping `self` either
             // way, so element-order disturbance is irrelevant.
             let m = self.matches.swap_remove(self.selected);
-            StartupChoice::Resume(Box::new(m.session))
+            StartupChoice::ResumeSavedSession(Box::new(m.session))
         } else if self.selected == self.new_saved_idx() {
-            StartupChoice::NewSaved
+            StartupChoice::NewSavedSession
         } else {
-            StartupChoice::NewTransient
+            StartupChoice::NewTransientSession
         }
     }
 
@@ -562,10 +559,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Positional-files path: discovery + resume dialog.  Clap allows
-    // an empty file list at this point only because we relaxed
-    // `required = true`; surface a friendly message rather than the
-    // raw clap "missing argument" usage error.
+    // Without --list or --resume, we should be given a list of files to load
+    // into a session.
     if args.files.is_empty() {
         return Err("no files provided; use --list to see saved sessions or \
              --resume <id> to reopen one"
@@ -593,8 +588,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // store: transient sessions get `None` and skip every write.
     let (session, store_for_app, resumed) = match choice {
         StartupChoice::Quit => return Ok(()),
-        StartupChoice::Resume(s) => (*s, Some(store), true),
-        StartupChoice::NewSaved => {
+        StartupChoice::ResumeSavedSession(s) => (*s, Some(store), true),
+        StartupChoice::NewSavedSession => {
             let mut s = Session::new();
             s.sources = sources;
             // Initial save before opening the TUI.  If the state
@@ -603,7 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             store.save(s.id, &s)?;
             (s, Some(store), false)
         }
-        StartupChoice::NewTransient => {
+        StartupChoice::NewTransientSession => {
             let mut s = Session::new();
             s.sources = sources;
             (s, None, false)
@@ -696,16 +691,12 @@ fn visual_rows_for(line: &str, width: u16) -> usize {
 
 /// Splits `text` into successive slices that are each at most `width`
 /// characters wide, breaking at the column boundary regardless of word
-/// boundaries.  Used by the raw render path so a copied wrapped line
-/// can be re-joined by stripping newlines: with word-wrap, the wrap
-/// point can replace a space, leaving the copy ambiguous about
-/// whether the newline should re-expand to a space.  With column-wrap,
-/// the visual rows are contiguous bytes of the source line — stripping
-/// newlines recovers the original.
-///
-/// Empty input yields one empty slice so the caller always has at
-/// least one chunk to render.  `width == 0` (degenerate terminal)
-/// returns the whole line in one chunk to avoid a divide-by-zero.
+/// boundaries.  Used when rendering raw log entries so that a wrapped line can
+/// be re-joined by stripping newlines.  (With word-wrap, the wrap point can
+/// replace a space, leaving the result ambiguous about whether the newline
+/// should re-expand to a space.  With column-wrap, the visual rows are
+/// contiguous bytes of the source line.  Stripping newlines recovers the
+/// original.)
 fn column_chunks(text: &str, width: u16) -> Vec<&str> {
     if width == 0 || text.is_empty() {
         return vec![text];
@@ -819,10 +810,8 @@ fn format_byte_rate(bytes_per_sec: f64) -> String {
 /// where N is the number of records currently visible, B is the byte
 /// offset of the topmost visible record across all sources (a single
 /// number summed from the streamview anchor cursor), T is the total
-/// bytes of every source matched by the active filter, and P is
-/// `100 * B / T`.  When the viewport sits at the very start every
-/// source contributes zero to B, so the "(beginning of stream)" marker
-/// only appears when we have a streamview to consult.
+/// bytes of all sources matched by the active filter, and P is
+/// `100 * B / T`.
 ///
 /// Tabs without a streamview (synthetic test fixtures and Summary
 /// builds before they materialize) have no meaningful byte offset, so
@@ -933,23 +922,20 @@ fn format_fetch_stats(stats: &ParseStats) -> String {
 /// take to drop a frame at 60 Hz, while still being large enough that
 /// the per-chunk overhead (rebuilding a [`Stepper`] from the saved
 /// [`Cursor`] for summary builds, handing back to the event loop for
-/// search) doesn't dominate the parse cost.  Tuned by hand; not a
-/// load-bearing constant.
+/// search) doesn't dominate the parse cost.
 const LONG_OP_CHUNK_RECORDS: usize = 4_000;
 
 /// A multi-chunk operation driven by the main event loop in between
-/// frame draws.  Two flavors today — building a Summary tab's
-/// histogram, and stepping a search across the merged stream — both of
-/// which can scan a large fraction of the underlying log files and
-/// would otherwise block the UI for seconds at a time.
+/// frame draws.  This is used for anything where the TUI would be otherwise
+/// unresponsive for an unbounded amount of time, which basically means any time
+/// an indefinite amount of scanning is required (e.g., building a summary,
+/// searching, seeking to a specific spot).
 ///
 /// While a [`LongOp`] is active, the parse-stats line is replaced with
 /// a progress bar; Ctrl-C cancels and unwinds (no partial summary, no
 /// anchor change for search).
 enum LongOp {
-    // [`SummaryOp`] is several hundred bytes (SummaryBuilder owns
-    // multiple HashMaps); boxed to keep the enum compact since
-    // [`SearchOp`] is only ~88 bytes.
+    // Box the [`SummaryOp`] to keep this enum compact.
     BuildSummary(Box<SummaryOp>),
     Search(SearchOp),
     /// Chunked window-fill behind `g`, `G`, bookmark navigation, and
@@ -1014,7 +1000,7 @@ impl LongOp {
 
 /// In-progress Summary build.  Holds the partial [`SummaryBuilder`]
 /// across chunks plus a [`Cursor`] from which the next [`Stepper`] is
-/// built.  Drained by repeated calls to [`Self::advance`]; on
+/// built.  Drained by repeated calls to [`Self::advance`].  On
 /// completion, [`Self::finalize`] turns it into the histogram lines
 /// the destination tab will display.
 struct SummaryOp {
@@ -1340,7 +1326,7 @@ impl SearchDirection {
     /// Character drawn at the left of the search prompt — `/` for
     /// forward, `?` for backward.  Matches the key that opened the
     /// dialog.
-    fn prompt(self) -> char {
+    fn prompt(&self) -> char {
         match self {
             Self::Forward => '/',
             Self::Backward => '?',
@@ -1431,16 +1417,16 @@ struct Tab {
     select: Option<Selection>,
 }
 
-/// What a select-mode commit will do.
-///
-/// `x` → exclude (build `msg != <selected>`); `X` → include (build
-/// `msg = <selected>`); `b` → bookmark (open the name dialog).  Stored
-/// on [`Selection`] so the rendering and dispatch paths agree on what
-/// kind of mode the user is in.
+/// What committing (hitting enter) in the current selection mode will do
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionAction {
+    /// Append to the current filter a predicate that excludes all records whose
+    /// message matches the selected record
     Exclude,
+    /// Append to the current filter a predicate that includes all records whose
+    /// message matches the selected record
     Include,
+    /// Create a bookmark pointing at the selected record
     Bookmark,
 }
 
@@ -1532,10 +1518,6 @@ impl Tab {
     /// the cached rows, viewport, and transient selection/search state.
     /// Call after the [`LogStream::filter`] for `self.stream` has been
     /// mutated.
-    /// Re-runs the host stream's filter against the engine and
-    /// refreshes the cached rows, viewport, and transient
-    /// selection/search state.  Call after the [`LogStream::filter`]
-    /// for `self.stream` has been mutated.
     ///
     /// `anchor` controls where the new viewport lands:
     ///
@@ -1998,10 +1980,6 @@ struct App {
     /// constructors leave this `None`.
     store: Option<SessionStore>,
     /// Save-cadence bookkeeping for session-affecting mutations.
-    /// Phase 5 only flushes on exit; later phases call
-    /// `policy.record(Cadence::Inline)` and `Cadence::Debounced` at
-    /// the appropriate mutation sites and consult `policy.due()` in
-    /// the event loop.
     policy: SavePolicy,
     /// When true, draw a developer-oriented row above the user status
     /// line showing engine fetch progress (`X records (Y) fetched in
@@ -2016,7 +1994,7 @@ impl App {
     /// [`Self::new_with_session`] so a previously-saved session and
     /// the on-disk store are honored.
     #[cfg(test)]
-    fn new(engine: Engine) -> Self {
+    fn new_for_tests(engine: Engine) -> Self {
         Self::new_with_session(
             engine,
             Session::new(),
@@ -3921,8 +3899,6 @@ impl App {
         let page = self.viewport_height as usize;
         let half_page = page / 2;
         match key {
-            // Only `q` opens the quit prompt; see `handle_bookmarks_key`
-            // for the rationale behind not accepting Esc or Ctrl-C.
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::NONE,
@@ -3993,8 +3969,7 @@ impl App {
                 self.seek_active_to_start();
             }
             // Different terminals report `G` with NONE or SHIFT; accept
-            // both.  Don't accept CONTROL/ALT — those are unrelated
-            // bindings the user might add later.
+            // both.
             KeyEvent { code: KeyCode::Char('G'), modifiers, .. }
                 if modifiers == KeyModifiers::NONE
                     || modifiers == KeyModifiers::SHIFT =>
@@ -6377,7 +6352,7 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         a.viewport_height = 10;
         let initial_len = a.active_tab().formatted().len();
         // Page down a generous number of times — each press advances by
@@ -6859,7 +6834,7 @@ mod tests {
 
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         a.viewport_height = 2;
         a.active_tab_mut().viewport_top = LineIdx(3);
         assert_eq!(a.active_tab().formatted().len(), 6);
@@ -8607,7 +8582,7 @@ mod tests {
         }
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        (App::new(engine), dir)
+        (App::new_for_tests(engine), dir)
     }
 
     #[test]
@@ -8715,7 +8690,7 @@ mod tests {
         for path in &paths {
             engine.add_file_source(path).unwrap();
         }
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         a.viewport_height = 5;
 
         // Filter out the first sled entirely: every one of its records
@@ -8779,7 +8754,7 @@ mod tests {
         for path in &paths {
             engine.add_file_source(path).unwrap();
         }
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         a.viewport_height = 5;
 
         let filter: Filter =
@@ -10036,7 +10011,7 @@ mod tests {
         }
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         a.viewport_height = 10;
         (a, dir)
     }
@@ -10072,7 +10047,7 @@ mod tests {
         }
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        let mut a = App::new(engine);
+        let mut a = App::new_for_tests(engine);
         // The multi-line tests are about exactly the line/event split
         // that extras introduce.  Streams hide extras by default, so
         // flip the toggle on before handing the app back.
@@ -10234,7 +10209,7 @@ mod tests {
         drop(f);
         let mut engine = Engine::new();
         engine.add_file_source(&path).unwrap();
-        let a = App::new(engine);
+        let a = App::new_for_tests(engine);
         let tab = a.active_tab();
         assert_eq!(tab.events().len(), 2);
         assert_eq!(tab.formatted().len(), 2, "extras should be hidden");
@@ -10846,7 +10821,7 @@ mod tests {
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let session_id = Session::new().id;
 
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         a.session.id = session_id;
         a.store = Some(store);
         // Simulate a debounced mutation having dirtied the session.
@@ -10868,7 +10843,7 @@ mod tests {
         // try_save_now must succeed without touching disk.  The
         // policy's dirty bit is also left alone — there's no flush
         // to record.
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         assert!(a.store.is_none());
         a.policy.record(seer::Cadence::Debounced);
         a.try_save_now().expect("no-op should succeed");
@@ -10884,7 +10859,7 @@ mod tests {
     fn app_with_store_and_one_tab() -> (App, camino_tempfile::Utf8TempDir) {
         let dir = camino_tempfile::tempdir().unwrap();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         a.store = Some(store);
         // The default `App::new` already pushed a tab; that push
         // would itself have saved if a store had been attached at
@@ -11336,22 +11311,22 @@ mod tests {
         // Row 0: first candidate.
         let mut d = make();
         d.selected = 0;
-        assert!(matches!(d.confirm(), StartupChoice::Resume(_)));
+        assert!(matches!(d.confirm(), StartupChoice::ResumeSavedSession(_)));
 
         // Row 1: second candidate.
         let mut d = make();
         d.selected = 1;
-        assert!(matches!(d.confirm(), StartupChoice::Resume(_)));
+        assert!(matches!(d.confirm(), StartupChoice::ResumeSavedSession(_)));
 
         // Row 2: New saved.
         let mut d = make();
         d.selected = 2;
-        assert!(matches!(d.confirm(), StartupChoice::NewSaved));
+        assert!(matches!(d.confirm(), StartupChoice::NewSavedSession));
 
         // Row 3: New transient.
         let mut d = make();
         d.selected = 3;
-        assert!(matches!(d.confirm(), StartupChoice::NewTransient));
+        assert!(matches!(d.confirm(), StartupChoice::NewTransientSession));
     }
 
     #[test]
@@ -11389,7 +11364,7 @@ mod tests {
         // first candidate); Enter resumes it.
         let d = StartupDialog::new(vec![fake_match(MatchKind::Exact)]);
         match d.handle_key(keypress(KeyCode::Enter)) {
-            StartupDialogStep::Done(StartupChoice::Resume(_)) => {}
+            StartupDialogStep::Done(StartupChoice::ResumeSavedSession(_)) => {}
             _ => panic!("expected Done(Resume)"),
         }
     }
@@ -11400,7 +11375,7 @@ mod tests {
         // rows in between).
         let d = StartupDialog::new(Vec::new());
         match d.handle_key(keypress(KeyCode::Enter)) {
-            StartupDialogStep::Done(StartupChoice::NewSaved) => {}
+            StartupDialogStep::Done(StartupChoice::NewSavedSession) => {}
             _ => panic!("expected Done(NewSaved)"),
         }
     }
@@ -11527,7 +11502,7 @@ mod tests {
         let dir = camino_tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join("sessions");
         let store = SessionStore::open_at(&sessions_dir).unwrap();
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         a.store = Some(store);
         // Make the policy due.
         a.policy.mark_saved(now_minus(Duration::from_secs(60)));
@@ -11587,7 +11562,7 @@ mod tests {
         let dir = camino_tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join("sessions");
         let store = SessionStore::open_at(&sessions_dir).unwrap();
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         a.store = Some(store);
         // Save once successfully so the initial state is on disk.
         a.save_after_inline_mutation();
@@ -11719,7 +11694,7 @@ mod tests {
     #[test]
     fn seeit_command_dialog_notice_when_session_is_transient() {
         // App with no store attached (the transient-session case).
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         assert!(a.store.is_none());
 
         a.handle_key(shift('Y'));
@@ -11856,7 +11831,7 @@ mod tests {
     fn bookmarks_y_with_no_store_falls_back_to_notice() {
         // Same transient-session story as the main-tab Y binding: no
         // store means no on-disk session for `seeit` to point at.
-        let mut a = App::new(Engine::new());
+        let mut a = App::new_for_tests(Engine::new());
         let stream_id = a.tabs[a.active].stream;
         add_bookmark_at(&mut a, stream_id, 1, "only");
         while !a.bookmarks_active() {

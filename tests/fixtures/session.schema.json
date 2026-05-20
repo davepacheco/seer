@@ -337,7 +337,7 @@
       ]
     },
     "HostnameDisplay": {
-      "description": "How [`format_event`] should render the bunyan `hostname` field.\n\nSelected via the `h` field-display dialog in the TUI and persisted on the host [`crate::stream::LogStream`] so the choice outlives a session.",
+      "description": "How [`format_event`] should render the bunyan `hostname` field.",
       "oneOf": [
         {
           "description": "Trim to the first dot-component, then collapse a trailing UUID to its first 8-character group — see [`short_hostname`].  This is the default because real Oxide hostnames carry a domain suffix and a service-instance UUID that crowd the header without informing the user.",
