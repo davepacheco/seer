@@ -172,12 +172,11 @@ src/session.rs:
 - session id: why not pure random?  how about base62
 - when would Tab.cursor actually be `None`?
 
-src/summary.rs:
-- do we actually need the per-source information?  I feel like we don't.
-- it's keeping every timestamp with nanosecond precision.  That's not great.  If there's a maximum resolution (e.g., 1m), then we should keep at most that.  If not...maybe there should be?
-- finish(): has a comment about BTreeSet for deterministic iteration order but
-  it doesn't seem like that matters
-- format_time_label (relates to above): granularity should probably be an enum with explicit values
+fixed: src/summary.rs:
+- fixed: do we actually need the per-source information?  I feel like we don't.
+- fixed: it's keeping every timestamp with nanosecond precision.  That's not great.  If there's a maximum resolution (e.g., 1m), then we should keep at most that.  If not...maybe there should be?
+- fixed: format_time_label (relates to above): granularity should probably be an enum with explicit values
+- fixed: finish(): has a comment about BTreeSet for deterministic iteration order but it doesn't seem like that matters
 
 src/test_fixtures.rs:
 - I don't like the feature.  Make this a separate package?
