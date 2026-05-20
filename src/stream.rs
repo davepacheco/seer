@@ -2,13 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Log streams.
-//!
-//! A "log stream" is the unit a tab views.  Conceptually it is a filter
-//! over the events in some set of sources; today the type carries only
-//! an id, so its observable behavior is "produces every event from every
-//! source the engine knows about" — the same as `Engine::query_events`.
-//! Filters and source-set restrictions land here next.
+//! View into a stream of log records, encapsulating filtering and related
+//! options
 
 use crate::filter::Filter;
 use crate::render::{HostnameDisplay, RenderOpts};
@@ -46,15 +41,7 @@ impl LogStreamId {
 
 /// A log stream.
 ///
-/// Owns its identity, display name, and active filter.  The set of
-/// sources a stream draws from will join the struct once
-/// per-stream source restrictions land; for now every stream sees every
-/// source the engine knows about.
-///
-/// Filter ownership lives here (rather than on the display tab) so that
-/// when a bookmark targets a stream that has no tab open, opening a
-/// fresh tab for that stream restores the user's filter alongside the
-/// position.
+/// Owns its identity, display name, and active filter.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogStream {
     pub id: LogStreamId,

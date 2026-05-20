@@ -29,18 +29,20 @@ src/engine.rs
 src/session.rs
 src/summary.rs
 src/test_fixtures.rs
+tests/fixtures/sample.log
+tests/fixtures/session.schema.json
+examples/gen_fixture.rs
+src/stream.rs
 
 done, revisit:
 src/bin/seer.rs
+benches/engine.rs
 
 TODO:
-benches/engine.rs
-examples/gen_fixture.rs
-src/bin/seeit.rs
-src/stream.rs
 src/streamview.rs
-tests/fixtures/sample.log
-tests/fixtures/session.schema.json
+
+TODO, lower priority:
+src/bin/seeit.rs
 tests/scale.rs
 tests/seeit_session.rs
 tests/session_lifecycle.rs
@@ -180,3 +182,26 @@ src/summary.rs:
 src/test_fixtures.rs:
 - I don't like the feature.  Make this a separate package?
 - There are 4-5 copies of `fn t()`.
+
+tests/fixtures/sample.log: can we remove this?
+
+examples/gen_fixture.rs:
+- shouldn't this use the test_fixture gen_single/gen_multi?
+
+src/stream.rs:
+- should not be `pub` fields directly constructed
+- probably means that src/session.rs needs its own version of this struct
+- this is fine but there's almost nothing to it.  maybe that's fine?
+
+General:
+- need to figure out once and for all:
+  - the responsibilities of tab vs.  logstream
+  - for each of these, whether we have 'id', 'name', or both
+  - whether it's ever okay to have two tabs pointed at the same logstream (I think not)
+  - which fields live where.
+
+src/streamview.rs:
+- what's the difference between this and Stepper?
+
+seeit:
+- I'm thinking it was a mistake to have this accept a session id.  Instead, when constructing a `seeit` command, it should accept *equivalent* args for filter, source list, display, etc.
