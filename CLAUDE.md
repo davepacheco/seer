@@ -273,12 +273,26 @@ Tradeoffs to keep in mind:
 
 - `Stepper` holds bidirectional buffers per source (capped at
   `BUFFER_LIMIT = 256`).  For a forward-only summary pass the
-  lookbehind buffer is wasted memory.  Modest, but worth noting if
-  someone benchmarks a multi-GB pass after the change.
-- Be careful that `SummaryOp` keeps constructing a fresh `Stepper`
-  per tick from a persisted `Cursor` — that's how it survives across
-  the chunk boundary today.  The helper signature should not assume
-  a long-lived stepper.
+  lookbehind buffer is unused, but it's O(1) per source — the
+  ceiling is `sources × 256 × avg_record_size`, low single-digit
+  megabytes on real data — and not worth designing around.  Only
+  reconsider if someone later raises `BUFFER_LIMIT` or wants a
+  stepper variant that opts out of buffering.
+- `SummaryOp` reconstructs a fresh `Stepper` per tick from a
+  persisted `Cursor`.  This is not a design preference: `Stepper<'a>`
+  borrows from the engine's sources, and `App.long_op` lives in the
+  same struct as `App.engine`, so a self-referential `Stepper` in
+  `SummaryOp` is not possible without restructuring.  The cost of
+  reconstruction is modest but real: the prior tick's per-source
+  buffered batch is dropped, so the first fetch after the cursor
+  refills it from storage, and `Stepper::walked_bytes` is lost
+  (`SummaryOp` keeps its own `bytes_read` field to compensate).  If
+  we want one helper signature that covers both callers honestly,
+  the better fix is to make `Stepper` own its sources (e.g.
+  `Arc<dyn Source>`) so `SummaryOp` can hold one across ticks.
+  That's a larger change than the consolidation itself, but it
+  removes the asymmetry rather than papering over it.  Short of
+  that, the helper signature must not assume a long-lived stepper.
 
 ### Misc TODO
 

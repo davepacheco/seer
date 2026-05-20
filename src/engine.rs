@@ -227,7 +227,6 @@ impl Engine {
             .collect();
         EventStream { cursors, filter, records_parsed: 0 }
     }
-
 }
 
 /// One-step lookahead over a single [`Source`]'s event stream, with

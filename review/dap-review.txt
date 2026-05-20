@@ -52,7 +52,7 @@ When done, clean up non-Rust files in the repo (e.g., plans)
 
 ------------------------------
 
-For CLAUDE.md:
+(done) For CLAUDE.md:
 - within a file, build top-down, not bottom-up
 - avoid unicode characters that have clear ASCII alternatives, like →, …, 
 - avoid run-on sentences.  Don't extend a sentence with parentheseis or hyphens.  Examples:
@@ -181,7 +181,7 @@ src/summary.rs:
 
 src/test_fixtures.rs:
 - I don't like the feature.  Make this a separate package?
-- There are 4-5 copies of `fn t()`.
+- fixed: There are 4-5 copies of `fn t()`.
 
 tests/fixtures/sample.log: can we remove this?
 

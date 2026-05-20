@@ -410,7 +410,7 @@
       ]
     },
     "LogStream": {
-      "description": "A log stream.\n\nOwns its identity, display name, and active filter.  The set of sources a stream draws from will join the struct once per-stream source restrictions land; for now every stream sees every source the engine knows about.\n\nFilter ownership lives here (rather than on the display tab) so that when a bookmark targets a stream that has no tab open, opening a fresh tab for that stream restores the user's filter alongside the position.",
+      "description": "A log stream.\n\nOwns its identity, display name, and active filter.",
       "type": "object",
       "required": [
         "id",

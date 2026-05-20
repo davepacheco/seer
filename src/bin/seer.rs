@@ -9042,8 +9042,9 @@ mod tests {
         // `viewport_top` actually has somewhere to scroll to (a
         // 4-row fixture would clamp to 0 regardless of the match
         // location).
-        let mut records: Vec<RecordSpec<'_>> =
-            (0..30).map(|i| (10 + i64::from(i) * 10, "filler", &[][..])).collect();
+        let mut records: Vec<RecordSpec<'_>> = (0..30)
+            .map(|i| (10 + i64::from(i) * 10, "filler", &[][..]))
+            .collect();
         records[25] = (260, "match-here", &[]);
         let (mut a, _dir) = multi_line_app(&records);
         a.viewport_height = 5;
