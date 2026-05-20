@@ -235,6 +235,51 @@ It should still be possible to edit the filter string directly.  If it's parseab
 
 New tabs should still open with this dialog.
 
+### Consolidate `EventStream` onto `Stepper`
+
+`EventStream` (from `engine::query_events`) and `Stepper` (from
+`engine::stepper`) are two parallel ways to iterate the merged event
+stream.  Almost everything already uses `Stepper`: `SummaryOp`,
+`SearchOp`, `SeekOp`, `StreamView`, `seeit` records mode, and
+`cursor_for_position`.  The only remaining nontrivial consumer of
+`EventStream` is `summary::summarize`, which `seeit` calls in summary
+mode.  The TUI's `SummaryOp::advance` reimplements the same fold on
+top of `Stepper` to get chunked progress reporting.
+
+Plan:
+
+1. Add `records_parsed()` and `bytes_read()` accessors to `Stepper`
+   that mirror the ones currently on `EventStream`.  Wire them through
+   the per-source `SourceWindow` so the counters survive across the
+   fresh `Stepper` constructions that `StreamView` does on every
+   fetch.  (Today those counters live on `StreamView::parse_stats`;
+   keep that, but the underlying source of truth should be the
+   stepper.)
+2. Extract a small helper — e.g. `fn fold_into_summary(stepper: &mut
+   Stepper, builder: &mut SummaryBuilder, budget: Option<usize>) ->
+   bool` — that pulls up to `budget` records, calls
+   `builder.observe`, and returns `true` at EOF.
+3. Rewrite `summary::summarize` as a single call to that helper with
+   `budget = None`, driving a `Stepper` to EOF.
+4. Rewrite `SummaryOp::advance` to call the same helper with `budget
+   = Some(LONG_OP_CHUNK_RECORDS)`, persisting the cursor between
+   ticks as it already does.
+5. Delete `EventStream`, `SourceCursor`, `pop_next`, and
+   `Engine::query_events`.  Update the few doc-comment references
+   (`stream.rs:10`, `summary.rs:133`, `engine.rs:108,259`,
+   `engine/merge.rs:9`, `bin/seer.rs:6812`).
+
+Tradeoffs to keep in mind:
+
+- `Stepper` holds bidirectional buffers per source (capped at
+  `BUFFER_LIMIT = 256`).  For a forward-only summary pass the
+  lookbehind buffer is wasted memory.  Modest, but worth noting if
+  someone benchmarks a multi-GB pass after the change.
+- Be careful that `SummaryOp` keeps constructing a fresh `Stepper`
+  per tick from a persisted `Cursor` — that's how it survives across
+  the chunk boundary today.  The helper signature should not assume
+  a long-lived stepper.
+
 ### Misc TODO
 
 Polish / bugs:

@@ -5,11 +5,11 @@
 //! Field and time histograms over an [`Engine`]'s events.
 //!
 //! A [`Summary`] is the data behind a Summary tab: for the events that
-//! pass the active filter, it captures
+//! pass the active filter, it captures:
 //!
-//! - the top 10 most-frequent top-level JSON field names (per source,
-//!   then unioned across sources, as the spec asks for) and, for each,
-//!   the most common values that field takes;
+//! - the top 10 most-frequent top-level JSON field names (per source, then
+//!   unioned across sources) and, for each, the most common values that field
+//!   takes;
 //! - a histogram of event counts in time buckets sized so that the full
 //!   range is divided into roughly 30 buckets (1m / 1h / 1d).
 //!
@@ -361,34 +361,21 @@ fn canonical_value(value: &serde_json::Value) -> String {
 /// order.  `time` is included; the summary builder strips it before
 /// counting because it gets the time-bucket histogram instead.
 fn iter_fields(event: &Event) -> Vec<(String, serde_json::Value)> {
-    use serde_json::json;
     let mut out: Vec<(String, serde_json::Value)> =
         Vec::with_capacity(7 + event.extra.len());
+    // unwrap(): all of these have serialize impls that should never fail
+    out.push(("time".to_string(), serde_json::to_value(&event.time).unwrap()));
     out.push((
-        "time".to_string(),
-        serde_json::Value::String(event.time.to_rfc3339()),
+        "level".to_string(),
+        serde_json::to_value(&event.level).unwrap(),
     ));
-    out.push(("level".to_string(), json!(event.level.as_bunyan_number())));
-    out.push((
-        "name".to_string(),
-        serde_json::Value::String(event.name.to_string()),
-    ));
+    out.push(("name".to_string(), serde_json::to_value(&event.name).unwrap()));
     out.push((
         "hostname".to_string(),
-        serde_json::Value::String(event.hostname.to_string()),
+        serde_json::to_value(&event.hostname).unwrap(),
     ));
-    // pid is a u32 wrapped in a newtype with `Display` only; re-parse
-    // its decimal form back into a JSON number so the histogram label
-    // reads `42` (a number) rather than `"42"` (a quoted string).  A
-    // failed parse falls back to the string form so we never lose the
-    // value.
-    let pid_str = event.pid.to_string();
-    let pid_value = pid_str
-        .parse::<u64>()
-        .map(serde_json::Value::from)
-        .unwrap_or(serde_json::Value::String(pid_str));
-    out.push(("pid".to_string(), pid_value));
-    out.push(("msg".to_string(), serde_json::Value::String(event.msg.clone())));
+    out.push(("pid".to_string(), serde_json::to_value(&event.pid).unwrap()));
+    out.push(("msg".to_string(), serde_json::to_value(&event.msg).unwrap()));
     for (k, v) in &event.extra {
         out.push((k.clone(), v.clone()));
     }

@@ -26,6 +26,7 @@ src/lib.rs
 src/save_policy.rs
 src/engine/merge.rs
 src/engine.rs
+src/session.rs
 
 done, revisit:
 src/bin/seer.rs
@@ -34,7 +35,6 @@ TODO:
 benches/engine.rs
 examples/gen_fixture.rs
 src/bin/seeit.rs
-src/session.rs
 src/stream.rs
 src/streamview.rs
 src/summary.rs
@@ -169,3 +169,10 @@ src/engine.rs:
 src/session.rs:
 - session id: why not pure random?  how about base62
 - when would Tab.cursor actually be `None`?
+
+src/summary.rs:
+- do we actually need the per-source information?  I feel like we don't.
+- it's keeping every timestamp with nanosecond precision.  That's not great.  If there's a maximum resolution (e.g., 1m), then we should keep at most that.  If not...maybe there should be?
+- finish(): has a comment about BTreeSet for deterministic iteration order but
+  it doesn't seem like that matters
+- format_time_label (relates to above): granularity should probably be an enum with explicit values

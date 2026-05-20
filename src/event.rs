@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -257,7 +257,16 @@ impl schemars::JsonSchema for Level {
 
 /// Logger name (the `name` field in a bunyan record).
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Deserialize, Display, From, AsRef,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Deserialize,
+    Display,
+    From,
+    AsRef,
+    Serialize,
 )]
 #[serde(transparent)]
 #[as_ref(forward)]
@@ -265,7 +274,16 @@ pub struct LoggerName(String);
 
 /// Hostname recorded in a bunyan record.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Deserialize, Display, From, AsRef,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Deserialize,
+    Display,
+    From,
+    AsRef,
+    Serialize,
 )]
 #[serde(transparent)]
 #[as_ref(forward)]
@@ -273,7 +291,16 @@ pub struct Hostname(String);
 
 /// Process id from a bunyan record.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Display, From,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Deserialize,
+    Display,
+    From,
+    Serialize,
 )]
 #[serde(transparent)]
 pub struct Pid(u32);
