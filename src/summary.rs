@@ -7,20 +7,20 @@
 //! A [`Summary`] is the data behind a Summary tab: for the events that
 //! pass the active filter, it captures:
 //!
-//! - the top 10 most-frequent top-level JSON field names (per source, then
-//!   unioned across sources) and, for each, the most common values that field
-//!   takes;
+//! - the most-frequent top-level JSON field names across all sources
+//!   (capped at [`TOP_FIELDS`]) and, for each, the most common values
+//!   that field takes;
 //! - a histogram of event counts in time buckets sized so that the full
 //!   range is divided into roughly 30 buckets (1m / 1h / 1d).
 //!
 //! The Summary is computed in a single pass: every event contributes to
 //! every field's value count and to one time bucket; afterwards the
-//! per-source top-10 lists pick which fields survive and in what order
-//! they're displayed.  Keeping all per-field value counts during the
-//! pass costs more memory than a two-pass design that learns the top-10
-//! first and only keeps values for those fields, but we already pay the
-//! cost of walking the events once on the way to the histogram and a
-//! single hash map per field is small in practice.
+//! global top-K by total count picks which fields survive and in what
+//! order they're displayed.  Keeping all per-field value counts during
+//! the pass costs more memory than a two-pass design that learns the
+//! top-K first and only keeps values for those fields, but we already
+//! pay the cost of walking the events once on the way to the histogram
+//! and a single hash map per field is small in practice.
 //!
 //! The `time` field is handled specially: it never appears in the field
 //! list (it would dominate it with one bucket per RFC3339 timestamp).
@@ -34,12 +34,11 @@
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::position::SourceId;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
-/// How many fields we keep per source before unioning across sources.
-const TOP_FIELDS_PER_SOURCE: usize = 10;
+/// How many fields we keep in the summary, globally across all sources.
+const TOP_FIELDS: usize = 25;
 
 /// How many distinct values per field are listed in the histogram.  Any
 /// further values are summarized as "(N more)" — the user can drill
@@ -57,8 +56,7 @@ pub struct Summary {
     /// Total number of events the summary was built from.
     pub total_events: u64,
     /// Field histograms, ordered by total occurrences (descending).
-    /// Length is at most `TOP_FIELDS_PER_SOURCE * num_sources` but
-    /// typically much less because top-10 lists overlap heavily.
+    /// Length is at most [`TOP_FIELDS`].
     pub fields: Vec<FieldSummary>,
     /// Time-bucket histogram.  `None` when no events were observed.
     pub time: Option<TimeSummary>,
@@ -122,7 +120,7 @@ pub fn summarize(engine: &Engine, filter: &Filter) -> Summary {
     // warnings): the summary describes only what was successfully
     // parsed.
     for ee in engine.query_events(filter).flatten() {
-        builder.observe(ee.position.source(), &ee.event);
+        builder.observe(&ee.event);
     }
     builder.finish()
 }
@@ -137,16 +135,14 @@ pub fn summarize(engine: &Engine, filter: &Filter) -> Summary {
 #[derive(Default)]
 pub struct SummaryBuilder {
     total_events: u64,
-    /// Per-source field counts so we can compute top-K per source.
-    /// Stored eagerly because we don't know which fields will survive
-    /// the per-source top-K cut until the pass is complete.
-    per_source_field_counts: HashMap<SourceId, HashMap<String, u64>>,
     /// Per-field, per-value count.  Populated for every field
     /// encountered, regardless of whether the field will eventually
     /// make the top-K — pruning happens at finish time.
     field_value_counts: HashMap<String, HashMap<String, u64>>,
-    /// Per-field total occurrence count, summed across all sources.
-    /// Used to order the surviving fields in the final summary.
+    /// Per-field total occurrence count across all events.  Used both
+    /// to pick the surviving top-K and to order them in the final
+    /// summary, so the displayed membership and ordering criteria
+    /// agree.
     field_total_counts: HashMap<String, u64>,
     /// Earliest and latest event timestamp observed.  Used to size the
     /// time-bucket histogram.
@@ -160,7 +156,7 @@ pub struct SummaryBuilder {
 impl SummaryBuilder {
     /// Folds one event into the accumulator.  Caller is responsible for
     /// deciding whether the event passed the filter.
-    pub fn observe(&mut self, source: &SourceId, event: &Event) {
+    pub fn observe(&mut self, event: &Event) {
         self.total_events += 1;
         // Update time bookkeeping first so we can drop the timestamp
         // before iterating fields (since `time` is excluded from the
@@ -173,15 +169,12 @@ impl SummaryBuilder {
                     Some((min.min(event.time), max.max(event.time)));
             }
         }
-        let per_source =
-            self.per_source_field_counts.entry(source.clone()).or_default();
         for (name, value) in iter_fields(event) {
             // Time is recorded separately above; skip it here so it
-            // doesn't crowd out other fields in the per-source top-K.
+            // doesn't crowd out other fields in the global top-K.
             if name == "time" {
                 continue;
             }
-            *per_source.entry(name.clone()).or_default() += 1;
             *self.field_total_counts.entry(name.clone()).or_default() += 1;
             let key = canonical_value(&value);
             *self
@@ -195,30 +188,18 @@ impl SummaryBuilder {
 
     /// Consumes the builder and returns the finished [`Summary`].
     pub fn finish(self) -> Summary {
-        // Take top-K per source, union the surviving names.  BTreeSet
-        // for deterministic iteration order before we sort by count.
-        let mut surviving: BTreeSet<String> = BTreeSet::new();
-        for counts in self.per_source_field_counts.values() {
-            let mut by_count: Vec<(&String, &u64)> = counts.iter().collect();
-            // Descending by count, then ascending by name for tie-break.
-            by_count.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-            for (name, _) in by_count.into_iter().take(TOP_FIELDS_PER_SOURCE) {
-                surviving.insert(name.clone());
-            }
-        }
-        // Order the surviving fields by total count desc, name asc.
-        let mut surviving: Vec<String> = surviving.into_iter().collect();
-        surviving.sort_by(|a, b| {
-            self.field_total_counts
-                .get(b)
-                .unwrap_or(&0)
-                .cmp(self.field_total_counts.get(a).unwrap_or(&0))
-                .then(a.cmp(b))
-        });
+        // Pick the top-K fields by total count, descending; break ties
+        // by name ascending for determinism.  The same ordering is used
+        // for display, so the rendered membership and ordering criteria
+        // agree.
+        let mut by_count: Vec<(String, u64)> =
+            self.field_total_counts.into_iter().collect();
+        by_count.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        by_count.truncate(TOP_FIELDS);
         let total_events = self.total_events;
-        let fields = surviving
+        let fields = by_count
             .into_iter()
-            .map(|name| {
+            .map(|(name, _)| {
                 let value_counts = self
                     .field_value_counts
                     .get(&name)
@@ -711,42 +692,89 @@ mod tests {
     }
 
     #[test]
-    fn summarize_unions_top_fields_per_source() {
-        // Source A has fields [name, msg, hostname, pid, level, v,
-        // alpha,beta,gamma,delta,epsilon,zeta] — that's 11 non-time
-        // fields, only 10 of which survive A's per-source top-K.
-        // Source B contributes a different 10 that picks up `eta` (which
-        // A's cut would drop).  The union should include `eta` even
-        // though A's only event with `eta` falls below A's cutoff.
+    fn summarize_top_fields_are_global() {
+        // The surviving field set is the global top-K by total count,
+        // bounded by `TOP_FIELDS`.  Membership and ordering use the same
+        // criterion (global count desc), so a field whose count places
+        // it inside the top-K is included regardless of which source it
+        // came from, and a field below the cutoff is excluded even if
+        // it would be popular within some small source.
         //
-        // We choose value distributions so the per-source counts force
-        // a deterministic ordering: in source A, alpha..zeta each
-        // appear twice; in source B alpha..zeta also each appear
-        // twice but `eta` appears 5 times (so B keeps it).
+        // Setup: source A carries `TOP_FIELDS + 4` extras with strictly
+        // decreasing frequencies so the cutoff bites cleanly and there
+        // are no ties at the boundary.  Source B is small and
+        // contributes a unique field `b_only` with a single occurrence,
+        // well below the cutoff, to confirm that a small source no
+        // longer rescues its locally-popular fields.
+        //
+        // We write the JSON lines directly via `append_raw` because
+        // `slog::info!`'s key positions need `&'static str`, which
+        // prevents driving the field names from a loop.
+        use crate::test_fixtures::append_raw;
         let dir = TestDir::new();
         let a = dir.path().join("a.log");
         let b = dir.path().join("b.log");
-        // Build A with 12 events that each carry one extra so per-event
-        // counts of name/msg/etc are inflated and the extras don't
-        // dominate.
-        append_bunyan(&a, "A", |log| {
-            for _ in 0..2 {
-                info!(log, "m"; "alpha" => 1, "beta" => 1, "gamma" => 1,
-                                "delta" => 1, "epsilon" => 1, "zeta" => 1);
+        let n_extras = TOP_FIELDS + 4;
+        let mut time = 0i64;
+        for i in 0..n_extras {
+            let name = format!("f_{i:02}");
+            // `f_i` appears `n_extras - i` times so frequencies are
+            // strictly decreasing and there are no ties.
+            for _ in 0..(n_extras - i) {
+                let line = serde_json::json!({
+                    "v": 0,
+                    "level": 30,
+                    "name": "A",
+                    "hostname": "test-host",
+                    "pid": 42,
+                    "time": t(time).to_rfc3339(),
+                    "msg": "m",
+                    &name: 1,
+                });
+                append_raw(&a, &line.to_string());
+                time += 1;
             }
-            info!(log, "m"; "eta" => 1);
-        });
+        }
         append_bunyan(&b, "B", |log| {
-            for _ in 0..5 {
-                info!(log, "m"; "eta" => 1);
-            }
-            info!(log, "m"; "alpha" => 1);
+            info!(log, "m"; "b_only" => 1);
         });
         let mut engine = Engine::new();
         engine.add_file_source(&a).unwrap();
         engine.add_file_source(&b).unwrap();
         let s = summarize(&engine, &Filter::default());
-        assert!(s.fields.iter().any(|f| f.name == "eta"));
+
+        // Result is exactly `TOP_FIELDS`: more candidates exist than
+        // the cap allows, and the strictly-decreasing frequencies mean
+        // there's no ambiguity at the boundary.
+        assert_eq!(s.fields.len(), TOP_FIELDS);
+
+        // The 5 bunyan core fields (name, msg, hostname, pid, level)
+        // appear on every event, so their global counts are the
+        // highest and they always survive.
+        for name in ["name", "msg", "hostname", "pid", "level"] {
+            assert!(
+                s.fields.iter().any(|f| f.name == name),
+                "expected `{name}` in top-K, got: {:?}",
+                s.fields.iter().map(|f| &f.name).collect::<Vec<_>>(),
+            );
+        }
+
+        // Among the `f_i` extras, the highest-frequency ones survive
+        // (low index = high count) and the lowest-frequency ones are
+        // dropped.
+        assert!(s.fields.iter().any(|f| f.name == "f_00"));
+        let last_name = format!("f_{:02}", n_extras - 1);
+        assert!(
+            !s.fields.iter().any(|f| f.name == last_name),
+            "expected `{last_name}` to fall outside top-K, got: {:?}",
+            s.fields.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        );
+
+        // `b_only` (1 occurrence in source B) is not surfaced — the
+        // small source it came from no longer rescues its unique
+        // fields.
+        assert!(!s.fields.iter().any(|f| f.name == "b_only"));
+
         dir.cleanup();
     }
 

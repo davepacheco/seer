@@ -1050,7 +1050,7 @@ impl SummaryOp {
             };
             self.bytes_read += rec.length;
             if let Ok(event) = rec.event {
-                self.builder.observe(&rec.source_id, &event);
+                self.builder.observe(&event);
                 self.records += 1;
             }
             count += 1;
