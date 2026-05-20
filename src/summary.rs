@@ -94,16 +94,121 @@ pub struct FieldSummary {
 /// Histogram of event counts over time.
 #[derive(Debug, Clone)]
 pub struct TimeSummary {
-    /// Short label for the bucket size shown in the histogram header
-    /// (`"1m"`, `"1h"`, `"1d"`).
-    pub bucket_label: &'static str,
-    /// Width of one bucket.
-    pub bucket_duration: Duration,
+    /// Bucket granularity chosen for this summary.  Carries both the
+    /// width (via [`TimeBucket::duration`]) and the short label
+    /// rendered in the histogram header (via [`TimeBucket::label`]).
+    pub bucket: TimeBucket,
     /// Buckets ordered by start time, ascending.  Empty buckets in the
     /// middle of the range are present with `count = 0` so the
     /// histogram shows quiet periods rather than silently compressing
     /// them out.
     pub buckets: Vec<(DateTime<Utc>, u64)>,
+}
+
+/// Granularity of one bar in the time histogram.
+///
+/// Variants are listed in ascending order of [`Self::duration`]; the
+/// finest granularity is returned by [`Self::min_granularity`] and is
+/// what [`SummaryBuilder`] buckets every event at during the pass.
+/// Coarser granularities are derived from the fine-grained counts at
+/// finish time.
+///
+/// When adding a new variant, keep the variant list in ascending order
+/// of duration and update [`Self::all`].  The `time_bucket_*` unit
+/// tests verify both invariants against `strum::IntoEnumIterator`, so
+/// drift fails the test suite rather than the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumIter))]
+pub enum TimeBucket {
+    Minute,
+    Hour,
+    Day,
+}
+
+impl TimeBucket {
+    /// All variants, in ascending order of duration.
+    ///
+    /// Used by the runtime paths that need to enumerate buckets
+    /// without pulling `strum` into the non-test build.  The
+    /// `time_bucket_all_matches_iteration` unit test keeps this in
+    /// sync with `strum::IntoEnumIterator`.
+    const fn all() -> &'static [Self] {
+        &[Self::Minute, Self::Hour, Self::Day]
+    }
+
+    /// Returns the width of one bucket at this granularity.
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::Minute => Duration::minutes(1),
+            Self::Hour => Duration::hours(1),
+            Self::Day => Duration::days(1),
+        }
+    }
+
+    /// Returns the short label shown in the histogram header
+    /// (`"1m"`, `"1h"`, `"1d"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minute => "1m",
+            Self::Hour => "1h",
+            Self::Day => "1d",
+        }
+    }
+
+    /// Rounds `t` down to the nearest bucket boundary at this
+    /// granularity.  Handles negative timestamps correctly (floor,
+    /// not truncation toward zero) so a UTC timestamp before 1970 —
+    /// vanishingly unlikely in our domain, but cheap to get right —
+    /// still falls into a stable bucket.
+    pub fn floor(self, t: DateTime<Utc>) -> DateTime<Utc> {
+        let secs = self.duration().num_seconds().max(1);
+        let aligned = t.timestamp() - t.timestamp().rem_euclid(secs);
+        DateTime::from_timestamp(aligned, 0).expect("aligned timestamp")
+    }
+
+    /// Formats `t` as the row label appropriate for this granularity.
+    pub fn format_label(self, t: DateTime<Utc>) -> String {
+        match self {
+            Self::Minute => t.format("%Y-%m-%dT%H:%M").to_string(),
+            Self::Hour => t.format("%Y-%m-%dT%H").to_string(),
+            Self::Day => t.format("%Y-%m-%d").to_string(),
+        }
+    }
+
+    /// Returns the finest supported granularity.
+    ///
+    /// Observers bucket every event at this granularity during the
+    /// pass; coarser granularities are derived from the fine-grained
+    /// counts at finish time.  This is what bounds the builder's
+    /// memory use: instead of holding one timestamp per event, the
+    /// builder holds at most one count per distinct fine-grained
+    /// bucket the events fall into.
+    pub fn min_granularity() -> Self {
+        Self::all()[0]
+    }
+
+    /// Picks the bucket size whose count for `range` is closest to
+    /// about 30 buckets.  Ties prefer the smaller granularity so a
+    /// flat range never collapses into one huge bucket.
+    pub fn pick_for_range(range: Duration) -> Self {
+        let target = 30i64;
+        let range_secs = range.num_seconds().max(0);
+        let mut best = Self::min_granularity();
+        let mut best_dist = i64::MAX;
+        for &cand in Self::all() {
+            let unit_secs = cand.duration().num_seconds().max(1);
+            // At least one bucket: a zero-or-negative range still
+            // produces a single bucket containing the lone observed
+            // timestamp.
+            let n = (range_secs / unit_secs).max(1);
+            let dist = (n - target).abs();
+            if dist < best_dist {
+                best = cand;
+                best_dist = dist;
+            }
+        }
+        best
+    }
 }
 
 /// Returns a [`Summary`] of every event in `engine` that passes
@@ -147,10 +252,15 @@ pub struct SummaryBuilder {
     /// Earliest and latest event timestamp observed.  Used to size the
     /// time-bucket histogram.
     time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    /// Running per-bucket-start counts; bucket size isn't known until
-    /// we see the full range, so we accumulate raw timestamps and
-    /// rebucket at finish time.
-    times: Vec<DateTime<Utc>>,
+    /// Event counts pre-bucketed at [`TimeBucket::min_granularity`].
+    /// Bounds memory at O(distinct fine-grained buckets) rather than
+    /// O(total events): real Oxide log spans cover hours to a few
+    /// days, so the map size is in the thousands even when the event
+    /// count is in the millions.  The display bucket size isn't known
+    /// until [`Self::finish`] sees the full range, so coarser
+    /// granularities are aggregated up from these counts at that
+    /// point.
+    fine_buckets: HashMap<DateTime<Utc>, u64>,
 }
 
 impl SummaryBuilder {
@@ -161,7 +271,8 @@ impl SummaryBuilder {
         // Update time bookkeeping first so we can drop the timestamp
         // before iterating fields (since `time` is excluded from the
         // field list).
-        self.times.push(event.time);
+        let fine = TimeBucket::min_granularity().floor(event.time);
+        *self.fine_buckets.entry(fine).or_default() += 1;
         match self.time_range {
             None => self.time_range = Some((event.time, event.time)),
             Some((min, max)) => {
@@ -210,14 +321,8 @@ impl SummaryBuilder {
             .collect();
 
         let time = self.time_range.map(|(min, max)| {
-            let (bucket_duration, bucket_label) = pick_bucket_size(max - min);
-            build_time_summary(
-                bucket_duration,
-                bucket_label,
-                min,
-                max,
-                &self.times,
-            )
+            let bucket = TimeBucket::pick_for_range(max - min);
+            build_time_summary(bucket, min, max, &self.fine_buckets)
         });
 
         Summary { total_events: self.total_events, fields, time }
@@ -253,80 +358,44 @@ fn build_field_summary(
 }
 
 fn build_time_summary(
-    bucket_duration: Duration,
-    bucket_label: &'static str,
+    bucket: TimeBucket,
     min: DateTime<Utc>,
     max: DateTime<Utc>,
-    times: &[DateTime<Utc>],
+    fine_buckets: &HashMap<DateTime<Utc>, u64>,
 ) -> TimeSummary {
-    let bucket_secs = bucket_duration.num_seconds().max(1);
-    // Align min and max to bucket boundaries.  The number of buckets is
-    // (end-start)/unit + 1 so the bucket containing `max` itself is
-    // included; this is what makes "events at minute 0 and minute 5"
-    // produce six buckets, not five.
-    let start_secs = floor_to_bucket(min.timestamp(), bucket_secs);
-    let end_secs = floor_to_bucket(max.timestamp(), bucket_secs);
-    let n = ((end_secs - start_secs) / bucket_secs) as usize + 1;
+    let bucket_secs = bucket.duration().num_seconds().max(1);
+    // Align min and max to display-bucket boundaries.  The number of
+    // buckets is (end-start)/unit + 1 so the bucket containing `max`
+    // itself is included; this is what makes "events at minute 0 and
+    // minute 5" produce six buckets, not five.
+    let start = bucket.floor(min);
+    let end = bucket.floor(max);
+    let n = ((end.timestamp() - start.timestamp()) / bucket_secs) as usize + 1;
     let mut counts = vec![0u64; n];
-    for t in times {
-        let secs = floor_to_bucket(t.timestamp(), bucket_secs);
-        let idx = ((secs - start_secs) / bucket_secs) as usize;
-        // Guard against an out-of-range index from a future caller that
-        // passes a `times` slice not bounded by `min`/`max`.  In the
+    // Aggregate fine-grained counts up to the display granularity.
+    // `fine` is already floored to the minimum granularity, so we only
+    // need to re-floor when the display bucket is coarser.
+    for (&fine, &count) in fine_buckets {
+        let display = bucket.floor(fine);
+        let idx =
+            ((display.timestamp() - start.timestamp()) / bucket_secs) as usize;
+        // Guard against an out-of-range index from a future caller
+        // that passes a map not bounded by `min`/`max`.  In the
         // current code path the arithmetic above is always in range.
         if idx < counts.len() {
-            counts[idx] += 1;
+            counts[idx] += count;
         }
     }
     let buckets = (0..n)
         .map(|i| {
-            let bucket_start_secs = start_secs + (i as i64) * bucket_secs;
+            let bucket_start_secs =
+                start.timestamp() + (i as i64) * bucket_secs;
             let bucket_start = DateTime::from_timestamp(bucket_start_secs, 0)
                 .expect("aligned timestamp");
             (bucket_start, counts[i])
         })
         .collect();
-    TimeSummary { bucket_label, bucket_duration, buckets }
-}
-
-/// Floors `secs` to the nearest multiple of `bucket_secs` at or below.
-/// Handles negative timestamps correctly (stick to floor, not truncation
-/// toward zero) so a UTC timestamp before 1970 — vanishingly unlikely in
-/// our domain, but cheap to get right — still falls into a stable
-/// bucket.
-fn floor_to_bucket(secs: i64, bucket_secs: i64) -> i64 {
-    let r = secs.rem_euclid(bucket_secs);
-    secs - r
-}
-
-/// Choose a bucket size that yields about 30 buckets over `range`.
-///
-/// Candidates are 1m, 1h, 1d (the spec calls these out explicitly).
-/// We pick the unit that produces a bucket count closest to 30; ties
-/// prefer the smaller unit so a flat range never collapses into one
-/// huge bucket.
-fn pick_bucket_size(range: Duration) -> (Duration, &'static str) {
-    let candidates: [(Duration, &'static str); 3] = [
-        (Duration::minutes(1), "1m"),
-        (Duration::hours(1), "1h"),
-        (Duration::days(1), "1d"),
-    ];
-    let target = 30i64;
-    let range_secs = range.num_seconds().max(0);
-    let mut best = candidates[0];
-    let mut best_dist = i64::MAX;
-    for cand in candidates {
-        let unit_secs = cand.0.num_seconds().max(1);
-        // At least one bucket: a zero-or-negative range still produces
-        // a single bucket containing the lone observed timestamp.
-        let n = (range_secs / unit_secs).max(1);
-        let dist = (n - target).abs();
-        if dist < best_dist {
-            best = cand;
-            best_dist = dist;
-        }
-    }
-    best
+    TimeSummary { bucket, buckets }
 }
 
 /// JSON-string representation of `value` used as the histogram key and
@@ -432,11 +501,11 @@ pub fn format_summary(summary: &Summary) -> Vec<String> {
             "== time ({} bucket{}, {} per bucket) ==",
             time.buckets.len(),
             if time.buckets.len() == 1 { "" } else { "s" },
-            time.bucket_label,
+            time.bucket.label(),
         ));
         let max = time.buckets.iter().map(|(_, c)| *c).max().unwrap_or(0);
         for (start, count) in &time.buckets {
-            let label = format_time_label(*start, time.bucket_label);
+            let label = time.bucket.format_label(*start);
             out.push(format_histogram_row(
                 &label,
                 *count,
@@ -502,10 +571,7 @@ fn compute_label_width(
     }
     if let Some(time) = &summary.time {
         for (start, _) in &time.buckets {
-            w = w.max(display_width(&format_time_label(
-                *start,
-                time.bucket_label,
-            )));
+            w = w.max(display_width(&time.bucket.format_label(*start)));
         }
     }
     // Cap so a single very long label doesn't squeeze the bar: long
@@ -550,15 +616,6 @@ fn format_histogram_row(
         "    {padding}{label} |{bar}{} {count:>count_width$}",
         " ".repeat(bar_pad),
     )
-}
-
-fn format_time_label(start: DateTime<Utc>, bucket_label: &str) -> String {
-    match bucket_label {
-        "1d" => start.format("%Y-%m-%d").to_string(),
-        "1h" => start.format("%Y-%m-%dT%H").to_string(),
-        // 1m and any future smaller buckets show minute granularity.
-        _ => start.format("%Y-%m-%dT%H:%M").to_string(),
-    }
 }
 
 /// Width in display cells of `s`.  Treats every char as one cell, which
@@ -800,23 +857,26 @@ mod tests {
 
     #[test]
     fn time_bucket_size_picks_minutes_for_short_range() {
-        let (d, label) = pick_bucket_size(Duration::minutes(20));
-        assert_eq!(label, "1m");
-        assert_eq!(d, Duration::minutes(1));
+        assert_eq!(
+            TimeBucket::pick_for_range(Duration::minutes(20)),
+            TimeBucket::Minute,
+        );
     }
 
     #[test]
     fn time_bucket_size_picks_hours_for_day_range() {
-        let (d, label) = pick_bucket_size(Duration::hours(30));
-        assert_eq!(label, "1h");
-        assert_eq!(d, Duration::hours(1));
+        assert_eq!(
+            TimeBucket::pick_for_range(Duration::hours(30)),
+            TimeBucket::Hour,
+        );
     }
 
     #[test]
     fn time_bucket_size_picks_days_for_month_range() {
-        let (d, label) = pick_bucket_size(Duration::days(30));
-        assert_eq!(label, "1d");
-        assert_eq!(d, Duration::days(1));
+        assert_eq!(
+            TimeBucket::pick_for_range(Duration::days(30)),
+            TimeBucket::Day,
+        );
     }
 
     #[test]
@@ -824,8 +884,41 @@ mod tests {
         // A single observed event has zero range; we should still get
         // exactly one bucket of the smallest unit so the histogram has
         // one usable row.
-        let (_d, label) = pick_bucket_size(Duration::seconds(0));
-        assert_eq!(label, "1m");
+        assert_eq!(
+            TimeBucket::pick_for_range(Duration::seconds(0)),
+            TimeBucket::Minute,
+        );
+    }
+
+    #[test]
+    fn time_bucket_all_matches_iteration() {
+        // Hand-rolled list in `TimeBucket::all` must match the order
+        // and contents of `strum::EnumIter`.  This is what keeps
+        // `strum` a dev-only dependency: the runtime code iterates
+        // the hand-rolled list, but drift fails the test suite.
+        use strum::IntoEnumIterator;
+        let by_iter: Vec<TimeBucket> = TimeBucket::iter().collect();
+        let by_hand: Vec<TimeBucket> = TimeBucket::all().to_vec();
+        assert_eq!(by_iter, by_hand);
+    }
+
+    #[test]
+    fn time_bucket_all_ordered_ascending_by_duration() {
+        // `min_granularity` assumes the first element of `all` is the
+        // shortest-duration variant.  Check that against the actual
+        // durations rather than the source order.
+        let durations: Vec<_> =
+            TimeBucket::all().iter().map(|b| b.duration()).collect();
+        let mut sorted = durations.clone();
+        sorted.sort();
+        assert_eq!(durations, sorted);
+    }
+
+    #[test]
+    fn time_bucket_min_granularity_is_smallest() {
+        use strum::IntoEnumIterator;
+        let by_iter = TimeBucket::iter().min_by_key(|b| b.duration()).unwrap();
+        assert_eq!(TimeBucket::min_granularity(), by_iter);
     }
 
     #[test]
@@ -844,7 +937,7 @@ mod tests {
         engine.add_file_source(&p).unwrap();
         let s = summarize(&engine, &Filter::default());
         let time = s.time.unwrap();
-        assert_eq!(time.bucket_label, "1m");
+        assert_eq!(time.bucket, TimeBucket::Minute);
         assert_eq!(time.buckets.len(), 2);
         assert_eq!(time.buckets[0].1, 1);
         assert_eq!(time.buckets[1].1, 2);
