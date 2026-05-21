@@ -133,9 +133,9 @@ src/engine/merge.rs:
 - fixed: MergeError: should use ThisError and strike `source_error`
 - there seems to be a lot of cloning.  Maybe MergeRecord should hold a BufferedRecord (and consumers should use accessors for fields).  This might be tricky since the stepper holds onto the BufferedRecord for an unspecified period of time.
 - SourceWindow: uses bools for EOF despite having an enum
-- max_walks (and related identifiers) should be like `max_scan` or `max_records_to_scan` or something
+- fixed: max_walks (and related identifiers) should be like `max_scan` or `max_records_to_scan` or something
 - I'm feeling like we never want `max_walks` to be `None` and I'm not clear why we don't treat everything like a "long op"
-- Move `step_backward_n()` into `seeit`
+- fixed: Move `step_backward_n()` into `seeit`
 - fixed: step(): error condition should panic?  or restructure the code to avoid this condition
 - fixed: pick(): loop could be reworked to avoid "expect"
 

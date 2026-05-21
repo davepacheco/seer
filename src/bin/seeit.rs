@@ -25,7 +25,7 @@ use camino::Utf8PathBuf;
 use clap::{ArgGroup, Parser, ValueEnum};
 use seer::{
     Cursor, Engine, Filter, HostnameDisplay, MergeRecord, RenderOpts,
-    ResolvedMode, ResolvedTarget, Selector, SessionId, SessionStore,
+    ResolvedMode, ResolvedTarget, Selector, SessionId, SessionStore, Stepper,
     format_event, format_summary, resolve, summarize,
 };
 
@@ -463,7 +463,7 @@ fn emit_forward_from_engine(
 /// `--count M` records starting at the cursor.
 ///
 /// Uses two steppers because a single stepper owns one position that
-/// both directions share — see [`seer::Stepper::step_backward_n`].
+/// both directions share — see [`step_backward_n`].
 fn emit_records_window(
     engine: &Engine,
     filter: &Filter,
@@ -473,7 +473,7 @@ fn emit_records_window(
 ) {
     if let Some(before) = args.before {
         let mut back = engine.stepper(filter.clone(), &resolved.cursor);
-        for r in back.step_backward_n(before) {
+        for r in step_backward_n(&mut back, before) {
             emit_record(&r, opts);
         }
     }
@@ -484,6 +484,28 @@ fn emit_records_window(
         args.count,
         opts,
     );
+}
+
+/// Walks `stepper` backward up to `n` times and returns the records
+/// in chronological (forward) order.
+///
+/// Stops early if [`Stepper::step_backward`] returns `None`, so the
+/// returned vec is at most `n` long.  After this call the stepper's
+/// cursor has retreated by the returned vec's length; callers that
+/// want to resume forward from the *original* starting position
+/// should construct a fresh stepper at the same cursor.  Used by
+/// [`emit_records_window`] to assemble `--before N`'s pre-cursor
+/// window.
+fn step_backward_n(stepper: &mut Stepper<'_>, n: usize) -> Vec<MergeRecord> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        match stepper.step_backward() {
+            Some(r) => out.push(r),
+            None => break,
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Builds a [`Summary`] over `filter` and prints it.  Summary mode
