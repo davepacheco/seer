@@ -498,6 +498,17 @@ impl<'a> Stepper<'a> {
         // closer time on a later fill).  Keep filling non-ready
         // sources until every one of them either has a head or has
         // hit its direction's edge.
+        //
+        // `progressed` tracks whether a fill in this pass actually
+        // made a previously non-ready source ready (surfaced a record
+        // or hit EOF), not merely that fill was called.  With that,
+        // the loop's single exit covers both natural cases: every
+        // source was already ready (no fills attempted, progressed
+        // stays false), or every fill walked without finding a match
+        // and without hitting EOF — only possible under bounded walks
+        // (e.g., `max_walks_per_fill` exhausted before the scan
+        // caught up).  In the latter case we yield to the caller,
+        // who can drive another step to resume the scan.
         loop {
             let mut progressed = false;
             for s in &mut self.sources {
@@ -511,21 +522,11 @@ impl<'a> Stepper<'a> {
                     self.max_walks_per_fill,
                 );
                 self.walked_bytes += walked;
-                progressed = true;
-            }
-            let all_ready = self
-                .sources
-                .iter()
-                .all(|s| !s.buf(dir).is_empty() || s.eof(dir));
-            if all_ready {
-                break;
+                if !s.buf(dir).is_empty() || s.eof(dir) {
+                    progressed = true;
+                }
             }
             if !progressed {
-                // Pathological guard: every non-ready source's fill
-                // returned with the source still not ready *and* not
-                // EOF.  Could happen if `max_walks_per_fill` is zero
-                // (no work allowed) or fill silently no-ops.  Bail
-                // out rather than spin.
                 break;
             }
         }
@@ -553,41 +554,43 @@ fn pick(sources: &[SourceWindow<'_>], direction: Direction) -> Option<usize> {
     let mut best_time: Option<DateTime<Utc>> = None;
     for (i, s) in sources.iter().enumerate() {
         let Some(head) = s.buf(direction).front() else { continue };
-        let is_err = head.event.is_err();
-        if is_err {
-            // Errors emit eagerly: an error head always wins over an
-            // event head.  Forward keeps the first error encountered
-            // (lowest index); backward overwrites so the highest index
-            // wins.
-            match (best_is_err, direction) {
-                (false, _) => {
-                    best = Some(i);
-                    best_is_err = true;
+        match &head.event {
+            Err(_) => {
+                // Errors emit eagerly: an error head always wins over
+                // an event head.  Forward keeps the first error
+                // encountered (lowest index); backward overwrites so
+                // the highest index wins.
+                match (best_is_err, direction) {
+                    (false, _) => {
+                        best = Some(i);
+                        best_is_err = true;
+                    }
+                    (true, Direction::Backward) => {
+                        best = Some(i);
+                    }
+                    (true, Direction::Forward) => {}
                 }
-                (true, Direction::Backward) => {
-                    best = Some(i);
-                }
-                (true, Direction::Forward) => {}
             }
-            continue;
-        }
-        if best_is_err {
-            continue;
-        }
-        let t = head.event.as_ref().expect("not err").time;
-        // Strict inequality on time, then ties go to higher index for
-        // backward (lowest-index wins forward by being set first and
-        // never replaced).
-        let take = match direction {
-            Direction::Forward => best_time.is_none_or(|bt| t < bt),
-            Direction::Backward => match best_time {
-                None => true,
-                Some(bt) => t >= bt,
-            },
-        };
-        if take {
-            best = Some(i);
-            best_time = Some(t);
+            Ok(event) => {
+                if best_is_err {
+                    continue;
+                }
+                let t = event.time;
+                // Strict inequality on time, then ties go to higher
+                // index for backward (lowest-index wins forward by
+                // being set first and never replaced).
+                let take = match direction {
+                    Direction::Forward => best_time.is_none_or(|bt| t < bt),
+                    Direction::Backward => match best_time {
+                        None => true,
+                        Some(bt) => t >= bt,
+                    },
+                };
+                if take {
+                    best = Some(i);
+                    best_time = Some(t);
+                }
+            }
         }
     }
     best

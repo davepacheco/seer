@@ -139,8 +139,6 @@ src/engine/merge.rs:
 - step(): error condition should panic?  or restructure the code to avoid this condition
 - pick(): loop could be reworked to avoid "expect"
 
-Current status: almost done src/engine/merge.rs, looking at pick() last, then tests
-
 General: should SourceId have a borrowed string so it's more cheaply copy'able?  Owned by source itself.
 
 src/engine.rs:
