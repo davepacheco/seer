@@ -44,6 +44,19 @@ impl TabIdx {
     fn get(self) -> usize {
         self.0
     }
+
+    /// Returns the tab index immediately before this one.  Panics if
+    /// `self` is zero — callers use this when patching up indices for
+    /// tabs whose position shifted left after a close, so a zero input
+    /// would indicate the bug of trying to shift past the start.  The
+    /// explicit [`usize::checked_sub`] is so the panic is unconditional;
+    /// a bare `self.0 - 1` would wrap to [`usize::MAX`] in release mode.
+    fn prev(self) -> TabIdx {
+        let Some(prev) = self.0.checked_sub(1) else {
+            panic!("TabIdx::prev called on zero index");
+        };
+        TabIdx(prev)
+    }
 }
 
 impl std::fmt::Display for TabIdx {
@@ -2270,7 +2283,7 @@ impl App {
     /// responsible for ensuring no other [`LongOp`] is in flight.
     fn start_summary_build(&mut self, tab_idx: TabIdx, filter: Filter) {
         debug_assert!(self.long_op.is_none());
-        if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
+        if let Some(tab) = self.tab_mut(tab_idx) {
             tab.standalone_materialized = summary_placeholder_rows();
             tab.viewport_top = LineIdx::ZERO;
             tab.search = None;
@@ -2414,7 +2427,7 @@ impl App {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
                 let materialized = s.finalize();
-                if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
+                if let Some(tab) = self.tab_mut(tab_idx) {
                     tab.standalone_materialized = materialized;
                     tab.viewport_top = LineIdx::ZERO;
                 }
@@ -2434,9 +2447,8 @@ impl App {
                 let w = self.viewport_width;
                 match outcome {
                     SearchOutcome::Found => {
-                        if tab_idx.get() < self.tabs.len() {
-                            self.tabs[tab_idx.get()]
-                                .resync_from_streamview(h, w);
+                        if let Some(tab) = self.tab_mut(tab_idx) {
+                            tab.resync_from_streamview(h, w);
                         }
                     }
                     SearchOutcome::NotFound => {
@@ -2471,7 +2483,7 @@ impl App {
     /// [`Self::finalize_long_op`].
     fn finalize_seek_op(&mut self, s: SeekOp) {
         let tab_idx = s.tab_idx;
-        if tab_idx.get() >= self.tabs.len() {
+        if self.tab(tab_idx).is_none() {
             // Tab vanished while the op was running.  Drain any
             // queued Summary build so the rest of the filter-rebuild
             // chain still makes progress.
@@ -2535,7 +2547,7 @@ impl App {
         match op {
             LongOp::BuildSummary(s) => {
                 let tab_idx = s.tab_idx;
-                if let Some(tab) = self.tabs.get_mut(tab_idx.get()) {
+                if let Some(tab) = self.tab_mut(tab_idx) {
                     tab.standalone_materialized = Materialized {
                         events: Vec::new(),
                         formatted: vec![
@@ -2614,6 +2626,18 @@ impl App {
 
     fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
+    }
+
+    /// Returns the tab at `idx`, or `None` if the index is out of
+    /// range (for example because a long op outlived the tab it was
+    /// targeting).
+    fn tab(&self, idx: TabIdx) -> Option<&Tab> {
+        self.tabs.get(idx.0)
+    }
+
+    /// Mutable counterpart to [`Self::tab`].
+    fn tab_mut(&mut self, idx: TabIdx) -> Option<&mut Tab> {
+        self.tabs.get_mut(idx.0)
     }
 
     /// Resets the active tab to the end of the merged stream behind a
@@ -2866,15 +2890,16 @@ impl App {
         let walked_bytes_at_start = view.parse_stats().walked_bytes;
         let records_at_start = view.parse_stats().records;
         let total_bytes = self.engine.filtered_total_bytes(view.filter());
-        self.tabs[tab_idx.get()].streamview = Some(view);
-        self.tabs[tab_idx.get()].search = None;
-        self.tabs[tab_idx.get()].select = None;
+        let h = self.viewport_height;
+        let w = self.viewport_width;
+        let tab = &mut self.tabs[tab_idx.get()];
+        tab.streamview = Some(view);
+        tab.search = None;
+        tab.select = None;
         // Materialize the (empty) view so the tab's formatted lines
         // reflect the new state — without this the user would see
         // stale content from before the filter change.
-        let h = self.viewport_height;
-        let w = self.viewport_width;
-        self.tabs[tab_idx.get()].resync_from_streamview(h, w);
+        tab.resync_from_streamview(h, w);
         self.long_op = Some(LongOp::Seek(SeekOp::new(
             tab_idx,
             finalize,
@@ -3461,7 +3486,7 @@ impl App {
     fn adjust_long_op_state_for_closed_tab(&mut self, closed: usize) {
         let closed = TabIdx(closed);
         let shift_down = |idx: &mut TabIdx| {
-            *idx = TabIdx(idx.get() - 1);
+            *idx = idx.prev();
         };
         match self.long_op.as_mut() {
             Some(LongOp::BuildSummary(s)) => {
