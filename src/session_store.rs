@@ -310,8 +310,7 @@ mod tests {
         Session, SessionIdParseError, SessionSource, Tab, TabKind,
     };
     use crate::stream::LogStream;
-    use crate::test_fixtures::t;
-    use camino_tempfile::tempdir;
+    use crate::test_fixtures::{TestDir, t};
 
     fn session_with_one_tab() -> Session {
         let stream = LogStream::new("Tab 1".to_string());
@@ -423,7 +422,7 @@ mod tests {
 
     #[test]
     fn save_then_load_round_trips_a_populated_session() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let id = SessionId::random();
         let session = session_with_one_tab();
@@ -434,11 +433,12 @@ mod tests {
         assert_eq!(back.tabs[0].stream, session.tabs[0].stream);
         assert_eq!(back.tabs[0].cursor, session.tabs[0].cursor);
         assert_eq!(back.streams.len(), session.streams.len());
+        dir.cleanup();
     }
 
     #[test]
     fn save_writes_pretty_json_to_id_dot_json() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let id: SessionId = "deadbeef".parse().unwrap();
         store.save(id, &Session::new()).unwrap();
@@ -448,6 +448,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         // Pretty-printed JSON has at least one newline.
         assert!(body.contains('\n'), "expected pretty JSON, got: {body}");
+        dir.cleanup();
     }
 
     #[test]
@@ -456,7 +457,7 @@ mod tests {
         // test, but we can verify the contract: after a successful
         // save there is no `.tmp` file left behind, and the final
         // path is the one we expected.
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let id = SessionId::random();
         store.save(id, &Session::new()).unwrap();
@@ -473,6 +474,7 @@ mod tests {
             leftovers.is_empty(),
             "expected no .tmp leftovers, got {leftovers:?}"
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -481,7 +483,7 @@ mod tests {
         // truncated `.tmp` file next to the real one.  load() and
         // list() should still see the real session and ignore the
         // tmp.
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let id: SessionId = "12345678".parse().unwrap();
         store.save(id, &Session::new()).unwrap();
@@ -495,11 +497,12 @@ mod tests {
         // list() does not include the tmp file as a session.
         let ids = store.list().unwrap();
         assert_eq!(ids, vec![id]);
+        dir.cleanup();
     }
 
     #[test]
     fn list_returns_saved_ids_and_skips_unrelated_files() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let a: SessionId = "1".parse().unwrap();
         let b: SessionId = "2".parse().unwrap();
@@ -517,19 +520,21 @@ mod tests {
         let mut ids = store.list().unwrap();
         ids.sort();
         assert_eq!(ids, vec![a, b]);
+        dir.cleanup();
     }
 
     #[test]
     fn load_on_missing_id_returns_io_error() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let err = store.load(SessionId::random()).unwrap_err();
         assert!(matches!(err, StoreError::Io { .. }), "got {err:?}");
+        dir.cleanup();
     }
 
     #[test]
     fn resolve_state_dir_uses_env_override_when_present() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let want = dir.path().to_path_buf();
         let got = resolve_state_dir(|k| {
             assert_eq!(k, STATE_DIR_ENV);
@@ -537,6 +542,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got, want);
+        dir.cleanup();
     }
 
     #[test]
@@ -553,7 +559,7 @@ mod tests {
 
     #[test]
     fn find_matches_classifies_exact_match() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let id = save_with_sources(&store, &["/log/a", "/log/b"], 100);
 
@@ -568,11 +574,12 @@ mod tests {
             store.find_matches(&user_paths(&["/log/b", "/log/a"])).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, MatchKind::Exact);
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_classifies_superset() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         save_with_sources(&store, &["/log/a", "/log/b", "/log/c"], 100);
 
@@ -580,11 +587,12 @@ mod tests {
             store.find_matches(&user_paths(&["/log/a", "/log/b"])).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, MatchKind::Superset);
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_classifies_overlap() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         // Session has b and c; user asks for a and b.  Sets overlap on
         // b but neither contains the other.
@@ -594,16 +602,18 @@ mod tests {
             store.find_matches(&user_paths(&["/log/a", "/log/b"])).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].kind, MatchKind::Overlap);
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_skips_disjoint_sessions() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         save_with_sources(&store, &["/log/a"], 100);
 
         let matches = store.find_matches(&user_paths(&["/log/b"])).unwrap();
         assert!(matches.is_empty());
+        dir.cleanup();
     }
 
     #[test]
@@ -611,17 +621,18 @@ mod tests {
         // With no user paths, no session can overlap.  The caller (the
         // resume dialog) is responsible for treating an empty path
         // list as "show all sessions" if that's what it wants.
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         save_with_sources(&store, &["/log/a"], 100);
 
         let matches = store.find_matches(&[]).unwrap();
         assert!(matches.is_empty());
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_skips_sessions_with_no_sources() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         // An empty session (e.g. one created but never opened against
         // a file) can't overlap with any user paths.
@@ -629,19 +640,21 @@ mod tests {
 
         let matches = store.find_matches(&user_paths(&["/log/a"])).unwrap();
         assert!(matches.is_empty());
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_returns_empty_when_store_is_empty() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let matches = store.find_matches(&user_paths(&["/log/a"])).unwrap();
         assert!(matches.is_empty());
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_orders_by_kind_then_recency() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
 
         // For user query [a, x]:
@@ -678,11 +691,12 @@ mod tests {
             "exact first (newest within kind), then superset, then \
              overlap; the disjoint session is dropped entirely"
         );
+        dir.cleanup();
     }
 
     #[test]
     fn find_matches_skips_corrupt_session_files() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let good = save_with_sources(&store, &["/log/a"], 100);
 
@@ -699,5 +713,6 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].session.id, good);
         assert_eq!(matches[0].kind, MatchKind::Exact);
+        dir.cleanup();
     }
 }

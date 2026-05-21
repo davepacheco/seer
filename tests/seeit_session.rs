@@ -15,8 +15,8 @@
 //! own unit tests.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use camino_tempfile::{Utf8TempDir, tempdir};
 use chrono::{DateTime, Utc};
+use seer::test_fixtures::TestDir;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, Cursor, Engine, Filter, LogStream,
     STATE_DIR_ENV, Selector, Session, SessionId, SessionSource, SessionStore,
@@ -38,7 +38,7 @@ struct StagedSource {
     mtime: DateTime<Utc>,
 }
 
-fn stage_sample(dir: &Utf8TempDir, name: &str) -> StagedSource {
+fn stage_sample(dir: &TestDir, name: &str) -> StagedSource {
     let src = Utf8PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo"),
     )
@@ -121,7 +121,7 @@ fn count_records(stdout: &str) -> usize {
 
 #[test]
 fn whole_session_emits_every_record_in_the_source() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -133,11 +133,12 @@ fn whole_session_emits_every_record_in_the_source() {
         count_records(&stdout) >= 10,
         "expected >=10 records, got stdout:\n{stdout}"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn stream_with_filter_drops_non_matching_records() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (mut session, stream_id) = build_session(&staged);
     // Replace the stream's filter with one that matches every
@@ -164,11 +165,12 @@ fn stream_with_filter_drops_non_matching_records() {
         0,
         "filter should have dropped every record:\n{stdout}"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn count_caps_output() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -177,11 +179,12 @@ fn count_caps_output() {
     let stdout =
         run_seeit(dir.path(), &["--session", &id.to_string(), "--count", "3"]);
     assert_eq!(count_records(&stdout), 3);
+    dir.cleanup();
 }
 
 #[test]
 fn tab_at_saved_cursor_resumes_from_that_position() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
 
     // Discover the byte offset of the third record by walking the
@@ -210,11 +213,12 @@ fn tab_at_saved_cursor_resumes_from_that_position() {
     let resumed = count_records(&from_tab);
     assert!(resumed < whole, "resumed {resumed} >= whole {whole}");
     assert_eq!(resumed, whole - 2);
+    dir.cleanup();
 }
 
 #[test]
 fn bookmark_before_window_emits_pre_cursor_records() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
 
     // Set up a bookmark at the third record so --before walks back
@@ -256,11 +260,12 @@ fn bookmark_before_window_emits_pre_cursor_records() {
         ],
     );
     assert_eq!(count_records(&stdout), 3);
+    dir.cleanup();
 }
 
 #[test]
 fn override_filter_replaces_resolved_filter() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (mut session, stream_id) = build_session(&staged);
     // Stream filter drops everything; --filter override should
@@ -283,11 +288,12 @@ fn override_filter_replaces_resolved_filter() {
         ],
     );
     assert!(count_records(&stdout) > 0);
+    dir.cleanup();
 }
 
 #[test]
 fn and_filter_narrows_resolved_filter() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (mut session, stream_id) = build_session(&staged);
     // Stream filter accepts everything; --and-filter should narrow.
@@ -321,11 +327,12 @@ fn and_filter_narrows_resolved_filter() {
         count_records(&narrowed),
         count_records(&unfiltered),
     );
+    dir.cleanup();
 }
 
 #[test]
 fn summary_tab_emits_summary_output() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (mut session, _) = build_session(&staged);
     session.tabs[0].kind = TabKind::Summary;
@@ -347,11 +354,12 @@ fn summary_tab_emits_summary_output() {
         0,
         "summary should not contain record headers"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn render_overrides_layer_on_top_of_stream_opts() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (mut session, stream_id) = build_session(&staged);
     // Force the stream to a known render-opts shape (extras off,
@@ -389,11 +397,12 @@ fn render_overrides_layer_on_top_of_stream_opts() {
         with_lines > base_lines,
         "--show-extras did not add lines: base {base_lines} -> with {with_lines}\nbase:\n{base}\nwith:\n{with_extras}"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn unknown_session_returns_nonzero_exit() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     // Force the state dir to exist but have no sessions.
     fs::create_dir_all(dir.path().join("sessions")).unwrap();
     let unknown: SessionId = "deadbeef".parse().unwrap();
@@ -416,11 +425,12 @@ fn unknown_session_returns_nonzero_exit() {
         stderr.contains("I/O error"),
         "expected I/O error mention from store load failure, got:\n{stderr}"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn fingerprint_mismatch_fails_loudly() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -443,11 +453,12 @@ fn fingerprint_mismatch_fails_loudly() {
             || stderr.contains("SourceFingerprint"),
         "expected fingerprint error, got:\n{stderr}"
     );
+    dir.cleanup();
 }
 
 #[test]
 fn header_writes_context_to_stderr_not_stdout() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -487,11 +498,12 @@ fn header_writes_context_to_stderr_not_stdout() {
     assert!(stderr.contains("target=tab"));
     assert!(stderr.contains("mode=records"));
     assert!(stderr.contains("window=count=1"));
+    dir.cleanup();
 }
 
 #[test]
 fn header_omitted_means_nothing_on_stderr() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -509,6 +521,7 @@ fn header_omitted_means_nothing_on_stderr() {
         !stderr.contains("seeit: session="),
         "did not pass --header but got a banner:\n{stderr}"
     );
+    dir.cleanup();
 }
 
 #[test]
@@ -543,7 +556,7 @@ fn printed_seeit_command_actually_reproduces_the_view() {
     // the binary with those args, and confirm it produces non-empty
     // output.  This is the contract Phase 6's seer keybinding relies
     // on — whatever seer prints, the user can paste into a shell.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
     let (session, _) = build_session(&staged);
     let id = session.id;
@@ -570,13 +583,14 @@ fn printed_seeit_command_actually_reproduces_the_view() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(count_records(&stdout) >= 10);
+    dir.cleanup();
 }
 
 #[test]
 fn file_mode_still_works_unchanged() {
     // Confirm that pointing seeit at a bare file (today's
     // pre-session-mode invocation) still produces output.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let staged = stage_sample(&dir, "sample.log");
 
     let exe = env!("CARGO_BIN_EXE_seeit");
@@ -584,4 +598,5 @@ fn file_mode_still_works_unchanged() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(count_records(&stdout) >= 10);
+    dir.cleanup();
 }

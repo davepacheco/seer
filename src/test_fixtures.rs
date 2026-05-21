@@ -18,11 +18,11 @@
 //!   hundreds or thousands of records, used by scale tests under `tests/` and
 //!   by benches under `benches/`.
 //!
-//! The module is exposed publicly only when compiling under
-//! `#[cfg(test)]` or with the `test-fixtures` feature enabled (see
-//! `lib.rs`).  Consumers outside the crate enable it via
-//! `required-features = ["test-fixtures"]` on the relevant `[[test]]`
-//! or `[[bench]]` entry in `Cargo.toml`.
+//! The module is unconditionally `pub`, so it is reachable from
+//! integration tests, benches, the `seer` and `seeit` binaries' own
+//! test modules, and any other code that links against the library.
+//! The `slog`-based helpers below remain `#[cfg(test)]`-only because
+//! `slog` is a dev-dependency.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use camino_tempfile::Utf8TempDir;

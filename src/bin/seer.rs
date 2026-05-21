@@ -23,6 +23,8 @@ use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 use regex::Regex;
 #[cfg(test)]
 use seer::Event as LogEvent;
+#[cfg(test)]
+use seer::test_fixtures::TestDir;
 use seer::{
     Bookmark, BookmarkId, BookmarkName, ByteLen, Cadence, CoreField, Cursor,
     Direction, Engine, EventIdx, EventPredicate, FieldName, Filter, Form,
@@ -6343,12 +6345,11 @@ mod tests {
     /// initial batch (~256 records on a real engine, 100 here for speed).
     #[test]
     fn scroll_down_extends_streamview_past_initial_window() {
-        use camino_tempfile::tempdir;
         use slog::{Drain, Logger, info, o};
         use std::fs::OpenOptions;
         use std::sync::Mutex;
 
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         {
             let file = OpenOptions::new()
@@ -6380,6 +6381,7 @@ mod tests {
             "viewport_top {top} stuck at or below initial cache \
              {initial_len}; lazy window did not extend",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -6824,12 +6826,11 @@ mod tests {
         // Build a real engine with a tiny bunyan file so apply_filter
         // can re-run query_events.  This is the only filter-dialog
         // test that isn't pure state-machine.
-        use camino_tempfile::tempdir;
         use slog::{Drain, Logger, info, o, warn};
         use std::fs::OpenOptions;
         use std::sync::Mutex;
 
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         {
             let file = OpenOptions::new()
@@ -7313,7 +7314,7 @@ mod tests {
         // at a narrow viewport and asserting that the visual rows
         // are exactly the next N chars of the source, including
         // spaces that would otherwise have been the wrap point.
-        let (mut a, _dir) = multi_line_app(&[(10, "first message", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first message", &[])]);
         a.toggle_show_raw();
         // Wide enough to fit the JSON in a few rows of column wrap;
         // narrow enough that any whitespace inside it would be a
@@ -7337,6 +7338,7 @@ mod tests {
                 "expected column chunk {chunk:?} in dump:\n{dump}",
             );
         }
+        dir.cleanup();
     }
 
     #[test]
@@ -7747,7 +7749,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         a.handle_key(shift('G'));
         assert!(
             matches!(a.long_op, Some(LongOp::Seek(_))),
@@ -7763,6 +7765,7 @@ mod tests {
         // the viewport is at EOF (max_top clamped).
         assert!(a.long_op.is_none());
         assert!(a.active_tab().viewport_top > 0);
+        dir.cleanup();
     }
 
     #[test]
@@ -7774,7 +7777,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         // First scroll somewhere away from the top so `g` has to seek.
         a.handle_key(shift('G'));
         a.drain_long_op();
@@ -7791,6 +7794,7 @@ mod tests {
         }
         a.drain_long_op();
         assert_eq!(a.active_tab().viewport_top, 0);
+        dir.cleanup();
     }
 
     #[test]
@@ -7805,7 +7809,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         let filter: Filter = "msg=payload-m25".parse().unwrap();
         a.apply_filter(filter);
         assert!(
@@ -7822,6 +7826,7 @@ mod tests {
             formatted.iter().any(|l| l.contains("payload-m25")),
             "expected 'payload-m25' in viewport, got {formatted:?}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -7841,7 +7846,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         let filter: Filter = "msg=~payload-m[0-9]*99$".parse().unwrap();
         a.apply_filter(filter);
         a.drain_long_op();
@@ -7854,6 +7859,7 @@ mod tests {
         // nothing got double-counted from re-walking.
         let view_records = a.active_tab().streamview.as_ref().unwrap();
         assert_eq!(view_records.record_count(), 5);
+        dir.cleanup();
     }
 
     #[test]
@@ -7872,7 +7878,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         // Selective filter: only multiples of 100 (20 records out of
         // 2000) survive.  Without per-tick yielding, finding any one
         // match still has to walk an average of ~100 records on
@@ -7889,6 +7895,7 @@ mod tests {
         // Drain the rest and confirm the op eventually completes.
         a.drain_long_op();
         assert!(a.long_op.is_none());
+        dir.cleanup();
     }
 
     #[test]
@@ -7904,7 +7911,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         a.handle_key(shift('G'));
         assert!(matches!(a.long_op, Some(LongOp::Seek(_))));
         a.cancel_long_op();
@@ -7914,6 +7921,7 @@ mod tests {
             "expected a cancellation notice, got {:?}",
             a.notice,
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -7935,7 +7943,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         a.handle_key(shift('G'));
         a.drain_long_op();
         let after_g = a.active_tab().viewport_top;
@@ -7946,6 +7954,7 @@ mod tests {
              now {} after one k press",
             a.active_tab().viewport_top,
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -7968,7 +7977,7 @@ mod tests {
             .enumerate()
             .map(|(i, m)| (10 + i as i64, m.as_str()))
             .collect();
-        let (mut a, _dir) = host_app("test", &records);
+        let (mut a, dir) = host_app("test", &records);
         // Search for record 129 — close to but inside the streamview's
         // initial 138-line fetch.
         a.handle_key(key(KeyCode::Char('/')));
@@ -7986,6 +7995,7 @@ mod tests {
              was {after_search}, is now {} after 3 j presses",
             a.active_tab().viewport_top,
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -8571,15 +8581,12 @@ mod tests {
     /// Builds a small bunyan log file, points an Engine at it, and
     /// returns the App so a test can drive the streamview-backed
     /// status-line code path that needs real byte offsets.
-    fn app_with_real_log(
-        records: usize,
-    ) -> (App, camino_tempfile::Utf8TempDir) {
-        use camino_tempfile::tempdir;
+    fn app_with_real_log(records: usize) -> (App, TestDir) {
         use slog::{Drain, Logger, info, o};
         use std::fs::OpenOptions;
         use std::sync::Mutex;
 
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         {
             let file = OpenOptions::new()
@@ -8604,7 +8611,7 @@ mod tests {
         // anchor cursor has meaningful byte offsets to sum.  At the
         // top of the stream the offset is zero, the percent rounds to
         // 0, and the "(beginning of stream)" marker appears.
-        let (mut a, _dir) = app_with_real_log(50);
+        let (mut a, dir) = app_with_real_log(50);
         a.viewport_height = 5;
         let backend = TestBackend::new(160, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8615,6 +8622,7 @@ mod tests {
         assert!(dump.contains("0 B of"), "dump:\n{dump}");
         assert!(dump.contains("(0%)"), "dump:\n{dump}");
         assert!(dump.contains("(beginning of stream)"), "dump:\n{dump}");
+        dir.cleanup();
     }
 
     #[test]
@@ -8622,7 +8630,7 @@ mod tests {
         // Scrolling to the end of a streamview-backed tab surfaces the
         // "(end of stream)" marker and a non-zero byte offset.  The
         // beginning-of-stream marker must not also appear.
-        let (mut a, _dir) = app_with_real_log(50);
+        let (mut a, dir) = app_with_real_log(50);
         a.viewport_height = 10;
         let backend = TestBackend::new(160, 13);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8636,6 +8644,7 @@ mod tests {
         assert!(dump.contains("(end of stream)"), "dump:\n{dump}");
         assert!(!dump.contains("(beginning of stream)"), "dump:\n{dump}");
         assert!(dump.contains("from byte offset"), "dump:\n{dump}");
+        dir.cleanup();
     }
 
     #[test]
@@ -8646,7 +8655,7 @@ mod tests {
         // After the fix, the user status reports a non-zero offset
         // corresponding to the first matching record's actual byte
         // position in its source file.
-        let (mut a, _dir) = app_with_real_log(50);
+        let (mut a, dir) = app_with_real_log(50);
         a.viewport_height = 5;
         let backend = TestBackend::new(160, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -8667,6 +8676,7 @@ mod tests {
         assert!(!dump.contains("from byte offset 0 B of"), "dump:\n{dump}");
         // ...and no longer marked as the beginning of the stream.
         assert!(!dump.contains("(beginning of stream)"), "dump:\n{dump}");
+        dir.cleanup();
     }
 
     #[test]
@@ -8676,10 +8686,9 @@ mod tests {
         // hostname, and the displayed byte offset must reflect the
         // bytes the engine walked past in the filtered-out sources
         // (not just the visible record's offset in its own file).
-        use camino_tempfile::tempdir;
         use std::io::Write;
 
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let paths: Vec<_> = (0..3)
             .map(|i| dir.path().join(format!("sled-{i:02}.log")))
             .collect();
@@ -8732,6 +8741,7 @@ mod tests {
             !dump.contains("(beginning of stream)"),
             "should not still be marked as beginning, dump:\n{dump}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -8743,10 +8753,9 @@ mod tests {
         // back to 0 — the backward extend's stepper walked the
         // excluded source down to 0 and the streamview blindly
         // overwrote `front_cursor` with the now-zero stepper cursor.
-        use camino_tempfile::tempdir;
         use std::io::Write;
 
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let paths: Vec<_> = (0..3)
             .map(|i| dir.path().join(format!("sled-{i:02}.log")))
             .collect();
@@ -8795,6 +8804,7 @@ mod tests {
             "k at top should not have reset the byte offset to 0, \
              before:\n{before}\nafter:\n{after}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -8967,7 +8977,7 @@ mod tests {
         // long op chunks through the merged stream until the summary
         // is fully built.  After draining, the rendered rows should
         // match what the synchronous build produced previously.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "first", &[]),
             (30, "second", &[]),
@@ -8988,11 +8998,12 @@ mod tests {
             "got:\n{}",
             lines.join("\n"),
         );
+        dir.cleanup();
     }
 
     #[test]
     fn long_op_summary_cancel_leaves_placeholder_and_clears_queue() {
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         assert!(matches!(a.long_op, Some(LongOp::BuildSummary(_))));
@@ -9004,6 +9015,7 @@ mod tests {
             lines.iter().any(|l| l.contains("cancelled")),
             "expected cancel notice, got: {lines:?}"
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -9011,7 +9023,7 @@ mod tests {
         // A second build for the same tab while the first is still
         // pending should drop the older request — only the newest
         // filter is honored.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "alpha", &[]), (20, "beta", &[])]);
         a.handle_key(shift('S'));
         // Force a pending state by stalling the active op without
@@ -9026,6 +9038,7 @@ mod tests {
         assert_eq!(a.pending_summary_builds.len(), 1);
         let (_, last) = a.pending_summary_builds.front().unwrap();
         assert_eq!(last.to_string(), "msg=beta");
+        dir.cleanup();
     }
 
     #[test]
@@ -9033,7 +9046,7 @@ mod tests {
         // Pressing `S` installs a placeholder + long op; the very
         // next frame should show the progress bar in place of the
         // parse-stats row.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         let backend = TestBackend::new(120, 6);
@@ -9044,6 +9057,7 @@ mod tests {
             dump.contains("Computing summary"),
             "expected progress bar; dump:\n{dump}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -9059,7 +9073,7 @@ mod tests {
             .map(|i| (10 + i64::from(i) * 10, "filler", &[][..]))
             .collect();
         records[25] = (260, "match-here", &[]);
-        let (mut a, _dir) = multi_line_app(&records);
+        let (mut a, dir) = multi_line_app(&records);
         a.viewport_height = 5;
         a.handle_key(key(KeyCode::Char('/')));
         type_into(a.dialog.as_mut().unwrap(), "match-here");
@@ -9077,6 +9091,7 @@ mod tests {
              (top={top}, formatted.len()={})",
             a.active_tab().formatted().len(),
         );
+        dir.cleanup();
     }
 
     // ---------- end progress bar ----------
@@ -9573,7 +9588,7 @@ mod tests {
         // non-zero — proof that the byte position of the bookmarked
         // event flowed through `commit_selection`'s
         // `cursor_for_position` call.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),
             (30, "third", &[]),
@@ -9593,6 +9608,7 @@ mod tests {
             offset.get()
         );
         assert_eq!(bm.display_msg, "third");
+        dir.cleanup();
     }
 
     /// Inserts a synthetic bookmark with a controllable `display_time`
@@ -9815,7 +9831,7 @@ mod tests {
         // to the top, navigate to the bookmark, and verify the
         // streamview's window starts at the bookmarked record (so the
         // first formatted line carries its msg).
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),
             (30, "third", &[]),
@@ -9840,6 +9856,7 @@ mod tests {
         assert!(line0.contains("third"), "first formatted line was {line0:?}");
         // No filter mismatch, so no notice.
         assert!(a.notice.is_none());
+        dir.cleanup();
     }
 
     /// Returns the `msg` of the event currently at the top of the
@@ -9858,7 +9875,7 @@ mod tests {
     /// Builds a 5-record multi-line app with a viewport short enough
     /// (2 lines) that `j`/`k` actually move the anchor instead of
     /// being clamped because everything already fits on screen.
-    fn five_record_app() -> (App, camino_tempfile::Utf8TempDir) {
+    fn five_record_app() -> (App, TestDir) {
         let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),
@@ -9876,7 +9893,7 @@ mod tests {
         // matches every record (effectively a no-op filter).  The
         // viewport should remain on the third record rather than
         // snapping back to the first.
-        let (mut a, _dir) = five_record_app();
+        let (mut a, dir) = five_record_app();
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
@@ -9884,6 +9901,7 @@ mod tests {
         a.apply_filter(filter);
         a.drain_long_op();
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
+        dir.cleanup();
     }
 
     #[test]
@@ -9891,7 +9909,7 @@ mod tests {
         // Scroll to the third record, then apply a filter that hides
         // exactly that record.  The viewport should slide to the next
         // visible record (the fourth) rather than snap to the top.
-        let (mut a, _dir) = five_record_app();
+        let (mut a, dir) = five_record_app();
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("third"));
@@ -9899,6 +9917,7 @@ mod tests {
         a.apply_filter(filter);
         a.drain_long_op();
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("fourth"));
+        dir.cleanup();
     }
 
     #[test]
@@ -9912,7 +9931,7 @@ mod tests {
         // packs from the end of the surviving buffer — "second" at
         // top, "third" at the bottom — so the visible region is
         // full rather than half-empty.
-        let (mut a, _dir) = five_record_app();
+        let (mut a, dir) = five_record_app();
         for _ in 0..3 {
             a.handle_key(key(KeyCode::Char('j')));
         }
@@ -9927,6 +9946,7 @@ mod tests {
              got {formatted:?}",
         );
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("second"));
+        dir.cleanup();
     }
 
     #[test]
@@ -9935,7 +9955,7 @@ mod tests {
         // so it should preserve the viewport in the same way: the
         // `x`/`Enter` flow on the third record should leave the user
         // looking at the fourth, not at the first.
-        let (mut a, _dir) = five_record_app();
+        let (mut a, dir) = five_record_app();
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('x')));
@@ -9944,6 +9964,7 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         a.drain_long_op();
         assert_eq!(viewport_top_msg(&a).as_deref(), Some("fourth"));
+        dir.cleanup();
     }
 
     #[test]
@@ -9951,7 +9972,7 @@ mod tests {
         // After a filter hides the bookmarked event, navigating to the
         // bookmark should still work (anchor on the nearest visible
         // neighbor) and stash a notice telling the user.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),
             (30, "third", &[]),
@@ -9968,6 +9989,7 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         let n = a.notice.as_deref().unwrap_or_default();
         assert!(n.contains("hidden"), "notice was: {n:?}");
+        dir.cleanup();
     }
 
     // ---------- multi-line rendering ----------
@@ -9991,13 +10013,9 @@ mod tests {
     /// (e.g. to exercise the H-toggle's short/full/none cycle).
     /// `records` is `(epoch_secs, msg)` pairs; extras aren't emitted
     /// because the hostname tests don't need them.
-    fn host_app(
-        hostname: &str,
-        records: &[(i64, &str)],
-    ) -> (App, camino_tempfile::Utf8TempDir) {
-        use camino_tempfile::tempdir;
+    fn host_app(hostname: &str, records: &[(i64, &str)]) -> (App, TestDir) {
         use std::io::Write;
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         for (secs, msg) in records {
             let time =
@@ -10030,12 +10048,9 @@ mod tests {
         (a, dir)
     }
 
-    fn multi_line_app(
-        records: &[RecordSpec<'_>],
-    ) -> (App, camino_tempfile::Utf8TempDir) {
-        use camino_tempfile::tempdir;
+    fn multi_line_app(records: &[RecordSpec<'_>]) -> (App, TestDir) {
         use std::io::Write;
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         for (secs, msg, extras) in records {
             let time =
@@ -10072,7 +10087,7 @@ mod tests {
 
     #[test]
     fn render_emits_multiple_lines_per_event_with_extras() {
-        let (a, _dir) = multi_line_app(&[
+        let (a, dir) = multi_line_app(&[
             (10, "starting", &[("build", r#""0.1.0""#)]),
             (20, "tick", &[]),
             (30, "loaded", &[("zones", "4"), ("ms", "12")]),
@@ -10105,6 +10120,7 @@ mod tests {
         assert!(tab.formatted()[3].ends_with(" loaded"));
         assert_eq!(tab.formatted()[4], "    ms = 12");
         assert_eq!(tab.formatted()[5], "    zones = 4");
+        dir.cleanup();
     }
 
     #[test]
@@ -10112,7 +10128,7 @@ mod tests {
         // First event has two extras (3 lines total); second has none
         // (1 line).  A single `j` in select mode must land on the
         // *second event*, not on one of the first event's extra rows.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[("a", "1"), ("b", "2")]),
             (20, "second", &[]),
         ]);
@@ -10120,13 +10136,14 @@ mod tests {
         assert_eq!(a.active_tab().select.unwrap().event_idx, 0);
         a.handle_key(key(KeyCode::Char('j')));
         assert_eq!(a.active_tab().select.unwrap().event_idx, 1);
+        dir.cleanup();
     }
 
     #[test]
     fn render_highlights_all_lines_of_selected_event() {
         // Event 1 spans lines 1, 2, 3 (header + 2 extras).  Selecting
         // it must paint the dark-gray bg on every one of those rows.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[("a", "1"), ("b", "2")]),
             (30, "third", &[]),
@@ -10150,6 +10167,7 @@ mod tests {
         // must not be highlighted.
         assert!(buf[(0, 1)].style().bg != Some(Color::DarkGray));
         assert!(buf[(0, 5)].style().bg != Some(Color::DarkGray));
+        dir.cleanup();
     }
 
     #[test]
@@ -10161,7 +10179,7 @@ mod tests {
         // next event whose time ≥ anchor.time + 60s.  Tail events
         // ensure max_top is far enough below the target that the
         // result isn't accidentally clamped.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[("k", "1")]), // lines 0, 1
             (80, "later", &[]),           // line 2 — 70s after first
             (90, "filler", &[]),          // line 3
@@ -10175,13 +10193,14 @@ mod tests {
         // Its first display line is line 2; max_top with 6 lines and
         // height 2 is 4, so the result is not clamped.
         assert_eq!(a.active_tab().viewport_top, 2);
+        dir.cleanup();
     }
 
     #[test]
     fn footer_reports_entry_count_in_select_mode() {
         // 3 events but 6 display lines: footer in select mode should
         // say "entry 1/3", not "row 1/6".
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[("k", "1")]),
             (20, "second", &[]),
             (30, "third", &[("k", "1"), ("z", "9")]),
@@ -10195,6 +10214,7 @@ mod tests {
             dump.contains("entry 1/3"),
             "expected entry count in footer, got:\n{dump}",
         );
+        dir.cleanup();
     }
 
     // ---------- show_extras toggle (F) ----------
@@ -10205,9 +10225,8 @@ mod tests {
         // extras: the multi-line file below has two events, each with
         // its own extras, but the rendered tab should be just the two
         // header lines.
-        use camino_tempfile::tempdir;
         use std::io::Write;
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let path = dir.path().join("a.log");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
@@ -10230,11 +10249,12 @@ mod tests {
         assert!(tab.formatted()[0].ends_with(" first"));
         assert!(tab.formatted()[1].ends_with(" second"));
         assert!(!a.active_stream().show_extras);
+        dir.cleanup();
     }
 
     #[test]
     fn shift_f_toggles_show_extras_and_repaints() {
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[("build", r#""0.1.0""#)]),
             (20, "tick", &[]),
         ]);
@@ -10251,6 +10271,7 @@ mod tests {
         a.handle_key(key(KeyCode::Char('F')));
         assert!(a.active_stream().show_extras);
         assert_eq!(a.active_tab().formatted().len(), 3);
+        dir.cleanup();
     }
 
     #[test]
@@ -10259,7 +10280,7 @@ mod tests {
         // on the second event's header (line 2 with extras showing) and
         // toggle off — viewport should snap to the same record at its
         // new (post-rerender) line.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[("a", "1"), ("b", "2")]),
             (30, "third", &[]),
@@ -10275,6 +10296,7 @@ mod tests {
         // First line for record 1 is still index 1 (event 0 is single
         // line).  Anchor preserved across the second toggle too.
         assert_eq!(a.active_tab().viewport_top, 1);
+        dir.cleanup();
     }
 
     // ---------- show_raw toggle (R) ----------
@@ -10285,7 +10307,7 @@ mod tests {
         // columns.  Toggle R: the rendered row becomes the JSON line
         // from the source.  Toggle again: header returns.  Exercise
         // both NONE and SHIFT modifier forms of `R`.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[("build", r#""0.1.0""#)])]);
         // multi_line_app enabled extras; the default (raw off) renders
         // a header followed by one extras row.
@@ -10309,6 +10331,7 @@ mod tests {
         assert!(!a.active_stream().show_raw);
         assert_eq!(a.active_tab().formatted().len(), 2);
         assert!(a.active_tab().formatted()[0].contains("INFO"));
+        dir.cleanup();
     }
 
     // ---------- show_date toggle (D) ----------
@@ -10318,7 +10341,7 @@ mod tests {
         // A fresh stream's timestamps should include the date prefix:
         // most triage starts with "what day was this?" and the user
         // opts out (`D`) when they're zoomed in on a tight window.
-        let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (a, dir) = multi_line_app(&[(10, "first", &[])]);
         assert!(a.active_stream().show_date);
         let row = &a.active_tab().formatted()[0];
         // Timestamp prefix carries the date and ends in millisecond
@@ -10327,11 +10350,12 @@ mod tests {
             row.starts_with("1970-01-01T00:00:10.000Z "),
             "expected dated header, got {row:?}",
         );
+        dir.cleanup();
     }
 
     #[test]
     fn shift_d_toggles_show_date_and_repaints() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         assert!(a.active_stream().show_date);
         let dated = a.active_tab().formatted()[0].clone();
         assert!(dated.starts_with("1970-01-01T00:00:10.000Z "));
@@ -10348,6 +10372,7 @@ mod tests {
         a.handle_key(key(KeyCode::Char('D')));
         assert!(a.active_stream().show_date);
         assert!(a.active_tab().formatted()[0].starts_with("1970-01-01T"));
+        dir.cleanup();
     }
 
     #[test]
@@ -10356,7 +10381,7 @@ mod tests {
         // (only the timestamp prefix shrinks), so a viewport parked
         // mid-buffer should stay where it is.  Contrast with the
         // show_extras toggle, which can collapse multi-line records.
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),
             (30, "third", &[]),
@@ -10369,6 +10394,7 @@ mod tests {
         a.handle_key(shift('D'));
         assert_eq!(a.active_tab().viewport_top, 1);
         assert_eq!(a.active_tab().formatted().len(), lines_before);
+        dir.cleanup();
     }
 
     #[test]
@@ -10406,13 +10432,14 @@ mod tests {
 
     #[test]
     fn streams_default_to_short_hostname() {
-        let (a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (a, dir) = multi_line_app(&[(10, "first", &[])]);
         assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Short);
+        dir.cleanup();
     }
 
     #[test]
     fn d_opens_display_fields_dialog_with_active_opts() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(key(KeyCode::Char('d')));
         match &a.dialog {
             Some(Dialog::DisplayFields { draft, cursor }) => {
@@ -10421,11 +10448,12 @@ mod tests {
             }
             _ => panic!("expected DisplayFields dialog"),
         }
+        dir.cleanup();
     }
 
     #[test]
     fn display_fields_dialog_jk_navigates_with_wrap() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(key(KeyCode::Char('d')));
         // j once → cursor 1.
         a.handle_key(key(KeyCode::Char('j')));
@@ -10451,6 +10479,7 @@ mod tests {
             }
             _ => panic!("dialog closed unexpectedly"),
         }
+        dir.cleanup();
     }
 
     #[test]
@@ -10458,7 +10487,7 @@ mod tests {
         // Tab should advance the cursor the same way `j` does, and
         // BackTab should retreat it like `k` — for users who'd rather
         // use Tab/Shift-Tab than vim keys.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(key(KeyCode::Char('d')));
         a.handle_key(key(KeyCode::Tab));
         match &a.dialog {
@@ -10474,6 +10503,7 @@ mod tests {
             }
             _ => panic!("dialog closed unexpectedly"),
         }
+        dir.cleanup();
     }
 
     #[test]
@@ -10482,7 +10512,7 @@ mod tests {
         // should reflect Full, but the active stream is unchanged
         // until Enter.  Then Enter applies and the stream picks up
         // Full.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameFull);
         a.handle_key(key(KeyCode::Char(' ')));
@@ -10497,11 +10527,12 @@ mod tests {
         a.handle_key(key(KeyCode::Enter));
         assert!(a.dialog.is_none());
         assert_eq!(a.active_stream().hostname_display, HostnameDisplay::Full);
+        dir.cleanup();
     }
 
     #[test]
     fn display_fields_dialog_space_toggles_pid_checkbox() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         let before = a.active_stream().render_opts();
         assert!(!before.show_pid, "default is pid hidden");
         a.handle_key(key(KeyCode::Char('d')));
@@ -10509,11 +10540,12 @@ mod tests {
         a.handle_key(key(KeyCode::Char(' ')));
         a.handle_key(key(KeyCode::Enter));
         assert!(a.active_stream().render_opts().show_pid);
+        dir.cleanup();
     }
 
     #[test]
     fn display_fields_dialog_esc_discards_draft() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         let before = a.active_stream().render_opts();
         a.handle_key(key(KeyCode::Char('d')));
         focus_display_field(&mut a, DisplayFieldItem::HostnameNone);
@@ -10521,6 +10553,7 @@ mod tests {
         a.handle_key(key(KeyCode::Esc));
         assert!(a.dialog.is_none());
         assert_eq!(a.active_stream().render_opts(), before);
+        dir.cleanup();
     }
 
     #[test]
@@ -10528,7 +10561,7 @@ mod tests {
         // Use a hostname that exercises both the dot-trim and the
         // UUID-collapse, so the two hostname modes produce visibly
         // different rendered lines.
-        let (mut a, _dir) = host_app(
+        let (mut a, dir) = host_app(
             "oxz_nexus_c53300fc-84eb-490a-9e1e-9e18d372856d.oxide.test",
             &[(10, "first")],
         );
@@ -10551,6 +10584,7 @@ mod tests {
             ),
             "expected full hostname after apply, got {full_line:?}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -10561,7 +10595,7 @@ mod tests {
         // `set_render_opts` is what enforces propagation when a new
         // field lands; this test confirms the persistence layer
         // preserves whatever the stream is carrying.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[("k", "1")])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[("k", "1")])]);
         let stream_id = a.tabs[a.active].stream;
         let initial = a.active_stream();
         assert!(initial.show_extras, "multi_line_app starts with extras on");
@@ -10602,6 +10636,7 @@ mod tests {
         assert!(stream.show_pid);
         assert!(!stream.show_name);
         assert_eq!(stream.hostname_display, HostnameDisplay::Full);
+        dir.cleanup();
     }
 
     #[test]
@@ -10627,7 +10662,7 @@ mod tests {
         // without prompting for a filter — the new tab inherits the
         // active tab's filter and the user adjusts it afterwards via
         // `f` if they want to.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         let initial_tabs = a.tabs.len();
         a.handle_key(shift('S'));
@@ -10635,6 +10670,7 @@ mod tests {
         assert_eq!(a.active, a.tabs.len() - 1);
         assert_eq!(a.active_tab().kind, TabKind::Summary);
         assert!(a.dialog.is_none());
+        dir.cleanup();
     }
 
     #[test]
@@ -10643,7 +10679,7 @@ mod tests {
         // Summary tab should pick that up rather than default.  We
         // verify by making the filter accept zero events and then
         // observing that the summary reports zero events.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "alpha", &[]), (20, "beta", &[])]);
         let f: Filter = "msg=alpha".parse().unwrap();
         a.apply_filter(f.clone());
@@ -10661,26 +10697,29 @@ mod tests {
         let stream_id = a.active_tab().stream;
         let stream_filter = &a.session.streams.get(&stream_id).unwrap().filter;
         assert_eq!(stream_filter.to_string(), f.to_string());
+        dir.cleanup();
     }
 
     #[test]
     fn summary_tab_f_opens_filter_dialog() {
         // After landing on a Summary tab the user can still adjust
         // the filter via `f`.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(shift('S'));
         assert!(a.dialog.is_none());
         a.handle_key(key(KeyCode::Char('f')));
         assert!(matches!(a.dialog, Some(Dialog::Filter { .. })));
+        dir.cleanup();
     }
 
     #[test]
     fn bare_s_opens_summary_tab() {
         // Some terminals report `S` with no SHIFT modifier; the binding
         // accepts both forms so capital-S is reliable across them.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(key(KeyCode::Char('S')));
         assert_eq!(a.active_tab().kind, TabKind::Summary);
+        dir.cleanup();
     }
 
     #[test]
@@ -10688,7 +10727,7 @@ mod tests {
         // Open a summary tab over a multi-record file; the rendered
         // formatted lines should include the standard section headers
         // ("Summary:", "== name ...", "== time ...").
-        let (mut a, _dir) = multi_line_app(&[
+        let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "first", &[]),
             (30, "second", &[]),
@@ -10702,6 +10741,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.starts_with("== name")));
         assert!(lines.iter().any(|l| l.starts_with("== msg")));
         assert!(lines.iter().any(|l| l.starts_with("== time")));
+        dir.cleanup();
     }
 
     #[test]
@@ -10709,7 +10749,7 @@ mod tests {
         // After landing on a Summary tab, the user can open the
         // filter dialog with `f` and apply a narrower filter; the
         // histogram should re-render against the new filter.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         a.drain_long_op();
@@ -10727,6 +10767,7 @@ mod tests {
             "expected one-event summary, got:\n{}",
             lines.join("\n"),
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -10735,7 +10776,7 @@ mod tests {
         // underlying records to act on.  A Summary tab whose key
         // ignores the binding shouldn't suddenly drop into selection
         // mode and trap the user.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(shift('S'));
         a.handle_key(key(KeyCode::Char('x')));
         assert!(a.active_tab().select.is_none());
@@ -10743,6 +10784,7 @@ mod tests {
         assert!(a.active_tab().select.is_none());
         a.handle_key(key(KeyCode::Char('b')));
         assert!(a.active_tab().select.is_none());
+        dir.cleanup();
     }
 
     #[test]
@@ -10750,7 +10792,7 @@ mod tests {
         // Summary tabs hide x/X/b/F/<>/= from the footer because those
         // bindings either no-op (selection-mode) or operate on event
         // state the summary view doesn't expose.
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(shift('S'));
         let backend = TestBackend::new(160, 6);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -10763,17 +10805,19 @@ mod tests {
         // ...but not the record-oriented bindings.
         assert!(!dump.contains("x/X exclude"), "dump:\n{dump}");
         assert!(!dump.contains("F fields="), "dump:\n{dump}");
+        dir.cleanup();
     }
 
     #[test]
     fn summary_tab_tab_name_is_summary_n() {
-        let (mut a, _dir) = multi_line_app(&[(10, "first", &[])]);
+        let (mut a, dir) = multi_line_app(&[(10, "first", &[])]);
         a.handle_key(shift('S'));
         assert!(
             a.active_tab().name.starts_with("Summary "),
             "expected `Summary N`, got {:?}",
             a.active_tab().name,
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -10782,22 +10826,21 @@ mod tests {
         // `event_for_line` is empty (Summary tabs have no underlying
         // events, only histogram rows).  `format_user_status` used to
         // index into that empty slice and panic on the next frame.
-        let (mut a, _dir) =
+        let (mut a, dir) =
             multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
         a.handle_key(shift('S'));
         a.drain_long_op();
         let backend = TestBackend::new(160, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
+        dir.cleanup();
     }
 
     // ---------- persistent-session plumbing (phase 5) ----------
 
     #[test]
     fn build_session_sources_canonicalizes_and_stats_each_file() {
-        use camino_tempfile::tempdir;
-
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let a_path = dir.path().join("a.log");
         let b_path = dir.path().join("b.log");
         std::fs::write(&a_path, b"hello\n").unwrap();
@@ -10825,13 +10868,12 @@ mod tests {
         // bookmarks rely on.
         let id_as_str: &str = by_id[0].id.as_ref();
         assert_eq!(id_as_str, by_id[0].path.as_str());
+        dir.cleanup();
     }
 
     #[test]
     fn try_save_now_persists_session_and_marks_policy_clean() {
-        use camino_tempfile::tempdir;
-
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let session_id = Session::new().id;
 
@@ -10849,6 +10891,7 @@ mod tests {
         // same session id.
         let reloaded = a.store.as_ref().unwrap().load(session_id).unwrap();
         assert_eq!(reloaded.id, session_id);
+        dir.cleanup();
     }
 
     #[test]
@@ -10867,11 +10910,12 @@ mod tests {
     // ---------- inline persistence (phase 6) ----------
 
     /// Builds an [`App`] with no engine but with a freshly-created
-    /// on-disk [`SessionStore`] attached.  Returns the
-    /// `Utf8TempDir` so the caller can keep the backing directory
-    /// alive for the duration of the test.
-    fn app_with_store_and_one_tab() -> (App, camino_tempfile::Utf8TempDir) {
-        let dir = camino_tempfile::tempdir().unwrap();
+    /// on-disk [`SessionStore`] attached.  Returns the [`TestDir`]
+    /// so the caller can keep the backing directory alive for the
+    /// duration of the test (and call [`TestDir::cleanup`] on
+    /// success).
+    fn app_with_store_and_one_tab() -> (App, TestDir) {
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
         let mut a = App::new_for_tests(Engine::new());
         a.store = Some(store);
@@ -10893,7 +10937,7 @@ mod tests {
 
     #[test]
     fn add_bookmark_persists_inline() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         assert!(reload_session(&a).user_bookmarks.is_empty());
 
         let stream_id = a.tabs[a.active].stream;
@@ -10912,11 +10956,12 @@ mod tests {
         assert_eq!(bms.len(), 1);
         let only = bms.iter().next().unwrap();
         assert_eq!(only.display_msg, "marked");
+        dir.cleanup();
     }
 
     #[test]
     fn delete_bookmark_persists_inline() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let stream_id = a.tabs[a.active].stream;
         let draft = BookmarkDraft {
             cursor: Cursor::with([]),
@@ -10932,17 +10977,19 @@ mod tests {
         assert!(!a.policy.dirty());
         let reloaded = reload_session(&a);
         assert!(reloaded.user_bookmarks.is_empty());
+        dir.cleanup();
     }
 
     #[test]
     fn push_tab_persists_the_new_stream_inline() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let before = reload_session(&a).streams.len();
 
         a.push_tab(TabKind::Stream, Filter::default());
         assert!(!a.policy.dirty());
         let after = reload_session(&a).streams.len();
         assert_eq!(after, before + 1);
+        dir.cleanup();
     }
 
     #[test]
@@ -10950,7 +10997,7 @@ mod tests {
         // `app_with_store_and_one_tab` already saved once with the
         // default single tab.  Push a second tab, then read back the
         // session to confirm both tabs were serialized in order.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let first_stream = a.tabs[0].stream;
         a.push_tab(TabKind::Stream, Filter::default());
         let second_stream = a.tabs[1].stream;
@@ -10961,6 +11008,7 @@ mod tests {
         assert_eq!(reloaded.tabs[0].kind, TabKind::Stream);
         assert_eq!(reloaded.tabs[1].stream, second_stream);
         assert_eq!(reloaded.tabs[1].kind, TabKind::Stream);
+        dir.cleanup();
     }
 
     #[test]
@@ -10969,7 +11017,7 @@ mod tests {
         // immediately and the new name should come back on resume —
         // pinning the bug where renames lived only on the runtime
         // `Tab` and were lost the moment the session was reloaded.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
 
         a.handle_key(key(KeyCode::Char('r')));
         a.handle_key(ctrl('u'));
@@ -10991,13 +11039,14 @@ mod tests {
         );
         assert_eq!(app2.tabs.len(), 1);
         assert_eq!(app2.tabs[0].name, "Nexus");
+        dir.cleanup();
     }
 
     #[test]
     fn save_records_summary_tab_kind() {
         // A Summary tab persists with `kind: Summary` so resume can
         // restore the histogram view rather than a stream view.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         a.push_tab(TabKind::Summary, Filter::default());
 
         let reloaded = reload_session(&a);
@@ -11007,6 +11056,7 @@ mod tests {
             .find(|t| t.kind == TabKind::Summary)
             .expect("the summary tab should round-trip");
         assert_eq!(summary.stream, a.tabs[1].stream);
+        dir.cleanup();
     }
 
     #[test]
@@ -11097,7 +11147,7 @@ mod tests {
 
     #[test]
     fn apply_filter_persists_the_new_filter_inline() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let stream_id = a.tabs[a.active].stream;
         let mut new_filter = Filter::default();
         new_filter.add_predicate(
@@ -11115,11 +11165,12 @@ mod tests {
         // Filter doesn't implement Eq, so compare its display form —
         // round-trip via serde is the contract that matters anyway.
         assert_eq!(format!("{:?}", stream.filter), format!("{new_filter:?}"),);
+        dir.cleanup();
     }
 
     #[test]
     fn toggle_show_extras_persists_inline() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let stream_id = a.tabs[a.active].stream;
         let before =
             reload_session(&a).streams.get(&stream_id).unwrap().show_extras;
@@ -11129,6 +11180,7 @@ mod tests {
         let after =
             reload_session(&a).streams.get(&stream_id).unwrap().show_extras;
         assert_eq!(after, !before);
+        dir.cleanup();
     }
 
     // ---------- CLI surface (phase 9) ----------
@@ -11170,7 +11222,7 @@ mod tests {
 
     #[test]
     fn engine_for_resumed_session_errors_naming_missing_paths() {
-        let dir = camino_tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let exists = dir.path().join("present.log");
         std::fs::write(&exists, b"hi\n").unwrap();
         let missing = dir.path().join("gone.log");
@@ -11202,11 +11254,12 @@ mod tests {
             msg.contains(missing.as_str()),
             "expected msg to name {missing}, got {msg}"
         );
+        dir.cleanup();
     }
 
     #[test]
     fn engine_for_resumed_session_succeeds_when_all_paths_present() {
-        let dir = camino_tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let a = dir.path().join("a.log");
         let b = dir.path().join("b.log");
         std::fs::write(&a, b"hi\n").unwrap();
@@ -11236,11 +11289,12 @@ mod tests {
         let Ok(_engine) = engine_for_resumed_session(&s) else {
             panic!("expected engine_for_resumed_session to succeed");
         };
+        dir.cleanup();
     }
 
     #[test]
     fn load_all_sessions_sorts_newest_first_and_skips_corrupt() {
-        let dir = camino_tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
 
         // Save three sessions with explicit timestamps.
@@ -11270,6 +11324,7 @@ mod tests {
         let sessions = load_all_sessions(&store).unwrap();
         let ids: Vec<_> = sessions.iter().map(|s| s.id).collect();
         assert_eq!(ids, vec![new.id, mid.id, old.id]);
+        dir.cleanup();
     }
 
     // ---------- startup dialog (phase 8) ----------
@@ -11450,24 +11505,26 @@ mod tests {
 
     #[test]
     fn j_scroll_records_debounced() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // The initial setup flushed the dirty bit.
         assert!(!a.policy.dirty());
         a.handle_key(key(KeyCode::Char('j')));
         assert!(a.policy.dirty(), "j should have marked the policy dirty");
+        dir.cleanup();
     }
 
     #[test]
     fn ctrl_d_scroll_records_debounced() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         assert!(!a.policy.dirty());
         a.handle_key(ctrl('d'));
         assert!(a.policy.dirty());
+        dir.cleanup();
     }
 
     #[test]
     fn flush_if_due_flushes_when_window_has_elapsed() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // Pretend the last save happened well outside the debounce
         // window.
         a.policy.mark_saved(now_minus(Duration::from_secs(60)));
@@ -11480,22 +11537,24 @@ mod tests {
             "flush_if_due should have cleared the dirty bit"
         );
         assert!(a.notice.is_none(), "successful flush should not set a notice");
+        dir.cleanup();
     }
 
     #[test]
     fn flush_if_due_is_a_noop_when_clean() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // Even with the window long elapsed, a clean policy stays
         // clean and no save fires.
         a.policy.mark_saved(now_minus(Duration::from_secs(60)));
         assert!(!a.policy.dirty());
         a.flush_if_due();
         assert!(!a.policy.dirty());
+        dir.cleanup();
     }
 
     #[test]
     fn flush_if_due_is_a_noop_within_debounce_window() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // Just-saved + just-recorded: the window has not elapsed.
         a.policy.mark_saved(Instant::now());
         a.policy.record(seer::Cadence::Debounced);
@@ -11505,6 +11564,7 @@ mod tests {
             a.policy.dirty(),
             "dirty bit must persist when the window hasn't elapsed"
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -11513,7 +11573,7 @@ mod tests {
         // The debounce check fires, the save fails, the error lands
         // on `notice`, and the dirty bit stays set so the next
         // opportunity retries.
-        let dir = camino_tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let sessions_dir = dir.path().join("sessions");
         let store = SessionStore::open_at(&sessions_dir).unwrap();
         let mut a = App::new_for_tests(Engine::new());
@@ -11531,11 +11591,12 @@ mod tests {
             notice.contains("session save failed"),
             "unexpected notice: {notice}"
         );
+        dir.cleanup();
     }
 
     #[test]
     fn viewport_resize_in_render_records_debounced() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // First render lands the 0→N transition; let it settle and
         // then mark_saved so subsequent dirty signals are isolated.
         let backend = TestBackend::new(80, 24);
@@ -11551,11 +11612,12 @@ mod tests {
             a.policy.dirty(),
             "resize should have recorded a debounced mutation"
         );
+        dir.cleanup();
     }
 
     #[test]
     fn render_at_same_size_does_not_record() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
@@ -11565,6 +11627,7 @@ mod tests {
         // Re-render at the same size: no resize, no record.
         terminal.draw(|frame| render(frame, &mut a)).unwrap();
         assert!(!a.policy.dirty(), "render at the same size must not record");
+        dir.cleanup();
     }
 
     #[test]
@@ -11573,7 +11636,7 @@ mod tests {
         // next save fails.  The mutation should still proceed; the
         // save error should land on `notice`; and the dirty bit
         // should stay set so future opportunities can retry.
-        let dir = camino_tempfile::tempdir().unwrap();
+        let dir = TestDir::new();
         let sessions_dir = dir.path().join("sessions");
         let store = SessionStore::open_at(&sessions_dir).unwrap();
         let mut a = App::new_for_tests(Engine::new());
@@ -11604,11 +11667,12 @@ mod tests {
         );
         // The mutation itself still landed in memory.
         assert!(a.session.user_bookmarks.contains_key(&stream_id));
+        dir.cleanup();
     }
 
     #[test]
     fn capital_y_opens_seeit_command_dialog() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         let session_id = a.session.id;
         let tab_name = a.active_tab().name.clone();
 
@@ -11624,26 +11688,29 @@ mod tests {
             shlex::try_quote(&tab_name).unwrap(),
         );
         assert_eq!(text, &expected);
+        dir.cleanup();
     }
 
     #[test]
     fn esc_closes_seeit_command_dialog() {
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         a.handle_key(shift('Y'));
         assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
 
         a.handle_key(key(KeyCode::Esc));
         assert!(a.dialog.is_none());
+        dir.cleanup();
     }
 
     #[test]
     fn enter_closes_seeit_command_dialog() {
         // Read-only popup: Enter should close it (same as Esc), not
         // act on the underlying tab.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         a.handle_key(shift('Y'));
         a.handle_key(key(KeyCode::Enter));
         assert!(a.dialog.is_none());
+        dir.cleanup();
     }
 
     #[test]
@@ -11651,12 +11718,13 @@ mod tests {
         // Non-Esc/Enter keys should not fall through to the
         // underlying tab (which would scroll or quit) while the popup
         // is open.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         a.handle_key(shift('Y'));
         a.handle_key(key(KeyCode::Char('j')));
         a.handle_key(key(KeyCode::Char('q')));
         assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
         assert!(!a.quit);
+        dir.cleanup();
     }
 
     #[test]
@@ -11665,7 +11733,7 @@ mod tests {
         // matches the user's current state.  Use a save-policy
         // mutation that hasn't been flushed yet, then press Y, and
         // assert the dirty bit cleared.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         a.policy.record(Cadence::Inline);
         // App::new + the constructor's initial save left the policy
         // clean; we just dirtied it.  Confirm.
@@ -11676,6 +11744,7 @@ mod tests {
             !a.policy.dirty(),
             "Y should have flushed the dirty bit via try_save_now",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -11685,7 +11754,7 @@ mod tests {
         // `render`, leaving the dialog invisible while still
         // capturing every keystroke.  Drive a full render and
         // assert the popup's title text appears in the buffer.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         // Push enough rows that the underlying tab has content to
         // render under the popup; without rows the assert still
         // catches the missing dispatch, but the dump is easier to
@@ -11703,6 +11772,7 @@ mod tests {
             dump.contains("seeit --session"),
             "expected command text in rendered buffer, got:\n{dump}",
         );
+        dir.cleanup();
     }
 
     #[test]
@@ -11744,7 +11814,7 @@ mod tests {
         // The Bookmarks pane's cursor *is* the selection — `Y` should
         // pop the reproduction command for the highlighted bookmark
         // without a separate "arm" step.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 3);
         let session_id = a.session.id;
         // Walk the cursor from "unset" to bookmark 2 so the popup
@@ -11764,18 +11834,20 @@ mod tests {
             shlex::try_quote(&cursor_id.to_string()).unwrap(),
         );
         assert_eq!(text, &expected);
+        dir.cleanup();
     }
 
     #[test]
     fn capital_y_in_bookmarks_without_shift_modifier_also_works() {
         // Mirrors the regular-tab binding: terminals report `Y` with
         // either NONE or SHIFT and both should open the popup.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 1);
 
         a.handle_key(key(KeyCode::Char('Y')));
 
         assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
+        dir.cleanup();
     }
 
     #[test]
@@ -11783,7 +11855,7 @@ mod tests {
         // The Bookmarks pane doesn't auto-highlight the first row on
         // entry — pressing `Y` before any j/k should still target
         // *some* bookmark rather than silently no-op.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 2);
         assert!(a.bookmark_cursor_idx().is_none());
 
@@ -11791,6 +11863,7 @@ mod tests {
 
         assert_eq!(a.bookmark_cursor_idx(), Some(0));
         assert!(matches!(a.dialog, Some(Dialog::SeeitCommand { .. })));
+        dir.cleanup();
     }
 
     #[test]
@@ -11799,7 +11872,7 @@ mod tests {
         // emitted `--bookmark <name>`; the id form is always unique.
         // Guard against a regression that picks the human-readable
         // name instead.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 1);
         let cursor_id = a.flat_bookmarks()[0].id;
 
@@ -11819,13 +11892,14 @@ mod tests {
             !text.contains("bm-0"),
             "command should not embed the bookmark name, got: {text}",
         );
+        dir.cleanup();
     }
 
     #[test]
     fn bookmarks_enter_still_navigates() {
         // Regression guard: the Y binding must not have stolen Enter's
         // default semantics on the Bookmarks pane.
-        let (mut a, _dir) = app_with_store_and_one_tab();
+        let (mut a, dir) = app_with_store_and_one_tab();
         enter_bookmarks_pane_with(&mut a, 1);
         // Initialize the bookmark cursor — `navigate_to_bookmark_cursor`
         // is a no-op while it's unset, which would mask the assertion
@@ -11839,6 +11913,7 @@ mod tests {
             "Enter must not open the seeit popup",
         );
         assert!(!a.bookmarks_active(), "Enter must have navigated away");
+        dir.cleanup();
     }
 
     #[test]

@@ -513,8 +513,7 @@ mod tests {
     use crate::position::{ByteOffset, SourceId};
     use crate::session::{Bookmark, BookmarkId, BookmarkName, Session, Tab};
     use crate::stream::LogStream;
-    use crate::test_fixtures::t;
-    use camino_tempfile::tempdir;
+    use crate::test_fixtures::{TestDir, t};
     use std::fs;
 
     /// Writes `body` to `dir/<name>` and returns a [`SessionSource`]
@@ -575,7 +574,7 @@ mod tests {
 
     #[test]
     fn whole_session_resolves_to_default_filter_and_render_opts() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
 
         let t = resolve_in_session(&session, &Selector::WholeSession).unwrap();
@@ -585,11 +584,12 @@ mod tests {
         // Filter::default has no predicates.
         assert!(t.filter.predicates().is_empty());
         assert_eq!(t.render_opts, RenderOpts::default());
+        dir.cleanup();
     }
 
     #[test]
     fn stream_resolves_to_stream_filter_and_render_opts() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         // Tweak the lone stream so the resolver picks up something
         // distinct from defaults.  Remove + mutate + reinsert is the
@@ -611,11 +611,12 @@ mod tests {
         assert!(t.render_opts.show_extras);
         assert_eq!(t.filter.predicates().len(), 1);
         assert_eq!(t.mode, ResolvedMode::Records);
+        dir.cleanup();
     }
 
     #[test]
     fn tab_resolves_to_saved_cursor() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         let expected_cursor =
             session.tabs[0].cursor.clone().expect("fixture sets cursor");
@@ -625,11 +626,12 @@ mod tests {
                 .unwrap();
         assert_eq!(t.cursor, expected_cursor);
         assert_eq!(t.mode, ResolvedMode::Records);
+        dir.cleanup();
     }
 
     #[test]
     fn tab_with_no_saved_cursor_starts_at_beginning() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         session.tabs[0].cursor = None;
 
@@ -637,11 +639,12 @@ mod tests {
             resolve_in_session(&session, &Selector::Tab("Tab 1".to_string()))
                 .unwrap();
         assert_eq!(t.cursor, Cursor::default());
+        dir.cleanup();
     }
 
     #[test]
     fn summary_tab_resolves_to_summary_mode() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         session.tabs[0].kind = TabKind::Summary;
 
@@ -649,11 +652,12 @@ mod tests {
             resolve_in_session(&session, &Selector::Tab("Tab 1".to_string()))
                 .unwrap();
         assert_eq!(t.mode, ResolvedMode::Summary);
+        dir.cleanup();
     }
 
     #[test]
     fn bookmark_resolves_by_name() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         let stream_id = session.tabs[0].stream;
         let bm = bookmark_at(Some("panic"), dir.path().join("a.log").as_str());
@@ -666,11 +670,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.cursor, expected_cursor);
+        dir.cleanup();
     }
 
     #[test]
     fn bookmark_resolves_by_id_prefix() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         let stream_id = session.tabs[0].stream;
         let bm = bookmark_at(None, dir.path().join("a.log").as_str());
@@ -685,11 +690,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.cursor, expected_cursor);
+        dir.cleanup();
     }
 
     #[test]
     fn unknown_stream_errors() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         let err =
             resolve_in_session(&session, &Selector::Stream("nope".to_string()))
@@ -700,11 +706,12 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+        dir.cleanup();
     }
 
     #[test]
     fn ambiguous_stream_lists_candidates() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         // Add a second stream with the same name as the first.
         let duplicate = LogStream::new("Tab 1".to_string());
@@ -721,21 +728,23 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+        dir.cleanup();
     }
 
     #[test]
     fn unknown_tab_errors() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         let err =
             resolve_in_session(&session, &Selector::Tab("Nope".to_string()))
                 .unwrap_err();
         assert!(matches!(err, ResolveError::UnknownTab { .. }));
+        dir.cleanup();
     }
 
     #[test]
     fn unknown_bookmark_errors() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         let err = resolve_in_session(
             &session,
@@ -743,11 +752,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ResolveError::UnknownBookmark { .. }));
+        dir.cleanup();
     }
 
     #[test]
     fn empty_bookmark_needle_is_unknown_not_ambiguous() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         let stream_id = session.tabs[0].stream;
         session.add_bookmark(
@@ -759,11 +769,12 @@ mod tests {
             resolve_in_session(&session, &Selector::Bookmark(String::new()))
                 .unwrap_err();
         assert!(matches!(err, ResolveError::UnknownBookmark { .. }));
+        dir.cleanup();
     }
 
     #[test]
     fn ambiguous_bookmark_lists_candidates() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let mut session = fixture_session(dir.path());
         let stream_id = session.tabs[0].stream;
         session.add_bookmark(
@@ -786,11 +797,12 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+        dir.cleanup();
     }
 
     #[test]
     fn fingerprint_mismatch_is_a_hard_error() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         // Touch a.log so its mtime + size shift.
         fs::write(dir.path().join("a.log"), "{}\n{}\n").unwrap();
@@ -809,17 +821,19 @@ mod tests {
             }
             other => panic!("wrong error: {other:?}"),
         }
+        dir.cleanup();
     }
 
     #[test]
     fn missing_source_errors_specifically() {
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let session = fixture_session(dir.path());
         fs::remove_file(dir.path().join("a.log")).unwrap();
 
         let err =
             resolve_in_session(&session, &Selector::WholeSession).unwrap_err();
         assert!(matches!(err, ResolveError::SourceMissing { .. }));
+        dir.cleanup();
     }
 
     #[test]
@@ -879,7 +893,7 @@ mod tests {
     #[test]
     fn resolve_loads_from_store() {
         // End-to-end: save a session, then resolve through the store.
-        let dir = tempdir().unwrap();
+        let dir = TestDir::new();
         let store_dir = dir.path().join("store");
         let store = SessionStore::open_at(&store_dir).unwrap();
         let session = fixture_session(dir.path());
@@ -888,5 +902,6 @@ mod tests {
 
         let t = resolve(&store, id, &Selector::WholeSession).unwrap();
         assert_eq!(t.sources.len(), 2);
+        dir.cleanup();
     }
 }

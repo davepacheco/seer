@@ -14,8 +14,8 @@
 //! sees.
 
 use camino::Utf8PathBuf;
-use camino_tempfile::tempdir;
 use chrono::{TimeZone, Utc};
+use seer::test_fixtures::TestDir;
 use std::time::{Duration, Instant};
 
 use seer::{
@@ -50,7 +50,7 @@ fn synthetic_bookmark(msg: &str) -> Bookmark {
 
 #[test]
 fn fresh_session_round_trips_through_save_and_load() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut session = Session::new();
     session.sources.insert_unique(synthetic_source("/log/a")).unwrap();
@@ -62,6 +62,7 @@ fn fresh_session_round_trips_through_save_and_load() {
     assert_eq!(loaded.sources.len(), 1);
     let first = loaded.sources.iter().next().expect("one source");
     assert_eq!(first.path, Utf8PathBuf::from("/log/a"));
+    dir.cleanup();
 }
 
 #[test]
@@ -69,7 +70,7 @@ fn inline_save_pattern_keeps_disk_state_current() {
     // Simulates the App's inline-save loop: every "user gesture"
     // (here, just a function call) follows the
     // record(Inline) + store.save + mark_saved pattern.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
 
@@ -110,11 +111,12 @@ fn inline_save_pattern_keeps_disk_state_current() {
     assert_eq!(only.id, bookmark_id);
     assert_eq!(only.display_msg, "marked");
     assert!(!policy.dirty());
+    dir.cleanup();
 }
 
 #[test]
 fn debounce_gates_writes_until_the_window_elapses() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut policy = SavePolicy::new(SavePolicy::DEFAULT_DEBOUNCE);
 
@@ -137,6 +139,7 @@ fn debounce_gates_writes_until_the_window_elapses() {
     store.save(id, &session).unwrap();
     policy.mark_saved(t + SavePolicy::DEFAULT_DEBOUNCE);
     assert!(!policy.dirty());
+    dir.cleanup();
 }
 
 #[test]
@@ -144,7 +147,7 @@ fn discovery_picks_overlapping_session_among_unrelated_ones() {
     // Save three sessions: one that overlaps the user's paths, one
     // that's an exact match, and one that's unrelated.
     // `find_matches` returns the two related ones, exact first.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
 
     let mut overlap = Session::new();
@@ -168,6 +171,7 @@ fn discovery_picks_overlapping_session_among_unrelated_ones() {
     let kinds: Vec<_> = matches.iter().map(|m| m.kind).collect();
     assert_eq!(ids, vec![exact.id, overlap.id]);
     assert_eq!(kinds, vec![MatchKind::Exact, MatchKind::Overlap]);
+    dir.cleanup();
 }
 
 #[test]
@@ -175,7 +179,7 @@ fn resume_flow_recovers_user_bookmarks_and_streams_across_processes() {
     // First "process": build a session with streams and a bookmark
     // and save it.  Second "process" (new SessionStore handle):
     // discover and resume.  Bookmarks and streams should be intact.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let sessions_dir = dir.path().join("sessions");
     let user_paths = vec![Utf8PathBuf::from("/log/a")];
 
@@ -215,13 +219,14 @@ fn resume_flow_recovers_user_bookmarks_and_streams_across_processes() {
     let only = bms.iter().next().unwrap();
     assert_eq!(only.name.as_ref().unwrap(), &bookmark_name);
     assert_eq!(only.display_msg, "captured");
+    dir.cleanup();
 }
 
 #[test]
 fn save_overwrites_prior_state_with_latest_content() {
     // Verifies the saver isn't append-only: a second save replaces
     // the first in place, so reload picks up the new content.
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut session = Session::new();
     let id = session.id;
@@ -238,11 +243,12 @@ fn save_overwrites_prior_state_with_latest_content() {
 
     let loaded = store.load(id).unwrap();
     assert_eq!(loaded.streams.len(), 3);
+    dir.cleanup();
 }
 
 #[test]
 fn list_after_many_saves_returns_every_id() {
-    let dir = tempdir().unwrap();
+    let dir = TestDir::new();
     let store = SessionStore::open_at(dir.path().join("sessions")).unwrap();
     let mut ids = Vec::new();
     for _ in 0..5 {
@@ -254,4 +260,5 @@ fn list_after_many_saves_returns_every_id() {
     listed.sort();
     ids.sort();
     assert_eq!(listed, ids);
+    dir.cleanup();
 }

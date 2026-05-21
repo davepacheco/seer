@@ -74,13 +74,13 @@ source.rs:
 render.rs:
 - show_date should be a TimestampDisplay
 view_target.rs:
-- all tests using a tempdir should use an abstraction for testing
+- fixed: all tests using a tempdir should use an abstraction for testing
 - low prio: shell_quote() is infallible but janky.  We should maybe have a
   newtype for names that prohibits control characters
 session_store.rs:
 - should not create the directory if we're not saving anything
 seer.rs:
-- `TabIdx` newtype:
+- fixed: `TabIdx` newtype:
   - using `get` instead of `Deref`/`AsRef`?
   - direct comparison to `usize`?
 - build_session_sources():
@@ -136,8 +136,8 @@ src/engine/merge.rs:
 - max_walks (and related identifiers) should be like `max_scan` or `max_records_to_scan` or something
 - I'm feeling like we never want `max_walks` to be `None` and I'm not clear why we don't treat everything like a "long op"
 - Move `step_backward_n()` into `seeit`
-- step(): error condition should panic?  or restructure the code to avoid this condition
-- pick(): loop could be reworked to avoid "expect"
+- fixed: step(): error condition should panic?  or restructure the code to avoid this condition
+- fixed: pick(): loop could be reworked to avoid "expect"
 
 General: should SourceId have a borrowed string so it's more cheaply copy'able?  Owned by source itself.
 
