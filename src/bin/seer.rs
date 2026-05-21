@@ -2314,7 +2314,7 @@ impl App {
 
     /// Drives one tick of an in-progress seek.  Each call to
     /// [`StreamView::ensure_window_step`] runs at most one bounded
-    /// scan (capped at `LONG_OP_WALKS_PER_FILL` records examined),
+    /// scan (capped at `LONG_OP_RECORDS_TO_SCAN_PER_FILL` records examined),
     /// so the wall time per tick is predictable even when the
     /// active filter rejects almost everything.  Returns `true` once
     /// the window-fill reaches its target or hits EOF in the fill

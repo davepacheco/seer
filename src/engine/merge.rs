@@ -201,7 +201,7 @@ impl<'a> SourceWindow<'a> {
         dir: Direction,
         filter: &Filter,
         batch_size: usize,
-        max_walks: Option<usize>,
+        max_records_to_scan: Option<usize>,
     ) -> ByteLen {
         if !self.buf(dir).is_empty() || self.eof(dir) {
             return ByteLen::ZERO;
@@ -216,7 +216,7 @@ impl<'a> SourceWindow<'a> {
             self.position,
             dir,
             batch_size,
-            max_walks,
+            max_records_to_scan,
             filter,
         ) {
             Ok(batch) => {
@@ -325,7 +325,7 @@ impl<'a> SourceWindow<'a> {
 ///
 /// The default value (used by [`super::Engine::stepper`] and
 /// [`Stepper::new`]) matches every common navigation path: the storage
-/// layer's [`FETCH_BATCH_SIZE`] batch, no per-fill walks budget.
+/// layer's [`FETCH_BATCH_SIZE`] batch, no per-fill records-to-scan budget.
 /// The TUI's long-op driver passes a customized value through
 /// [`super::Engine::stepper_with`] to bound the wall time per
 /// `stepper.step` call under selective filters.
@@ -339,12 +339,15 @@ pub struct StepperOptions {
     /// long-op driver passes a small value here so each `step` call
     /// yields after a bounded amount of walking even when the filter
     /// rejects almost everything.
-    pub max_walks_per_fill: Option<usize>,
+    pub max_records_to_scan_per_fill: Option<usize>,
 }
 
 impl Default for StepperOptions {
     fn default() -> Self {
-        Self { batch_size: FETCH_BATCH_SIZE, max_walks_per_fill: None }
+        Self {
+            batch_size: FETCH_BATCH_SIZE,
+            max_records_to_scan_per_fill: None,
+        }
     }
 }
 
@@ -366,7 +369,7 @@ pub struct Stepper<'a> {
     /// the long-op driver bound the wall time per fill on selective
     /// filters where a single batch of matches would otherwise force
     /// the underlying scan to walk thousands of on-disk records.
-    max_walks_per_fill: Option<usize>,
+    max_records_to_scan_per_fill: Option<usize>,
     /// Running total of bytes the stepper's fills have walked off
     /// disk — including bytes from records the filter rejected.
     /// Surfaced to callers via [`Self::walked_bytes`] so the TUI's
@@ -386,7 +389,7 @@ impl<'a> Stepper<'a> {
     }
 
     /// Internal constructor that lets the caller customize the
-    /// per-fill batch size and walks budget.  Public callers go
+    /// per-fill batch size and records-to-scan budget.  Public callers go
     /// through [`super::Engine::stepper_with`].
     pub(super) fn with_options(
         sources: Vec<&'a dyn Source>,
@@ -394,7 +397,8 @@ impl<'a> Stepper<'a> {
         cursor: &Cursor,
         options: StepperOptions,
     ) -> Self {
-        let StepperOptions { batch_size, max_walks_per_fill } = options;
+        let StepperOptions { batch_size, max_records_to_scan_per_fill } =
+            options;
         let windows = sources
             .into_iter()
             .map(|s| {
@@ -406,7 +410,7 @@ impl<'a> Stepper<'a> {
             sources: windows,
             filter,
             batch_size,
-            max_walks_per_fill,
+            max_records_to_scan_per_fill,
             walked_bytes: ByteLen::ZERO,
         }
     }
@@ -418,7 +422,7 @@ impl<'a> Stepper<'a> {
     }
 
     /// True iff every per-source window has hit EOF in `dir`.  Used
-    /// by callers running the stepper under a per-fill walks budget
+    /// by callers running the stepper under a per-fill records-to-scan budget
     /// to distinguish a budget-exhausted `step` (returns `None` but
     /// has more records to find on a subsequent call) from real
     /// source exhaustion.
@@ -491,7 +495,7 @@ impl<'a> Stepper<'a> {
         // Multi-source merge requires every source to be "ready" —
         // either holding a buffered head or at EOF in this direction
         // — before we can safely pick one to pop.  Without that, a
-        // selective filter under a bounded walks budget can leave one
+        // selective filter under a bounded records-to-scan budget can leave one
         // source mid-scan while another has surfaced its next match;
         // popping that match would emit a record out of time order
         // (the still-scanning source could turn up a record with a
@@ -505,8 +509,8 @@ impl<'a> Stepper<'a> {
         // the loop's single exit covers both natural cases: every
         // source was already ready (no fills attempted, progressed
         // stays false), or every fill walked without finding a match
-        // and without hitting EOF — only possible under bounded walks
-        // (e.g., `max_walks_per_fill` exhausted before the scan
+        // and without hitting EOF — only possible under a bounded records-to-scan budget
+        // (e.g., `max_records_to_scan_per_fill` exhausted before the scan
         // caught up).  In the latter case we yield to the caller,
         // who can drive another step to resume the scan.
         loop {
@@ -519,7 +523,7 @@ impl<'a> Stepper<'a> {
                     dir,
                     &self.filter,
                     self.batch_size,
-                    self.max_walks_per_fill,
+                    self.max_records_to_scan_per_fill,
                 );
                 self.walked_bytes += walked;
                 if !s.buf(dir).is_empty() || s.eof(dir) {
@@ -1249,12 +1253,17 @@ mod tests {
             offset: ByteOffset,
             direction: Direction,
             count: usize,
-            max_walks: Option<usize>,
+            max_records_to_scan: Option<usize>,
             filter: &Filter,
         ) -> std::io::Result<crate::source::QueryBatch> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            self.inner
-                .query_bounded(offset, direction, count, max_walks, filter)
+            self.inner.query_bounded(
+                offset,
+                direction,
+                count,
+                max_records_to_scan,
+                filter,
+            )
         }
         fn byte_len(&self) -> std::io::Result<u64> {
             self.inner.byte_len()

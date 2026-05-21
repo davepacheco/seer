@@ -896,23 +896,23 @@ impl StreamView {
             // the file.  `batch_size = max_matches = 1` keeps the
             // matched-record count low so we don't buffer up matches
             // we'll discard on the next tick (each fresh stepper
-            // throws away its un-popped buf).  `max_walks` caps the
+            // throws away its un-popped buf).  `max_records_to_scan` caps the
             // per-tick wall time: under a 0.1%-selective filter,
-            // 4,000 walks ≈ 400 ms — enough that the per-fill setup
+            // 4,000 records scanned ≈ 400 ms — enough that the per-fill setup
             // cost amortizes against real work (the per-call file-
             // open + scan_backward initialization dominates if we
-            // pick walks much smaller), but short enough that the
+            // pick a much smaller budget), but short enough that the
             // user sees the progress bar tick several times per
             // second.
             const LONG_OP_BATCH: usize = 1;
-            const LONG_OP_WALKS_PER_FILL: usize = 4_000;
+            const LONG_OP_RECORDS_TO_SCAN_PER_FILL: usize = 4_000;
             let dir_eof = match self.anchor {
                 Anchor::PinBack => {
                     self.extend_backward_small_batch(
                         engine,
                         LONG_OP_BATCH,
                         LONG_OP_BATCH,
-                        LONG_OP_WALKS_PER_FILL,
+                        LONG_OP_RECORDS_TO_SCAN_PER_FILL,
                     );
                     self.eof.backward
                 }
@@ -921,7 +921,7 @@ impl StreamView {
                         engine,
                         LONG_OP_BATCH,
                         LONG_OP_BATCH,
-                        LONG_OP_WALKS_PER_FILL,
+                        LONG_OP_RECORDS_TO_SCAN_PER_FILL,
                     );
                     self.eof.forward
                 }
@@ -1114,7 +1114,7 @@ impl StreamView {
     }
 
     /// Like [`Self::extend_forward_batch`] but uses a stepper with a
-    /// small per-fill batch size and a per-fill walks budget so each
+    /// small per-fill batch size and a per-fill records-to-scan budget so each
     /// `query` call walks only a bounded number of on-disk records.
     /// Used by the long-op driver behind `G`/`g`/filter rebuild —
     /// under a selective filter, the default batch size (64 matches)
@@ -1128,7 +1128,7 @@ impl StreamView {
         engine: &Engine,
         batch_size: usize,
         max_matches: usize,
-        max_walks_per_fill: usize,
+        max_records_to_scan_per_fill: usize,
     ) -> usize {
         if self.eof.forward || max_matches == 0 {
             return 0;
@@ -1140,7 +1140,9 @@ impl StreamView {
             &self.back_cursor,
             StepperOptions {
                 batch_size,
-                max_walks_per_fill: Some(max_walks_per_fill),
+                max_records_to_scan_per_fill: Some(
+                    max_records_to_scan_per_fill,
+                ),
             },
         );
         let mut fetched = 0;
@@ -1188,7 +1190,7 @@ impl StreamView {
         engine: &Engine,
         batch_size: usize,
         max_matches: usize,
-        max_walks_per_fill: usize,
+        max_records_to_scan_per_fill: usize,
     ) -> usize {
         if self.eof.backward || max_matches == 0 {
             return 0;
@@ -1199,7 +1201,9 @@ impl StreamView {
             &self.front_cursor,
             StepperOptions {
                 batch_size,
-                max_walks_per_fill: Some(max_walks_per_fill),
+                max_records_to_scan_per_fill: Some(
+                    max_records_to_scan_per_fill,
+                ),
             },
         );
         let mut fetched = 0;
@@ -2307,10 +2311,10 @@ mod tests {
     }
 
     #[test]
-    fn bounded_walks_preserve_multi_source_order() {
-        // Regression: the long-op driver bounds per-fill walks so the
-        // UI stays responsive on selective filters.  With multi-source
-        // merging, that means each source can hit its walks budget
+    fn bounded_records_to_scan_preserves_multi_source_order() {
+        // Regression: the long-op driver bounds per-fill records-to-scan
+        // so the UI stays responsive on selective filters.  With multi-source
+        // merging, that means each source can hit its records-to-scan budget
         // mid-scan with no match yet — and popping a record from a
         // ready source before the others have walked to their next
         // match would emit records out of time order.  Verify that

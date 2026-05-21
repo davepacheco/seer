@@ -82,7 +82,7 @@ impl Engine {
     /// per-fill batch size and an optional per-fill records-walked
     /// budget via [`StepperOptions`].  The TUI's long-op driver uses
     /// this to keep each tick responsive under selective filters
-    /// (one match per call, paired with a `max_walks_per_fill`
+    /// (one match per call, paired with a `max_records_to_scan_per_fill`
     /// budget — see [`crate::StreamView::ensure_window_step`]).
     /// Without the budget, a single fill under a selective filter can
     /// freeze the UI for hundreds of milliseconds at a time.
