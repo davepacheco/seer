@@ -65,18 +65,6 @@ impl std::fmt::Display for TabIdx {
     }
 }
 
-impl PartialEq<usize> for TabIdx {
-    fn eq(&self, other: &usize) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialOrd<usize> for TabIdx {
-    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(other)
-    }
-}
-
 #[derive(Parser)]
 #[command(about = "interactive log explorer")]
 struct Args {
