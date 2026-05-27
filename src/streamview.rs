@@ -623,12 +623,6 @@ impl StreamView {
         })
     }
 
-    /// Looks up the record at `key` and returns it, if currently
-    /// cached in the window.
-    pub fn record_by_key(&self, key: &RecordKey) -> Option<&MergeRecord> {
-        self.find_record(key)
-    }
-
     /// Returns the [`Cursor`] "just before" the record at window index
     /// `idx` — i.e., a cursor such that
     /// `engine.stepper(filter, &cursor)`'s next `step_forward` (under
