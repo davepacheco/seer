@@ -7858,7 +7858,7 @@ mod tests {
         // about end-state correctness here: every match landed, and
         // nothing got double-counted from re-walking.
         let view_records = a.active_tab().streamview.as_ref().unwrap();
-        assert_eq!(view_records.record_count(), 5);
+        assert_eq!(view_records.materialized().events.len(), 5);
         dir.cleanup();
     }
 

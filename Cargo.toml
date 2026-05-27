@@ -6,12 +6,12 @@ edition = "2024"
 license = "MPL-2.0"
 
 [features]
-# Marker used by `required-features` on the `scale` integration test
-# and the `engine` benchmark so they are only built when the caller
-# opts in.  Both targets exercise large fixture builds; the feature
-# guards them from `cargo check --all-targets` runs that would
-# otherwise compile them every time.  `seer::test_fixtures` itself
-# is unconditionally public.
+# Marker used by `required-features` on the `engine` benchmark so it
+# is only built when the caller opts in.  The benchmark exercises
+# large fixture builds; the feature guards it from
+# `cargo check --all-targets` runs that would otherwise compile it
+# every time.  `seer::test_fixtures` itself is unconditionally
+# public.
 test-fixtures = []
 
 #
@@ -77,11 +77,6 @@ proptest = "1.6.0"
 slog = "2.7.0"
 slog-bunyan = "2.5.0"
 strum = { version = "0.27", features = ["derive"] }
-
-[[test]]
-name = "scale"
-path = "tests/scale.rs"
-required-features = ["test-fixtures"]
 
 [[bench]]
 name = "engine"

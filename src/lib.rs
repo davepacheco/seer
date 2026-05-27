@@ -45,9 +45,8 @@ pub use source::{
 };
 pub use stream::{LogStream, LogStreamId};
 pub use streamview::{
-    EventIdx, LineIdx, Materialized, ParseStats, RecordKey, RenderedLine, Row,
-    SEARCH_BUDGET, SearchAnchor, SearchDir, SearchOutcome, StreamView,
-    WindowFillStatus,
+    EventIdx, LineIdx, Materialized, ParseStats, RecordKey, Row, SEARCH_BUDGET,
+    SearchAnchor, SearchDir, SearchOutcome, StreamView, WindowFillStatus,
 };
 pub use summary::{
     FieldSummary, Summary, SummaryBuilder, TimeSummary, format_summary,

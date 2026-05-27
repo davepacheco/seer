@@ -526,14 +526,6 @@ impl StreamView {
         };
     }
 
-    /// Iterates over the cached records and their pre-formatted display
-    /// lines, in time order (front of deque first).  Used by callers
-    /// that need to walk the window directly (e.g. to materialize a
-    /// flat rendering buffer).
-    pub fn records(&self) -> impl Iterator<Item = (&MergeRecord, &[String])> {
-        self.records.iter().map(|e| (&e.record, e.lines.as_slice()))
-    }
-
     /// Returns the flat line index (across the window's records) at
     /// which the viewport's anchor sits, or `0` when the window is
     /// empty.  Caller's flat index has the same meaning as the
@@ -570,24 +562,6 @@ impl StreamView {
             Anchor::On { key: last.key(), line: last.lines.len() - 1 };
     }
 
-    /// Returns the record at the viewport's top, if any.
-    pub fn anchor_record(&self) -> Option<&MergeRecord> {
-        match &self.anchor {
-            Anchor::On { key, .. } => self.find_record(key),
-            _ => None,
-        }
-    }
-
-    /// Returns the viewport's anchor as `(record_key, line_within)`,
-    /// or `None` when the window is empty.  The TUI's footer uses this
-    /// to render a "you are here" indicator.
-    pub fn anchor_position(&self) -> Option<(RecordKey, usize)> {
-        match &self.anchor {
-            Anchor::On { key, line } => Some((key.clone(), *line)),
-            _ => None,
-        }
-    }
-
     /// Returns a [`Cursor`] that, when fed back into
     /// [`Self::seek_to_cursor`], lands the viewport on the same record
     /// the anchor is currently on.  Used by the TUI on filter changes:
@@ -605,16 +579,6 @@ impl StreamView {
             }
             _ => None,
         }
-    }
-
-    fn find_record(&self, key: &RecordKey) -> Option<&MergeRecord> {
-        self.records
-            .iter()
-            .find(|e| {
-                e.record.source_id == key.source_id
-                    && e.record.offset == key.offset
-            })
-            .map(|e| &e.record)
     }
 
     fn find_record_idx(&self, key: &RecordKey) -> Option<usize> {
@@ -648,16 +612,6 @@ impl StreamView {
         self.records.is_empty()
     }
 
-    /// Returns the number of cached records.
-    pub fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
-    /// Total display lines across all cached records.
-    pub fn total_lines(&self) -> usize {
-        self.records.iter().map(|e| e.lines.len()).sum()
-    }
-
     /// Returns true iff a forward scan from the back of the window has
     /// already exhausted every source under the active filter — no more
     /// records can appear past `records.back()`.  The TUI uses this to
@@ -665,27 +619,6 @@ impl StreamView {
     /// bottom coincides with the last cached line.
     pub fn is_forward_eof(&self) -> bool {
         self.eof.forward
-    }
-
-    /// Replaces the active filter, dropping cached records (since they
-    /// were filtered against the old filter) and reseting both cursors
-    /// to the start.  Equivalent to "filter changed, restart from the
-    /// top."
-    ///
-    /// Cursors are reset to [`Cursor::new`] (= byte 0 for every source)
-    /// rather than keeping the current viewport position because the
-    /// existing TUI's filter-change semantics resets `viewport_top` to
-    /// 0; matching that here keeps user expectations stable.
-    pub fn set_filter(&mut self, filter: Filter) {
-        self.filter = filter;
-        self.records.clear();
-        self.front_cursor = Cursor::new();
-        self.back_cursor = Cursor::new();
-        self.eof.forward = false;
-        self.eof.backward = false;
-        self.anchor = Anchor::PinFront;
-        self.parse_stats = ParseStats::default();
-        self.recompute_materialized();
     }
 
     /// Replaces the active rendering options and reformats every cached
@@ -727,13 +660,6 @@ impl StreamView {
         }
     }
 
-    /// Resets the view to the start of the merged stream and ensures
-    /// the window covers `viewport_height + OVER_FETCH_LINES` lines.
-    pub fn seek_to_start(&mut self, engine: &Engine, viewport_height: u16) {
-        self.prepare_seek_to_start();
-        self.ensure_window(engine, viewport_height);
-    }
-
     /// Sets up the view for a forward fetch from the merged stream's
     /// beginning, but does not fetch anything.  Paired with
     /// [`Self::ensure_window_step`] when the caller wants to drive
@@ -747,18 +673,6 @@ impl StreamView {
         self.anchor = Anchor::PinFront;
         self.search_resume = None;
         self.recompute_materialized();
-    }
-
-    /// Resets the view to the end of the merged stream and ensures
-    /// the window covers `viewport_height + OVER_FETCH_LINES` lines.
-    pub fn seek_to_end(
-        &mut self,
-        engine: &Engine,
-        viewport_height: u16,
-    ) -> std::io::Result<()> {
-        self.prepare_seek_to_end(engine)?;
-        self.ensure_window(engine, viewport_height);
-        Ok(())
     }
 
     /// Sets up the view for a backward fetch from EOF, but does not
@@ -1617,44 +1531,19 @@ impl StreamView {
     /// than re-landing); [`SearchAnchor::Include`] is what the initial
     /// `/<pattern>` wants (the cursor's current line is eligible).
     ///
-    /// Walks at most [`SEARCH_BUDGET`] records per call before
-    /// returning [`SearchOutcome::BudgetExhausted`].  When that
-    /// happens, the next `search_step` call with the same regex,
-    /// direction, and an unchanged anchor resumes from where this one
-    /// stopped; switching regex or direction or moving the anchor
-    /// (e.g. by scrolling) drops the resume point and restarts from
-    /// the anchor.
+    /// Walks at most `budget` records per call before returning
+    /// [`SearchOutcome::BudgetExhausted`].  When that happens, the next
+    /// call with the same regex, direction, and an unchanged anchor
+    /// resumes from where this one stopped; switching regex or
+    /// direction or moving the anchor (e.g. by scrolling) drops the
+    /// resume point and restarts from the anchor.  The TUI's
+    /// progress-bar driver uses this to run the scan in chunks small
+    /// enough to interleave with frame draws and Ctrl-C polls.
     ///
     /// `cancel` is consulted once per scanned record; returning `true`
     /// aborts the scan with [`SearchOutcome::Cancelled`], leaving the
     /// anchor unchanged and saving no resume point.  Callers that have
     /// no cancellation source can pass `&mut || false`.
-    pub fn search_step(
-        &mut self,
-        engine: &Engine,
-        regex: &Regex,
-        direction: SearchDir,
-        anchor: SearchAnchor,
-        viewport_height: u16,
-        cancel: &mut dyn FnMut() -> bool,
-    ) -> SearchOutcome {
-        self.search_step_with_budget(
-            engine,
-            regex,
-            direction,
-            anchor,
-            viewport_height,
-            SEARCH_BUDGET,
-            cancel,
-        )
-    }
-
-    /// Same as [`Self::search_step`] but with a caller-supplied
-    /// budget.  Used by streamview's own tests to drive
-    /// [`SearchOutcome::BudgetExhausted`] without having to build
-    /// 50,000-record fixtures, and by the TUI's progress-bar driver to
-    /// run the scan in chunks small enough to interleave with frame
-    /// draws and Ctrl-C polls.
     #[allow(clippy::too_many_arguments)]
     pub fn search_step_with_budget(
         &mut self,
@@ -1946,45 +1835,6 @@ impl StreamView {
             .expect("clamped to [0, last] >= 0");
         Some(self.records[clamped].key())
     }
-
-    /// Yields up to `viewport_height` display lines starting at the
-    /// viewport's anchor.  Each yielded line carries the [`RecordKey`]
-    /// of its source record (so the renderer can apply selection
-    /// highlighting), and a flag indicating whether the line is the
-    /// header line for that record.
-    pub fn rendered_lines(
-        &self,
-        viewport_height: u16,
-    ) -> Vec<RenderedLine<'_>> {
-        let mut out = Vec::with_capacity(viewport_height as usize);
-        if self.records.is_empty() {
-            return out;
-        }
-        let (mut idx, mut line) = self.anchor_indices();
-        let height = viewport_height as usize;
-        while out.len() < height && idx < self.records.len() {
-            let entry = &self.records[idx];
-            while out.len() < height && line < entry.lines.len() {
-                out.push(RenderedLine {
-                    text: &entry.lines[line],
-                    record: &entry.record,
-                    is_header: line == 0,
-                });
-                line += 1;
-            }
-            idx += 1;
-            line = 0;
-        }
-        out
-    }
-}
-
-/// One rendered line for the viewport, borrowed from the StreamView's
-/// internal storage.
-pub struct RenderedLine<'a> {
-    pub text: &'a str,
-    pub record: &'a MergeRecord,
-    pub is_header: bool,
 }
 
 fn total_lines(records: &VecDeque<WindowEntry>) -> usize {
@@ -2032,10 +1882,16 @@ mod tests {
     }
 
     fn anchor_msg(view: &StreamView) -> Option<String> {
-        view.anchor_record().and_then(|r| match &r.event {
-            Ok(e) => Some(e.msg.clone()),
-            Err(_) => None,
-        })
+        let mat = view.materialized();
+        if mat.events.is_empty() {
+            return None;
+        }
+        let line = view.anchor_flat_line();
+        let event_idx = *mat.event_for_line.get(line)?;
+        match &mat.events[event_idx.get()] {
+            Row::Event(e) => Some(e.event.msg.clone()),
+            Row::Error(_) => None,
+        }
     }
 
     #[test]
@@ -2045,8 +1901,8 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
         assert!(view.is_empty());
-        assert!(view.anchor_record().is_none());
-        assert!(view.rendered_lines(20).is_empty());
+        assert!(view.materialized().events.is_empty());
+        assert!(view.materialized().formatted.is_empty());
     }
 
     #[test]
@@ -2056,27 +1912,14 @@ mod tests {
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
-        assert_eq!(view.record_count(), 3);
+        assert_eq!(view.materialized().events.len(), 3);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
         let rendered: Vec<&str> =
-            view.rendered_lines(20).iter().map(|l| l.text).collect();
+            view.materialized().formatted.iter().map(|s| s.as_str()).collect();
         assert_eq!(rendered.len(), 3);
         assert!(rendered[0].contains("m10"));
         assert!(rendered[1].contains("m20"));
         assert!(rendered[2].contains("m30"));
-        dir.cleanup();
-    }
-
-    #[test]
-    fn seek_to_end_anchors_on_last_record() {
-        let dir = TestDir::new();
-        let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view =
-            StreamView::new(Filter::default(), RenderOpts::default());
-        view.seek_to_end(&engine, 20).unwrap();
-        assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
-        // Forward EOF; backward walk replays records.
-        assert!(view.record_count() >= 1);
         dir.cleanup();
     }
 
@@ -2119,38 +1962,14 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 5);
         // Initial window is FETCH_BATCH_SIZE records.
-        let initial = view.record_count();
+        let initial = view.materialized().events.len();
         // Scroll past the initial window.
         for _ in 0..initial + 10 {
             view.scroll_lines(&engine, 1, 5);
         }
         // We should have fetched more.  Anchor is somewhere past the
         // initial cap.
-        assert!(view.record_count() > initial || view.eof.forward);
-        dir.cleanup();
-    }
-
-    #[test]
-    fn set_filter_resets_to_top_with_new_filter() {
-        let dir = TestDir::new();
-        let engine = build_engine(
-            &[("nexus", &[10, 20, 30]), ("sled", &[15, 25, 35])],
-            &dir,
-        );
-        let mut view =
-            StreamView::new(Filter::default(), RenderOpts::default());
-        view.ensure_window(&engine, 20);
-        assert_eq!(view.record_count(), 6);
-        // Apply a name filter - tighten to nexus only.
-        let filter: Filter = "name=nexus".parse().unwrap();
-        view.set_filter(filter);
-        view.ensure_window(&engine, 20);
-        assert_eq!(view.record_count(), 3);
-        let rendered: Vec<&str> =
-            view.rendered_lines(20).iter().map(|l| l.text).collect();
-        assert!(rendered[0].contains("m10"));
-        assert!(rendered[1].contains("m20"));
-        assert!(rendered[2].contains("m30"));
+        assert!(view.materialized().events.len() > initial || view.eof.forward);
         dir.cleanup();
     }
 
@@ -2185,8 +2004,7 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
 
-        let formatted =
-            view.records().next().map(|(_, l)| l[0].to_string()).unwrap();
+        let formatted = view.materialized().formatted[0].clone();
         assert!(
             formatted.contains("INFO") && formatted.contains("m10"),
             "expected formatted header, got {formatted:?}",
@@ -2195,7 +2013,7 @@ mod tests {
         let mut o = view.render_opts();
         o.show_raw = true;
         view.set_render_opts(o);
-        let (record, raw_lines) = view.records().next().unwrap();
+        let raw_lines = view.materialized().formatted.clone();
         assert_eq!(raw_lines.len(), 1, "raw mode is one line per record");
         assert!(
             raw_lines[0].starts_with('{')
@@ -2203,14 +2021,11 @@ mod tests {
             "expected raw JSON line, got {:?}",
             raw_lines[0],
         );
-        // The stored raw matches the record's `raw` field exactly.
-        assert_eq!(raw_lines[0], record.raw);
 
         // Toggle off: header returns.
         o.show_raw = false;
         view.set_render_opts(o);
-        let restored =
-            view.records().next().map(|(_, l)| l[0].to_string()).unwrap();
+        let restored = view.materialized().formatted[0].clone();
         assert_eq!(restored, formatted);
         dir.cleanup();
     }
@@ -2226,11 +2041,7 @@ mod tests {
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
-        let dated_first = view
-            .records()
-            .next()
-            .map(|(_, lines)| lines[0].to_string())
-            .unwrap();
+        let dated_first = view.materialized().formatted[0].clone();
         assert!(
             dated_first.starts_with("1970-01-01T00:00:10.000Z "),
             "expected dated header, got {dated_first:?}",
@@ -2240,11 +2051,7 @@ mod tests {
         o.show_date = false;
         view.set_render_opts(o);
         assert!(!view.render_opts().show_date);
-        let undated_first = view
-            .records()
-            .next()
-            .map(|(_, lines)| lines[0].to_string())
-            .unwrap();
+        let undated_first = view.materialized().formatted[0].clone();
         assert!(
             undated_first.starts_with("00:00:10.000Z "),
             "expected time-only header after toggle, got {undated_first:?}",
@@ -2331,10 +2138,12 @@ mod tests {
         // (oldest-first) order and assert they're monotonically
         // increasing.
         let times: Vec<i64> = view
-            .records()
-            .filter_map(|(r, _)| match &r.event {
-                Ok(e) => Some(e.time.timestamp()),
-                Err(_) => None,
+            .materialized()
+            .events
+            .iter()
+            .filter_map(|row| match row {
+                Row::Event(e) => Some(e.event.time.timestamp()),
+                Row::Error(_) => None,
             })
             .collect();
         let want = vec![10, 15, 20, 25, 30, 35, 40, 45, 50, 1000];
@@ -2371,19 +2180,20 @@ mod tests {
         // `m1401`, … if the test fixture extended further; the
         // trailing space pins it to the rendered "<header>  m140" line.
         let regex = Regex::new(r"m140\b").unwrap();
-        let outcome = view.search_step(
+        let outcome = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Forward,
             SearchAnchor::Include,
             10,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m140"));
 
         let anchor_flat = view.anchor_flat_line();
-        let total_flat: usize = view.records().map(|(_, l)| l.len()).sum();
+        let total_flat: usize = view.materialized().formatted.len();
         let lines_at_or_past_anchor = total_flat - anchor_flat;
         let want = 10 + OVER_FETCH_LINES;
         assert!(
@@ -2403,12 +2213,13 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
-        let outcome = view.search_step(
+        let outcome = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Forward,
             SearchAnchor::Include,
             20,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
@@ -2424,12 +2235,13 @@ mod tests {
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
         let regex = Regex::new("nonexistent").unwrap();
-        let outcome = view.search_step(
+        let outcome = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Forward,
             SearchAnchor::Include,
             20,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::NotFound);
@@ -2445,29 +2257,32 @@ mod tests {
         view.ensure_window(&engine, 20);
         let regex = Regex::new("m20").unwrap();
         // First match: m20 at idx 1.
-        let _ = view.search_step(
+        let _ = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Forward,
             SearchAnchor::Include,
             20,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        let first_line = view.anchor_flat_line();
         // Next match (exclusive=true): the second m20 at idx 3.
-        let outcome = view.search_step(
+        let outcome = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Forward,
             SearchAnchor::Skip,
             20,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
-        // Both records have msg "m20"; we can't distinguish by message
-        // alone, but the offset must differ.
-        let key = view.anchor_position().unwrap().0;
-        assert_ne!(key.offset, ByteOffset::ZERO);
+        // Both records have msg "m20"; verify the anchor advanced
+        // rather than re-landing on the first match.
+        assert_eq!(anchor_msg(&view).as_deref(), Some("m20"));
+        assert!(view.anchor_flat_line() > first_line);
         dir.cleanup();
     }
 
@@ -2482,12 +2297,13 @@ mod tests {
         view.scroll_lines(&engine, 4, 20);
         assert_eq!(anchor_msg(&view).as_deref(), Some("m50"));
         let regex = Regex::new("m20").unwrap();
-        let outcome = view.search_step(
+        let outcome = view.search_step_with_budget(
             &engine,
             &regex,
             SearchDir::Backward,
             SearchAnchor::Skip,
             20,
+            SEARCH_BUDGET,
             &mut never_cancel(),
         );
         assert_eq!(outcome, SearchOutcome::Found);
@@ -2696,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_errors_appear_in_rendered_lines() {
+    fn parse_errors_appear_inline_in_materialized_output() {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         append_bunyan_at(&p, "x", t(10), "m10");
@@ -2707,9 +2523,9 @@ mod tests {
         let mut view =
             StreamView::new(Filter::default(), RenderOpts::default());
         view.ensure_window(&engine, 20);
-        assert_eq!(view.record_count(), 3);
+        assert_eq!(view.materialized().events.len(), 3);
         let rendered: Vec<&str> =
-            view.rendered_lines(20).iter().map(|l| l.text).collect();
+            view.materialized().formatted.iter().map(|s| s.as_str()).collect();
         assert!(rendered[0].contains("m10"));
         assert!(
             rendered[1].contains("not json")
@@ -2795,7 +2611,10 @@ mod tests {
         v2.seek_to_cursor(&engine, c2, 20);
         assert_eq!(anchor_msg(&v2).as_deref(), Some("m30"));
         // Past the end is a clean None.
-        assert!(view.cursor_before_record(view.record_count()).is_none());
+        assert!(
+            view.cursor_before_record(view.materialized().events.len())
+                .is_none()
+        );
         dir.cleanup();
     }
 
@@ -2817,36 +2636,6 @@ mod tests {
         let mut v = StreamView::new(Filter::default(), RenderOpts::default());
         v.seek_to_cursor(&engine, cursor, 20);
         assert_eq!(anchor_msg(&v).as_deref(), Some("m40"));
-        dir.cleanup();
-    }
-
-    #[test]
-    fn rendered_lines_caps_at_viewport_height() {
-        let dir = TestDir::new();
-        let engine = build_engine(&[("a", &[10, 20, 30, 40, 50])], &dir);
-        let mut view =
-            StreamView::new(Filter::default(), RenderOpts::default());
-        view.ensure_window(&engine, 20);
-        let lines = view.rendered_lines(3);
-        assert_eq!(lines.len(), 3);
-        let lines = view.rendered_lines(100);
-        // Capped at total available.
-        assert_eq!(lines.len(), 5);
-        dir.cleanup();
-    }
-
-    #[test]
-    fn scroll_then_set_filter_resets_to_top() {
-        let dir = TestDir::new();
-        let engine = build_engine(&[("a", &[10, 20, 30])], &dir);
-        let mut view =
-            StreamView::new(Filter::default(), RenderOpts::default());
-        view.ensure_window(&engine, 20);
-        view.scroll_lines(&engine, 2, 20);
-        assert_eq!(anchor_msg(&view).as_deref(), Some("m30"));
-        view.set_filter(Filter::default());
-        view.ensure_window(&engine, 20);
-        assert_eq!(anchor_msg(&view).as_deref(), Some("m10"));
         dir.cleanup();
     }
 }
