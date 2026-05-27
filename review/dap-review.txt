@@ -12,6 +12,7 @@ review/phase-4-abstractions.md
 review/phase-5-tests.md
 review/test-plan.md
 Cargo.lock
+(deleted) tests/scale.rs
 
 done (Rust), with questions below:
 src/position.rs
@@ -37,13 +38,10 @@ src/stream.rs
 done, revisit:
 src/bin/seer.rs
 benches/engine.rs
-
-TODO:
 src/streamview.rs
 
 TODO, lower priority:
 src/bin/seeit.rs
-tests/scale.rs
 tests/seeit_session.rs
 tests/session_lifecycle.rs
 tests/session_schema.rs
