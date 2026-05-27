@@ -180,10 +180,39 @@ General:
 
 src/streamview.rs:
 - what's the difference between this and Stepper?
+- ParseStats: lifetime of this seems goofy.  If you keep scrolling back and forth (g/G) it all goes up.  What's it used for?
+- SearchResumePoint: revisit this
+- LogStreamPosition seems very similar to RecordKey (both involve source, but RecordKey uses byte offset and LogStreamPosition uses timestamp + ordinal) -- why?
+- Why does StreamView include both records *and* events?  (I guess "events" is really part of Materialized)
+- records() is almost unused -- seems to be only used by tests, including scale test
+- ditto anchor_record()
+  - only caller of find_record()
+- ditto anchor_position()
+- anchor_record(): why does this not handle being anchored at top/bottom?
+  - same for anchor_position(), cursor_at_anchor(),
+- cursor_before_record():
+  - index should be a newtype, right?
+  - apparently only used when creating a bookmark
+- seek_to_start: is viewport height a line count or record count or what?
+- prepare_seek_to_start(): seems suspicious that this is callable from seer.rs
+- set_anchor_pin_back(): not clear what this is for
+- anchor_front_cursor_to_first_record(): suspect
+- extend_forwrd_batch() vs. extend_forward_small_batch()
+(Overall, I'm overwhelmed at the number of different similar methods that exist here and the number of different special cases.  But I haven't figured out yet if it's intrinsic or accidental complexity.)
+- extend_backward_batch/extend_backward_batch_n():
+  - neither is `pub` and one just calls the other -- I think we could just inline this.  At the very least, `stepper_batch` and `max_matches` could be the same thing
+- scroll_lines():
+  - the preamble makes no sense to me
+- search_step():
+  - has no non-test callers and immediately calls search_step_with_budget
+- search_step_with_budget(): opens with ensure_window(), which doesn't have a budget attached.  That doesn't seem right!
+  (I'm maybe seeing why we call ensure_window() though.  And I wonder if it's a missing call that results in getting the wrong results sometimes.)
+- move_selection(): does this actually *move* anything?  If so, why does this know anything about a "selection"?!
 
 seeit:
 - I'm thinking it was a mistake to have this accept a session id.  Instead, when constructing a `seeit` command, it should accept *equivalent* args for filter, source list, display, etc.
 
+------------------------------
 
 FULLY FIXED:
 
@@ -205,3 +234,217 @@ fixed: src/summary.rs:
     - The bar shrinks (and at very narrow widths is dropped entirely) so the numeric components are never truncated — losing the percent number is more confusing than losing bar resolution.
     - "Toggled with `p` and not persisted across sessions: it's a debugging affordance, not part of the user's view state."
 - try harder to avoid unwrap/expect when you can structure stuff with `let else`, match, etc.
+
+------------------------------
+
+StreamView vs. Stepper
+
+I'm trying to better understand the relationship between these and whether they can be consolidated or otherwise improved.
+
+As I understand it:
+
+STEPPER
+
+Contains:
+* a Vec<SourceWindow<'a>>:
+  - *borrowed* source
+  - position (byte offset of some record)
+  - buffered: two VecDeques of records (both directions)
+* a filter
+* a batch size
+* optional max number of records to scan per fill
+* running total of bytes read
+
+Intuition:
+- there's a merged, filtered stream from a lot of sources
+- you're at a particular spot in each source
+- you can walk forward or backwards
+- limits on how much work is done per step
+  => cancellable, shows progress
+- requests to the underlying source are cached, but only near your cursor
+  => fast incremental navigation
+  => bounded memory usage
+
+Good for:
+- Scanning through the whole stream (e.g., summary view, search)
+
+STREAMVIEW: much more complicated
+* filter
+* rendering options (booleans about what to show)
+* cursors: front, back
+* records: VecDeque<WindowEntry>
+  * raw MergeRecord (source, offset, length, event/error, raw string)
+  * Vec<String>: rendered lines of the log record
+* eof: indicates whether EOF has been reached in either or both directions
+* anchor: describes how the view is anchored:
+  - `On` (on a specific record: source_id + offset + line number)
+  - `Empty`
+  - `PinFront` / `PinBack`
+  I assume this is used to figure out if the user changes the filter (say) then what should change.  For example, if you're at the first record and change the filter, and new records appear before that one, you probably want to scroll up.  If you're on the second record (`On`), you don't.
+* parse_stats
+* search_resume: Option<SearchResumePoint>:
+  - this is used to keep track of where to resume a search when one "step" didn't find anything
+* materialized: ???
+  - events: Vec<Row>: one entry per event/error
+  - formatted: Vec<String>: one entry per displayed line
+  - event_for_line: tells you which event corresponds to line i
+  - first_line_for_event[i]: tells you which line is the first one for record i
+
+Intuition:
+- this tracks a window of events that can be extended in either direction
+- stores a bunch of rendered state that Stepper consumers might not care about
+
+I want to better understand how StreamView works.
+
+There are a few reasons I'm trying to dig into this, which boil down to:
+
+- bugs
+- performance
+- comprehensibility
+
+Buggy behavior I've seen:
+
+- In the middle of a filtered stream, apply filter, finds no records.  Hit `g` and I see records.
+- Bytes scanned can exceed total bytes.
+- Records scanned sometimes shows 0 when it's scanning.
+- When you hit `G` to scroll to bottom, it's goofy:
+  - starts empty
+  - starts pushing records in from the top
+  - pushes more than it should
+  - then scrolls to the end again
+
+Performance:
+- Several operations seem to hang with no progress/feedback
+  - loading a session with multiple tabs
+  - sometimes? re-applying a filter?  I'm not clear on exactly when
+  - summary with selective filter (I diagnosed this above)
+- Search slows down exponentially
+  - looks like it's using a ton of memory, then goes past the end
+  - afterwards, it's super sluggish -- 100% on-CPU
+    - it was 60% on-CPU just sitting there!
+      - this is lots of memcpy in cursor_before_record, doing rendering
+  - it's an awful lot of `lumem`free`!
+
+I want to better understand StreamView anyway since I want to take ownership for this.  But I also want to have some intuition for understand these behaviors.  Eventually, I want to make sure every operation that could take a while provides progress and the ability to cancel.
+
+Comprehensibility:
+- Both of these cache a contiguous range of records.
+- Both support incremental extension in either direction.
+- Both support changing the filter without changing where you are, I think
+- StreamView:
+  - contains more information about position *within* the cached window.  It's two positions, plus how that window is anchored.
+  - contains rendered data
+
+Claude admits:
+
+>   So the consequence: Stepper's bidirectional buffer is effectively dead code in this
+   caller.  Within a single fetch, only one direction is walked, and the Stepper is
+  dropped immediately after.  Stepper here is functioning as a one-shot batch fetcher
+   driven from a saved Cursor; the long-lived per-source lookahead/lookbehind it was
+  designed around is provided one level up, by StreamView's own window.
+
+Questions:
+- What uses step_backward() then?
+  - seeit, when given `--before`
+  - StreamView, when extending backward
+- A lot of the stuff the StreamView is trying to do seems much more complex with its implementation.  e.g., advance_time_forward() would be easy with the Stepper.  But with the StreamView, it's a mess of fiddly logic and accounting
+  - I feel like there's an abstraction here where you can advance the anchor like a stepper and then rebuild the window around it?
+
+
+Ideas around StreamView vs. Stepper:
+- Stepper probably needs to not borrow in order to do this
+- Could use some naming clarity:
+  - regarding the various positions (RecordKey, LogStreamPosition, what else?)
+    - merged stream vs. individual source
+    - physical position (byte offset) or logical one (timestamp + ordinal?)
+    - what about "index into [some window]"?
+- It was tempting to try to enhance Stepper to better represent what StreamView needs -- a cached window of records.  However, Stepper doesn't keep a *merged* view, and it keeps a bounded cache per source.  Need to think this through.
+- I almost want to rebuild functionality from scratch.  It'd be useful to have a clearer picture of what's used
+
+------------------------------
+
+Performance after a big search:
+
+pfexec dtrace -n 'profile-97/arg1 && pid == 27428/{ @[ustack(120)] = count(); @total = count();}' -c 'sleep 10'
+
+              libc.so.1`memcmp+0x82
+              seer`_ZN4seer10streamview10StreamView16cursor_at_anchor17h6fcf4d4f1560377cE+0x19a
+              seer`_ZN111_$LT$alloc..vec..Vec$LT$T$GT$$u20$as$u20$alloc..vec..spec_from_iter_nested..SpecFromIterNested$LT$T$C$I$GT$$GT$9from_iter17ha765876488d0e5ceE+0x14c
+              seer`_ZN4seer3App12try_save_now17hf5cf50545f45cabfE+0x31
+              seer`_ZN4seer16run_with_session17h4dc8771ca110cb58E+0xc3c
+              seer`_ZN4seer4main17hed3a85daaa2cb0feE+0x206a
+              seer`_ZN3std3sys9backtrace28__rust_begin_short_backtrace17h48aab430e2a5105cE+0x6
+              seer`_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h2b5c39bc373b0872E.llvm.8995034793291764227+0xc
+              seer`_RNvNtCseI2lRVYdSWK_3std2rt19lang_start_internal+0x3f4
+              seer`main+0x2c
+              seer`_start_crt+0x87
+              seer`_start+0x18
+               51
+
+              libc.so.1`memcpy+0x54c
+              seer`_ZN4seer10streamview10StreamView20cursor_before_record17hd8d4d6e2d7db2169E+0x10a
+              seer`_ZN4seer10streamview10StreamView16cursor_at_anchor17h6fcf4d4f1560377cE+0x1bf
+              seer`_ZN111_$LT$alloc..vec..Vec$LT$T$GT$$u20$as$u20$alloc..vec..spec_from_iter_nested..SpecFromIterNested$LT$T$C$I$GT$$GT$9from_iter17ha765876488d0e5ceE+0x14c
+              seer`_ZN4seer3App12try_save_now17hf5cf50545f45cabfE+0x31
+              seer`_ZN4seer16run_with_session17h4dc8771ca110cb58E+0xc3c
+              seer`_ZN4seer4main17hed3a85daaa2cb0feE+0x206a
+              seer`_ZN3std3sys9backtrace28__rust_begin_short_backtrace17h48aab430e2a5105cE+0x6
+              seer`_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h2b5c39bc373b0872E.llvm.8995034793291764227+0xc
+              seer`_RNvNtCseI2lRVYdSWK_3std2rt19lang_start_internal+0x3f4
+              seer`main+0x2c
+              seer`_start_crt+0x87
+              seer`_start+0x18
+               88
+
+              libc.so.1`memcpy+0x54c
+              seer`_ZN4seer10streamview10StreamView20cursor_before_record17hd8d4d6e2d7db2169E+0x10a
+              seer`_ZN4seer10streamview10StreamView16cursor_at_anchor17h6fcf4d4f1560377cE+0x1bf
+              seer`_ZN4seer6render17he07b3497d27dcfa9E+0x1936
+              seer`_ZN12ratatui_core8terminal8terminal17Terminal$LT$B$GT$8try_draw17h36f310c9007173baE+0x62
+              seer`_ZN4seer16run_with_session17h4dc8771ca110cb58E+0xd18
+              seer`_ZN4seer4main17hed3a85daaa2cb0feE+0x206a
+              seer`_ZN3std3sys9backtrace28__rust_begin_short_backtrace17h48aab430e2a5105cE+0x6
+              seer`_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h2b5c39bc373b0872E.llvm.8995034793291764227+0xc
+              seer`_RNvNtCseI2lRVYdSWK_3std2rt19lang_start_internal+0x3f4
+              seer`main+0x2c
+              seer`_start_crt+0x87
+              seer`_start+0x18
+               95
+              501
+
+Implies: 50% CPU usage, 18 percentage points of which are that memcpy
+
+Same command while navigating after having done such a search:
+
+              libumem.so.1`free+0x11
+              seer`_ZN4seer3Tab9scroll_up17h38960cf14da03f60E+0x57
+              seer`_ZN4seer3App10handle_key17h5d17e517c2fbd351E+0x986
+              seer`_ZN4seer16run_with_session17h4dc8771ca110cb58E+0xbf1
+              seer`_ZN4seer4main17hed3a85daaa2cb0feE+0x206a
+              seer`_ZN3std3sys9backtrace28__rust_begin_short_backtrace17h48aab430e2a5105cE+0x6
+              seer`_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h2b5c39bc373b0872E.llvm.8995034793291764227+0xc
+              seer`_RNvNtCseI2lRVYdSWK_3std2rt19lang_start_internal+0x3f4
+              seer`main+0x2c
+              seer`_start_crt+0x87
+              seer`_start+0x18
+               35
+
+              libumem.so.1`free+0x11
+              seer`_ZN4core3ptr42drop_in_place$LT$seer..streamview..Row$GT$17h2ebbf27eaa7ba7cbE.llvm.6271079715427298223+0xe4
+              seer`_ZN4seer10streamview10StreamView22recompute_materialized17hf2c18cf5c50e2478E+0x955
+              seer`_ZN4seer3Tab11scroll_down17h4161bf20f37a988aE+0x66
+              seer`_ZN4seer3App10handle_key17h5d17e517c2fbd351E+0xf40
+              seer`_ZN4seer16run_with_session17h4dc8771ca110cb58E+0xbf1
+              seer`_ZN4seer4main17hed3a85daaa2cb0feE+0x206a
+              seer`_ZN3std3sys9backtrace28__rust_begin_short_backtrace17h48aab430e2a5105cE+0x6
+              seer`_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h2b5c39bc373b0872E.llvm.8995034793291764227+0xc
+              seer`_RNvNtCseI2lRVYdSWK_3std2rt19lang_start_internal+0x3f4
+              seer`main+0x2c
+              seer`_start_crt+0x87
+              seer`_start+0x18
+               39
+             1067
+
+Implies 100% of CPU usage, but no single path is all of it.
+
+Why is `free` so expensive?  Is free supposed to be that bad in a big heap?
