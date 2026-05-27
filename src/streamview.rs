@@ -248,28 +248,6 @@ pub struct Materialized {
     pub parse_stats: ParseStats,
 }
 
-impl Materialized {
-    /// Builds a [`Materialized`] from caller-supplied flat vectors.
-    /// Used by TUI paths that don't have a [`StreamView`] backing them
-    /// (summary tabs whose histogram is computed elsewhere, test
-    /// fixtures with hand-crafted rows).
-    pub fn synthetic(
-        events: Vec<Row>,
-        formatted: Vec<String>,
-        event_for_line: Vec<EventIdx>,
-        first_line_for_event: Vec<LineIdx>,
-        parse_stats: ParseStats,
-    ) -> Self {
-        Self {
-            events,
-            formatted,
-            event_for_line,
-            first_line_for_event,
-            parse_stats,
-        }
-    }
-}
-
 /// Renders a [`MergeRecord`] into one or more display lines.
 ///
 /// When `opts.show_raw` is set, the record's raw bytes are returned
