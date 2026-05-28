@@ -378,9 +378,11 @@ pub struct Stepper<'a> {
 }
 
 impl<'a> Stepper<'a> {
-    /// Internal constructor with default [`StepperOptions`].  Public
-    /// callers go through [`super::Engine::stepper`].
-    pub(super) fn new(
+    /// Internal constructor with default [`StepperOptions`].  Used by
+    /// this module's own tests; public callers go through
+    /// [`super::Engine::stepper`].
+    #[cfg(test)]
+    fn new(
         sources: Vec<&'a dyn Source>,
         filter: Filter,
         cursor: &Cursor,

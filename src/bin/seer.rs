@@ -9587,7 +9587,7 @@ mod tests {
         // a non-first record should capture a cursor whose offset is
         // non-zero — proof that the byte position of the bookmarked
         // event flowed through `commit_selection`'s
-        // `cursor_for_position` call.
+        // `streamview.cursor_before_record` call.
         let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "second", &[]),

@@ -12,7 +12,7 @@
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::position::{ByteLen, ByteOffset, LogStreamPosition, SourceId};
+use crate::position::{ByteLen, LogStreamPosition, SourceId};
 use crate::source::{FileSource, Source, SourceError};
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
@@ -130,74 +130,6 @@ impl Engine {
             cursor.set(s.id().clone(), s.byte_len()?.into());
         }
         Ok(cursor)
-    }
-
-    /// Walks the unfiltered merge to find the event at `position` and
-    /// returns a [`Cursor`] just *before* that event — i.e., a cursor
-    /// such that `engine.stepper(filter, &cursor)`'s next `step_forward`
-    /// returns `position`'s event itself.
-    ///
-    /// "Before" rather than "after" is the semantic the navigation
-    /// callers want: feeding the result to [`crate::StreamView::seek_to_cursor`]
-    /// places the viewport's anchor on the bookmarked record.
-    ///
-    /// Returns `None` when `position`'s source isn't attached to this
-    /// engine, or when no event in that source matches the position's
-    /// time/ordinal pair.  Does not consult any filter: bookmark
-    /// resolution must work even when the active filter excludes the
-    /// bookmarked event.
-    pub fn cursor_for_position(
-        &self,
-        position: &LogStreamPosition,
-    ) -> Option<Cursor> {
-        if !self.sources.iter().any(|s| s.id() == position.source()) {
-            return None;
-        }
-        // Walk the unfiltered merge.  We accumulate per-source offsets
-        // in a cursor as we see each event; when we hit the anchor we
-        // return *before* updating, so the returned cursor names "just
-        // before" the bookmarked event.  Other sources' offsets in the
-        // cursor reflect the latest event we've seen from them prior
-        // to the bookmark — which is exactly what merging from this
-        // cursor wants.
-        let mut cursor = Cursor::new();
-        for s in &self.sources {
-            cursor.set(s.id().clone(), ByteOffset::ZERO);
-        }
-        let unfiltered = Filter::default();
-        let stepper_sources: Vec<&dyn Source> =
-            self.sources.iter().map(|s| s.as_ref()).collect();
-        let mut stepper =
-            Stepper::new(stepper_sources, unfiltered, &Cursor::new());
-        let mut ordinal_seen: u64 = 0;
-        let mut in_same_time_group = false;
-        while let Some(rec) = stepper.step_forward() {
-            let Ok(event) = rec.event else {
-                // Per-line errors don't carry a time/source pair the
-                // bookmark could be anchored to; advance the cursor
-                // past them and continue.
-                cursor.set(rec.source_id.clone(), rec.offset + rec.length);
-                continue;
-            };
-            let on_target_group = rec.source_id == *position.source()
-                && event.time == position.time();
-            if on_target_group {
-                if !in_same_time_group {
-                    in_same_time_group = true;
-                    ordinal_seen = 0;
-                }
-                if ordinal_seen == position.ordinal_within_time() {
-                    return Some(cursor);
-                }
-                ordinal_seen += 1;
-            } else if in_same_time_group {
-                // We walked off the matching group without finding
-                // the requested ordinal.
-                return None;
-            }
-            cursor.set(rec.source_id.clone(), rec.offset + rec.length);
-        }
-        None
     }
 
     /// Returns an iterator over every event in every source that
@@ -435,6 +367,7 @@ fn pop_next<'a>(
 mod tests {
     use super::*;
     use crate::event::Level;
+    use crate::position::ByteOffset;
     use crate::test_fixtures::{
         TestDir, append_bunyan, append_bunyan_at, append_raw, t,
     };
@@ -724,19 +657,6 @@ mod tests {
         dir.cleanup();
     }
 
-    /// Walks `engine`'s default-filter merge and returns the position of
-    /// the n-th `Ok` event.  Tests use this instead of building anchors
-    /// by hand because `LogStreamPosition` carries a tiebreaker that
-    /// would be tedious (and brittle) to mint manually.
-    fn nth_position(engine: &Engine, n: usize) -> LogStreamPosition {
-        engine
-            .query_events(&Filter::default())
-            .filter_map(|r| r.ok())
-            .nth(n)
-            .expect("event index in range")
-            .position
-    }
-
     #[test]
     fn query_filters_by_source_id_regex() {
         // Two sources whose canonical paths contain different basename
@@ -855,98 +775,6 @@ mod tests {
         let r2 = stepper.step_backward().unwrap();
         assert_eq!(r2.event.unwrap().msg, "a1");
         assert!(stepper.step_backward().is_none());
-        dir.cleanup();
-    }
-
-    #[test]
-    fn cursor_for_position_lands_just_before_anchor() {
-        // Build a multi-source fixture, anchor on a specific event,
-        // and confirm step_forward from the resulting cursor returns
-        // the anchored event itself.
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        append_bunyan_at(&a, "x", t(10), "a1");
-        append_bunyan_at(&a, "x", t(30), "a2");
-        append_bunyan_at(&b, "x", t(20), "b1");
-        append_bunyan_at(&b, "x", t(40), "b2");
-
-        let mut engine = Engine::new();
-        engine.add_file_source(&a).unwrap();
-        engine.add_file_source(&b).unwrap();
-        // Merge order: a1(10), b1(20), a2(30), b2(40).  Anchor on b1.
-        let anchor = nth_position(&engine, 1);
-        let cursor = engine.cursor_for_position(&anchor).unwrap();
-        // step_forward from this cursor returns b1; step_backward
-        // returns the previous event a1.
-        let mut stepper = engine.stepper(Filter::default(), &cursor);
-        let fwd = stepper.step_forward().unwrap();
-        assert_eq!(fwd.event.unwrap().msg, "b1");
-        let mut stepper = engine.stepper(Filter::default(), &cursor);
-        let back = stepper.step_backward().unwrap();
-        assert_eq!(back.event.unwrap().msg, "a1");
-        dir.cleanup();
-    }
-
-    #[test]
-    fn cursor_for_position_distinguishes_same_time_ordinals() {
-        // Two same-time events from one source.  cursor_for_position
-        // should land just before the requested ordinal, not the first.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        append_bunyan_at(&p, "x", t(10), "b");
-        append_bunyan_at(&p, "x", t(20), "c");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let pos_b = nth_position(&engine, 1);
-        let cursor = engine.cursor_for_position(&pos_b).unwrap();
-        let mut stepper = engine.stepper(Filter::default(), &cursor);
-        // Forward: b (the anchored same-time second event).
-        assert_eq!(stepper.step_forward().unwrap().event.unwrap().msg, "b",);
-        let mut stepper = engine.stepper(Filter::default(), &cursor);
-        // Backward: a (the same-time first event preceding b).
-        assert_eq!(stepper.step_backward().unwrap().event.unwrap().msg, "a",);
-        dir.cleanup();
-    }
-
-    #[test]
-    fn cursor_for_position_returns_none_for_unattached_source() {
-        // The bookmark's source isn't attached to this engine.
-        let dir = TestDir::new();
-        let p = dir.path().join("a.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        let mut engine_a = Engine::new();
-        engine_a.add_file_source(&p).unwrap();
-        let anchor = nth_position(&engine_a, 0);
-        let engine_b = Engine::new();
-        assert!(engine_b.cursor_for_position(&anchor).is_none());
-        dir.cleanup();
-    }
-
-    #[test]
-    fn cursor_for_position_returns_none_when_ordinal_past_group() {
-        // Two events share a timestamp; a third sits at a later time.
-        // Ask for ordinal 2 at the shared timestamp — only ordinals 0
-        // and 1 exist.  The walk enters the same-time group, increments
-        // through both members, then sees a record whose time has
-        // advanced; the walked-off-group branch fires and returns None.
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan_at(&p, "x", t(10), "a");
-        append_bunyan_at(&p, "x", t(10), "b");
-        append_bunyan_at(&p, "x", t(20), "c");
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        // Reuse the SourceId from a real position so the canonical-path
-        // form matches what the engine sees.
-        let real_pos = nth_position(&engine, 0);
-        let too_far = LogStreamPosition::new(
-            real_pos.source().clone(),
-            t(10),
-            2, // only ordinals 0 and 1 exist at t(10)
-        );
-        assert!(engine.cursor_for_position(&too_far).is_none());
         dir.cleanup();
     }
 }
