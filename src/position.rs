@@ -247,8 +247,15 @@ impl Cursor {
     }
 
     /// Returns true iff this cursor has no entries.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()
+    }
+
+    /// Returns the cumulative sum of bytes in the underlying stream *prior* to
+    /// this position
+    pub fn byte_offset(&self) -> ByteOffset {
+        ByteOffset(self.iter().map(|(_, off)| off.get()).sum())
     }
 }
 

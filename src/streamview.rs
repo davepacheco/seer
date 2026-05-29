@@ -1943,9 +1943,15 @@ impl Viewport {
     /// `idx` — i.e., a cursor such that `engine.stepper(filter, &cursor)`'s
     /// next `step_forward` (under the same filter the window was built with)
     /// returns that record.
-    pub fn cursor_before_record(&self, idx: usize) -> Option<Cursor> {
-        // XXX-dap I can't tell what kind of index this is or how we're going to
-        // compute it.
+    pub fn cursor_before_record(&self, _idx: EventIdx) -> Option<Cursor> {
+        // XXX-dap how are we going to compute this
+        // We only have two possible cursors to start with:
+        // - the anchor cursor
+        // - the cursor wherever the stepper is right now
+        // I'm inclined to clone the cursor wherever the stepper is right now
+        // and start walking in whichever direction looks closer to this event.
+        // The only thing is that we might not be able to tell which direction
+        // to go?
         todo!(); // XXX-dap implement me
     }
 
@@ -1959,8 +1965,16 @@ impl Viewport {
         }
     }
 
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
     pub fn materialized(&self) -> &Materialized {
         self.rendered.materialized()
+    }
+
+    pub fn is_forward_eof(&self) -> bool {
+        self.rendered.is_forward_eof()
     }
 
     /// Do a bounded amount of work trying to populate the current rendered
@@ -2056,6 +2070,14 @@ impl Viewport {
         // The direction is unused here.
         // XXX-dap TODO-cleanup better strong type safety
         self.start_seek(stepper, Direction::Forward, SeekDestination::Cursor);
+    }
+
+    pub fn start_seek_to_start(&mut self, engine: &Engine) {
+        self.start_seek_to_cursor(engine, &Cursor::new());
+    }
+
+    pub fn start_seek_to_end(&mut self, _engine: &Engine) {
+        // XXX-dap how do we do this lol
     }
 
     fn anchor_record(&self) -> Option<&MergeRecord> {
@@ -2183,6 +2205,7 @@ pub struct RenderedWindow {
     ordinals: HashMap<(SourceId, DateTime<Utc>), u64>,
     stepper: Stepper,
     nrecords: usize,
+    forward_eof: bool,
 }
 
 enum PopulateState {
@@ -2264,6 +2287,7 @@ impl RenderedWindow {
             stepper,
             state: initial_state,
             nrecords,
+            forward_eof: false,
         }
     }
 
@@ -2296,6 +2320,12 @@ impl RenderedWindow {
                 }
             }
         };
+
+        if let PopulateState::Forward(..) = &self.state
+            && exhausted
+        {
+            self.forward_eof = true;
+        }
 
         self.state = self.state.next(exhausted);
     }
@@ -2409,6 +2439,10 @@ impl RenderedWindow {
         panic!(
             "did not find desired cursor within max_distance {max_distance}"
         );
+    }
+
+    fn is_forward_eof(&self) -> bool {
+        self.forward_eof
     }
 
     // XXX-dap not used now, but maybe later

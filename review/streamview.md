@@ -359,3 +359,17 @@ Current status:
     - Seer's Tab::rerender() -- will this go away too?
     - Seer's Tab::resync_from_streamview() -- WTF is this
     - advance_seek_op() / advance_search_op() / finalize_seek_op()
+- I've implemented or stubbed out all the things that I know I need and that I
+  understand.  The next step is to remind myself how seer.rs works to
+  understand if there's any deeper mismatch (e.g., the way it manages long ops)
+- Okay, I'm currently in the middle of this conversion.
+  - done: I've gone through all *code* references to "streamview"
+  - done: implement is_forward_eof()
+  - done: go through uses of long_op
+  - IT COMPILES
+  - TODO: trying to figure out what to do with resync_from_streamview()
+    and viewport_top in general
+  - TODO: figure out what to do with summary builds
+  - TODO: lots of XXXs
+  - TODO: fix up cursor_before_record()
+  - TODO: fix up tests
