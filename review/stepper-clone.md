@@ -57,7 +57,7 @@ pair.
       keep the `'a` while moving `Engine` to `Arc<dyn Source>`); both
       were landed in one commit.
 
-- [ ] **4. Migrate `MergeRecord` to getters and an `Arc<dyn Source>`.**
+- [x] **4. Migrate `MergeRecord` to getters and an `Arc<dyn Source>`.**
       Replace the `pub` fields with accessor methods:
       - `source_id(&self) -> &SourceId` (routes through the stored
         `Arc<dyn Source>`)

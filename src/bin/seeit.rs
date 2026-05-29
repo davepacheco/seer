@@ -447,7 +447,7 @@ fn emit_forward_from_engine(
     let mut emitted: usize = 0;
     while let Some(r) = stepper.step_forward() {
         emit_record(&r, opts);
-        if r.event.is_ok() {
+        if r.event().is_ok() {
             emitted += 1;
             if let Some(max) = count
                 && emitted >= max
@@ -522,7 +522,7 @@ fn emit_summary(engine: &Engine, filter: &Filter) {
 /// formatted lines to stdout; per-line parse/IO errors print their
 /// `Display` form to stderr (matches the legacy file-mode behavior).
 fn emit_record(r: &MergeRecord, opts: &RenderOpts) {
-    match &r.event {
+    match r.event() {
         Ok(e) => {
             for line in format_event(e, opts) {
                 println!("{line}");

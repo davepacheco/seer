@@ -68,7 +68,7 @@ pub struct RecordKey {
 impl RecordKey {
     /// Builds a [`RecordKey`] from a [`MergeRecord`].
     pub fn from_record(record: &MergeRecord) -> Self {
-        Self { source_id: record.source_id.clone(), offset: record.offset }
+        Self { source_id: record.source_id().clone(), offset: record.offset() }
     }
 }
 
@@ -261,14 +261,14 @@ fn format_record(record: &MergeRecord, opts: &RenderOpts) -> Vec<String> {
         // Synthetic error placeholders (e.g. an I/O failure from the
         // source) have empty `raw`; fall back to the error's Display
         // so the row still says something meaningful.
-        if record.raw.is_empty()
-            && let Err(err) = &record.event
+        if record.raw().is_empty()
+            && let Err(err) = record.event()
         {
             return vec![err.to_string()];
         }
-        return vec![record.raw.clone()];
+        return vec![record.raw().to_string()];
     }
-    match &record.event {
+    match record.event() {
         Ok(event) => format_event(event, opts),
         Err(err) => vec![err.to_string()],
     }
@@ -490,13 +490,13 @@ impl StreamView {
         for entry in &self.records {
             let event_idx = EventIdx(events.len());
             first_line_for_event.push(LineIdx(formatted.len()));
-            match &entry.record.event {
+            match entry.record.event() {
                 Ok(event) => {
-                    let key = (entry.record.source_id.clone(), event.time);
+                    let key = (entry.record.source_id().clone(), event.time);
                     let ordinal = *ordinals.entry(key.clone()).or_insert(0);
                     ordinals.insert(key, ordinal + 1);
                     let position = LogStreamPosition::new(
-                        entry.record.source_id.clone(),
+                        entry.record.source_id().clone(),
                         event.time,
                         ordinal,
                     );
@@ -583,7 +583,8 @@ impl StreamView {
 
     fn find_record_idx(&self, key: &RecordKey) -> Option<usize> {
         self.records.iter().position(|e| {
-            e.record.source_id == key.source_id && e.record.offset == key.offset
+            e.record.source_id() == &key.source_id
+                && e.record.offset() == key.offset
         })
     }
 
@@ -602,7 +603,7 @@ impl StreamView {
         let mut cursor = self.front_cursor.clone();
         for entry in self.records.iter().take(idx) {
             let r = &entry.record;
-            cursor.set(r.source_id.clone(), r.offset + r.length);
+            cursor.set(r.source_id().clone(), r.offset() + r.length());
         }
         Some(cursor)
     }
@@ -989,8 +990,8 @@ impl StreamView {
     /// in wholesale and then roll back only the one source.
     fn anchor_front_cursor_to_first_record(&mut self) {
         if let Some(first) = self.records.front() {
-            let first_source = first.record.source_id.clone();
-            let first_offset = first.record.offset;
+            let first_source = first.record.source_id().clone();
+            let first_offset = first.record.offset();
             // `self.back_cursor` was just set to `stepper.cursor()` by
             // the caller; both extend_forward paths write it
             // immediately before invoking us.
@@ -1238,8 +1239,8 @@ impl StreamView {
             // we just trimmed from, the new front offset is
             // (offset + length).  Other sources unchanged.
             self.front_cursor.set(
-                entry.record.source_id.clone(),
-                entry.record.offset + entry.record.length,
+                entry.record.source_id().clone(),
+                entry.record.offset() + entry.record.length(),
             );
             // Trimming exposes earlier territory for backward fetches.
             self.eof.backward = false;
@@ -1259,7 +1260,7 @@ impl StreamView {
             }
             let entry = self.records.pop_back().unwrap();
             self.back_cursor
-                .set(entry.record.source_id.clone(), entry.record.offset);
+                .set(entry.record.source_id().clone(), entry.record.offset());
             self.eof.forward = false;
         }
     }
@@ -1428,7 +1429,7 @@ impl StreamView {
         }
         let (anchor_idx, _) = self.anchor_indices();
         let event_time = |i: usize| -> Option<DateTime<Utc>> {
-            self.records[i].record.event.as_ref().ok().map(|e: &Event| e.time)
+            self.records[i].record.event().as_ref().ok().map(|e: &Event| e.time)
         };
         match dir {
             Direction::Forward => (anchor_idx..self.records.len())
@@ -1453,7 +1454,7 @@ impl StreamView {
         // target.
         loop {
             while idx < self.records.len() {
-                if let Ok(ev) = &self.records[idx].record.event
+                if let Ok(ev) = self.records[idx].record.event()
                     && ev.time >= target
                 {
                     let key = self.records[idx].key();
@@ -1499,7 +1500,7 @@ impl StreamView {
             // Walk cached records backward until we find one with
             // time <= target.
             for i in (0..=anchor_idx).rev() {
-                if let Ok(ev) = &self.records[i].record.event
+                if let Ok(ev) = self.records[i].record.event()
                     && ev.time <= target
                 {
                     let key = self.records[i].key();
@@ -1854,7 +1855,8 @@ fn anchor_idx_in(
         return None;
     };
     records.iter().position(|e| {
-        e.record.source_id == key.source_id && e.record.offset == key.offset
+        e.record.source_id() == &key.source_id
+            && e.record.offset() == key.offset
     })
 }
 

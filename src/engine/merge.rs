@@ -63,21 +63,64 @@ const BUFFER_LIMIT: usize = 256;
 /// `length == 0` is emitted when the storage layer's `query` itself
 /// fails (e.g. the file was deleted out from under us); a real
 /// on-disk record always has positive length.
+///
+/// Fields are accessed through getters rather than directly so the
+/// internal representation can share buffered storage between cloned
+/// [`Stepper`]s in a later refactor.  Cloning a `MergeRecord` is
+/// cheap on the source side (the source is held by `Arc`) but still
+/// deep-copies the inline `event` / `raw` fields; that becomes cheap
+/// in the follow-up that moves the inline fields behind an
+/// `Arc<BufferedRecord>`.
 #[derive(Debug, Clone)]
 pub struct MergeRecord {
-    /// source the record came from
-    pub source_id: SourceId,
-    /// byte offset in `source_id` where the record begins
-    pub offset: ByteOffset,
+    /// source the record came from; carried so [`Self::source_id`]
+    /// can route through the source's own `id()` accessor without
+    /// duplicating the id in this struct
+    source: Arc<dyn Source>,
+    /// byte offset in `source` where the record begins
+    offset: ByteOffset,
     /// length of the record in bytes (including the trailing newline,
     /// if present); [`ByteLen::ZERO`] for synthetic error placeholders
-    pub length: ByteLen,
+    length: ByteLen,
     /// parsed event when the line was valid; otherwise the per-line
     /// parse or I/O error
-    pub event: Result<Event, MergeError>,
+    event: Result<Event, MergeError>,
     /// the record's bytes as they appear in the source, minus any
     /// trailing line terminator; empty for synthetic error placeholders
-    pub raw: String,
+    raw: String,
+}
+
+impl MergeRecord {
+    /// Returns the id of the source this record was read from.
+    pub fn source_id(&self) -> &SourceId {
+        self.source.id()
+    }
+
+    /// Returns the byte offset in the source where this record begins.
+    pub fn offset(&self) -> ByteOffset {
+        self.offset
+    }
+
+    /// Returns the length of this record in bytes, including the
+    /// trailing newline when present.  Zero for the synthetic error
+    /// placeholder emitted when the storage layer's `query` itself
+    /// fails.
+    pub fn length(&self) -> ByteLen {
+        self.length
+    }
+
+    /// Returns the parsed event, or the per-line parse / I/O error
+    /// surfaced inline by the merge layer.
+    pub fn event(&self) -> &Result<Event, MergeError> {
+        &self.event
+    }
+
+    /// Returns the record's bytes as they appear in the source, minus
+    /// any trailing line terminator.  Empty for the synthetic error
+    /// placeholder.
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
 }
 
 /// Per-line error surfaced by [`Stepper`].
@@ -300,7 +343,7 @@ impl SourceWindow {
             self.buf_mut(opp).pop_back();
         }
         MergeRecord {
-            source_id: self.source.id().clone(),
+            source: Arc::clone(&self.source),
             offset: r.offset,
             length: r.length,
             event: r.event,
@@ -609,8 +652,8 @@ mod tests {
     fn forward_msgs(stepper: &mut Stepper) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(r) = stepper.step_forward() {
-            match r.event {
-                Ok(e) => out.push(e.msg),
+            match r.event() {
+                Ok(e) => out.push(e.msg.clone()),
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -621,8 +664,8 @@ mod tests {
     fn backward_msgs(stepper: &mut Stepper) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(r) = stepper.step_backward() {
-            match r.event {
-                Ok(e) => out.push(e.msg),
+            match r.event() {
+                Ok(e) => out.push(e.msg.clone()),
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -695,12 +738,12 @@ mod tests {
         let mut fwd = Vec::new();
         for _ in 0..4 {
             let r = stepper.step_forward().unwrap();
-            fwd.push(r.event.unwrap().msg);
+            fwd.push(r.event().as_ref().unwrap().msg.clone());
         }
         let mut bwd = Vec::new();
         for _ in 0..4 {
             let r = stepper.step_backward().unwrap();
-            bwd.push(r.event.unwrap().msg);
+            bwd.push(r.event().as_ref().unwrap().msg.clone());
         }
         let mut fwd_rev = fwd.clone();
         fwd_rev.reverse();
@@ -880,14 +923,14 @@ mod tests {
         let mut stepper = make_stepper(&sources);
         // Consume m10 and m20.
         let r1 = stepper.step_forward().unwrap();
-        assert_eq!(r1.event.as_ref().unwrap().msg, "m10");
+        assert_eq!(r1.event().as_ref().unwrap().msg, "m10");
         let r2 = stepper.step_forward().unwrap();
-        assert_eq!(r2.event.as_ref().unwrap().msg, "m20");
+        assert_eq!(r2.event().as_ref().unwrap().msg, "m20");
         // Switch to a filter that excludes m30; m40 should be next.
         let filter: Filter = "msg!=m30".parse().unwrap();
         stepper.set_filter(filter);
         let r3 = stepper.step_forward().unwrap();
-        assert_eq!(r3.event.as_ref().unwrap().msg, "m40");
+        assert_eq!(r3.event().as_ref().unwrap().msg, "m40");
         // No more forward records.
         assert!(stepper.step_forward().is_none());
         dir.cleanup();
@@ -937,11 +980,11 @@ mod tests {
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let r1 = stepper.step_forward().unwrap();
-        assert_eq!(r1.event.as_ref().unwrap().msg, "m10");
+        assert_eq!(r1.event().as_ref().unwrap().msg, "m10");
         let r2 = stepper.step_forward().unwrap();
-        assert!(r2.event.is_err());
+        assert!(r2.event().is_err());
         let r3 = stepper.step_forward().unwrap();
-        assert_eq!(r3.event.as_ref().unwrap().msg, "m20");
+        assert_eq!(r3.event().as_ref().unwrap().msg, "m20");
         assert!(stepper.step_forward().is_none());
         dir.cleanup();
     }
@@ -964,11 +1007,11 @@ mod tests {
         }
         // Step backward: m20, then error, then m10.
         let r1 = stepper.step_backward().unwrap();
-        assert_eq!(r1.event.as_ref().unwrap().msg, "m20");
+        assert_eq!(r1.event().as_ref().unwrap().msg, "m20");
         let r2 = stepper.step_backward().unwrap();
-        assert!(r2.event.is_err());
+        assert!(r2.event().is_err());
         let r3 = stepper.step_backward().unwrap();
-        assert_eq!(r3.event.as_ref().unwrap().msg, "m10");
+        assert_eq!(r3.event().as_ref().unwrap().msg, "m10");
         assert!(stepper.step_backward().is_none());
         dir.cleanup();
     }
@@ -1044,7 +1087,7 @@ mod tests {
         assert!(stepper.step_forward().is_none());
         // Backward still works.
         let r = stepper.step_backward().unwrap();
-        assert_eq!(r.event.as_ref().unwrap().msg, "m20");
+        assert_eq!(r.event().as_ref().unwrap().msg, "m20");
         dir.cleanup();
     }
 
@@ -1062,8 +1105,8 @@ mod tests {
         let mut stepper = make_stepper(&sources);
         let mut expected_offset = ByteOffset::ZERO;
         while let Some(r) = stepper.step_forward() {
-            assert_eq!(r.offset, expected_offset);
-            expected_offset += r.length;
+            assert_eq!(r.offset(), expected_offset);
+            expected_offset += r.length();
         }
         assert_eq!(expected_offset.get(), len);
         dir.cleanup();
@@ -1105,7 +1148,7 @@ mod tests {
         let mut msgs = Vec::new();
         loop {
             match stepper.step_forward() {
-                Some(r) => msgs.push(r.event.unwrap().msg),
+                Some(r) => msgs.push(r.event().as_ref().unwrap().msg.clone()),
                 None => {
                     if stepper.is_exhausted(Direction::Forward) {
                         break;
@@ -1121,6 +1164,7 @@ mod tests {
     /// the batch-fetch test to confirm the stepper actually issues
     /// multiple smaller fetches rather than reading the whole file at
     /// once.
+    #[derive(Debug)]
     struct CountingSource {
         inner: FileSource,
         count: Arc<AtomicUsize>,

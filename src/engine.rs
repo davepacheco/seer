@@ -772,9 +772,9 @@ mod tests {
         let mut stepper = engine.stepper(Filter::default(), &cursor);
         assert!(stepper.step_forward().is_none());
         let r1 = stepper.step_backward().unwrap();
-        assert_eq!(r1.event.unwrap().msg, "b1");
+        assert_eq!(r1.event().as_ref().unwrap().msg, "b1");
         let r2 = stepper.step_backward().unwrap();
-        assert_eq!(r2.event.unwrap().msg, "a1");
+        assert_eq!(r2.event().as_ref().unwrap().msg, "a1");
         assert!(stepper.step_backward().is_none());
         dir.cleanup();
     }

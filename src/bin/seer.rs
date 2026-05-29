@@ -1051,9 +1051,9 @@ impl SummaryOp {
                 self.eof = true;
                 break;
             };
-            self.bytes_read += rec.length;
-            if let Ok(event) = rec.event {
-                self.builder.observe(&event);
+            self.bytes_read += rec.length();
+            if let Ok(event) = rec.event() {
+                self.builder.observe(event);
                 self.records += 1;
             }
             count += 1;
@@ -3198,8 +3198,9 @@ impl App {
             .engine
             .stepper(Filter::default(), &cursor)
             .step_forward()
-            .and_then(|r| r.event.ok())
-            .is_some_and(|e| filter.matches_event(&e));
+            .is_some_and(|r| {
+                r.event().as_ref().is_ok_and(|e| filter.matches_event(e))
+            });
         // `tab_idx` was just made active above, so this routes through
         // the standard seek-active-to-cursor path that installs a
         // [`LongOp::Seek`] (progress bar + Ctrl-C cancellation).

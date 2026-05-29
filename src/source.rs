@@ -124,7 +124,12 @@ pub enum SourceError {
 /// out as `Arc<dyn Source>` — the merge stepper and the streamview
 /// share the same source instance across navigation operations, and
 /// future work may want to drive scans from a worker thread.
-pub trait Source: Send + Sync {
+///
+/// The `Debug` bound lets [`crate::engine::MergeRecord`] (which holds
+/// an `Arc<dyn Source>`) keep its derived `Debug` impl; concrete
+/// sources are expected to print enough to identify themselves
+/// (their id, in practice).
+pub trait Source: Send + Sync + std::fmt::Debug {
     /// Returns this source's identifier.
     fn id(&self) -> &SourceId;
 
@@ -301,6 +306,7 @@ impl SourceMetadata {
 ///
 /// Each call to [`Source::events`] re-opens the file and streams it line
 /// by line, parsing each line as a bunyan JSON record.
+#[derive(Debug)]
 pub struct FileSource {
     id: SourceId,
     path: Utf8PathBuf,
