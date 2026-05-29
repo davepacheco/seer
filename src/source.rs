@@ -119,7 +119,12 @@ pub enum SourceError {
 }
 
 /// A source of log events.
-pub trait Source {
+///
+/// Implementations must be `Send + Sync` so the engine can hand them
+/// out as `Arc<dyn Source>` — the merge stepper and the streamview
+/// share the same source instance across navigation operations, and
+/// future work may want to drive scans from a worker thread.
+pub trait Source: Send + Sync {
     /// Returns this source's identifier.
     fn id(&self) -> &SourceId;
 
