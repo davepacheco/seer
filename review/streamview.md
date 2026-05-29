@@ -334,3 +334,28 @@ MergeWindow:
 - can be constituted with a stepper -- steps forward/back to get all the data
 RenderedWindow (maybe the same as MergeWindow)
 - rendered data associated with each record
+
+
+
+Current status:
+- I've made a bunch of the prerequisite changes above.
+- I've implemented a RenderedWindow that does the populate() bit
+- I've implemented a Viewport that contains a RenderedWindow and supports seeking
+- In principle, I may need to rethink some of how seer stores its state since I may have moved some of it (the long ops, etc.) into the new Viewport
+- What remains is to identify the gaps between what this supports and what seer needs
+  - cursor_at_anchor() is used to:
+    - compute byte offset into the merged stream
+    - save session state
+    - refresh tab after changing filter?  will this go away?
+  - materialized() -- trivial
+  - advance_time() -- I think that's easy?
+  - cursor_before_record(): given index -- used to create a bookmark.  I think this is doable?
+  - to figure out:
+    - scroll_lines()
+    - done: seek_to_cursor()
+    - Tab::seek_active_to_end() / seek_active_to_start() / seek_active_to_cursor()
+  - to re-review:
+    - Seer's Tab::refresh() -- it depends on how this gets called.  This may get eliminated?
+    - Seer's Tab::rerender() -- will this go away too?
+    - Seer's Tab::resync_from_streamview() -- WTF is this
+    - advance_seek_op() / advance_search_op() / finalize_seek_op()

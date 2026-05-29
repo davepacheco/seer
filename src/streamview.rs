@@ -297,6 +297,7 @@ enum Anchor {
     /// Top of viewport sits at line `line` within the record identified
     /// by `key`.  `line == 0` is the record's header line; positive
     /// values index into its extras (only when `show_extras` is on).
+    // XXX-dap line should be LineIdx
     On { key: RecordKey, line: usize },
     /// Window is empty under the active filter.
     Empty,
@@ -1893,6 +1894,8 @@ struct SeekOperation {
 }
 
 enum SeekDestination {
+    Cursor,
+    Distance(usize),
     Time(DateTime<Utc>),
     Search(Regex),
 }
@@ -1933,17 +1936,50 @@ impl Viewport {
         }
     }
 
+    /// Do a bounded amount of work trying to populate the current rendered
+    /// window
     pub fn populate_work(&mut self) {
         self.rendered.populate_work();
     }
+
+    pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
+        self.seek_interrupt();
+        let stepper = engine.stepper(filter, &self.anchor_cursor);
+        self.rendered =
+            RenderedWindow::new(stepper, 256, 1024, self.render_options);
+    }
+
+    pub fn set_render_options(&mut self, render_options: RenderOpts) {
+        self.render_options = render_options;
+        self.rendered.set_render_options(render_options);
+    }
+
+    // Seeking
 
     pub fn seek_interrupt(&mut self) {
         self.pending_seek = None;
     }
 
+    // XXX-dap this implicitly assumes the viewport height is smaller than the
+    // window size.  I guess we could pass that through to the point where we
+    // create the window
+    pub fn scroll_lines(&mut self, delta: isize) {
+        let stepper =
+            self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
+        let direction =
+            if delta > 0 { Direction::Forward } else { Direction::Backward };
+        self.start_seek(
+            stepper,
+            direction,
+            SeekDestination::Distance(delta.unsigned_abs()),
+        );
+        // Try doing a unit of work.  In the common case, this is going to be
+        // pretty quick.
+        self.seek_work();
+    }
+
     pub fn start_seek_by_time(
         &mut self,
-        engine: &Engine,
         direction: Direction,
         delta: Duration,
     ) {
@@ -1964,16 +2000,35 @@ impl Viewport {
             Direction::Backward => event.time - delta,
         };
 
-        self.start_seek(engine, direction, SeekDestination::Time(end_time))
+        let stepper =
+            self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
+        self.start_seek(stepper, direction, SeekDestination::Time(end_time))
     }
 
     pub fn start_seek_for_search(
         &mut self,
-        engine: &Engine,
         direction: Direction,
         regex: Regex,
     ) {
-        self.start_seek(engine, direction, SeekDestination::Search(regex));
+        let stepper =
+            self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
+        self.start_seek(stepper, direction, SeekDestination::Search(regex));
+    }
+
+    pub fn start_seek_to_cursor(&mut self, engine: &Engine, cursor: &Cursor) {
+        // A cursor seek is a little different from a typical one because we
+        // (mostly) know exactly where we're going.  But we treat it like an
+        // unbounded-seek anyway because in principle it's possible for it to
+        // take a lot of work to get to the next matching record.
+        //
+        // Unlike the other seek operations, we create a fresh Stepper from the
+        // engine here because we want to load this position directly rather
+        // than stepping to it.  It could be very far away.
+        let stepper = engine.stepper(self.filter.clone(), cursor);
+
+        // The direction is unused here.
+        // XXX-dap TODO-cleanup better strong type safety
+        self.start_seek(stepper, Direction::Forward, SeekDestination::Cursor);
     }
 
     fn anchor_record(&self) -> Option<&MergeRecord> {
@@ -1987,18 +2042,12 @@ impl Viewport {
 
     fn start_seek(
         &mut self,
-        engine: &Engine,
+        stepper: Stepper,
         direction: Direction,
         seek_to: SeekDestination,
     ) {
         // XXX-dap, if we're pinned to the back, this seems like it won't do
         // what we want
-        // XXX-dap creating a new stepper here is a little unfortunate when
-        // we've got one sitting in the RenderedWindow that might already have a
-        // bunch of the data we want to search.  Maybe the solution here is to
-        // build a sort of MultiStepper where we hang onto one end while the
-        // other end keeps going.
-        let stepper = engine.stepper(self.filter.clone(), &self.anchor_cursor);
         self.seek_interrupt();
         self.pending_seek = Some(SeekOperation {
             stepper,
@@ -2022,7 +2071,21 @@ impl Viewport {
             return;
         };
 
-        match &seek.seek_to {
+        match &mut seek.seek_to {
+            SeekDestination::Cursor => {
+                self.seek_finish(Some((next, LineIdx(0))));
+            }
+            SeekDestination::Distance(remaining) => {
+                // Render the record to figure out how many lines it takes up.
+                let nlines = format_record(&next, &self.render_options).len();
+                if *remaining > nlines {
+                    *remaining -= nlines;
+                    return;
+                }
+
+                let value = Some((next, LineIdx(*remaining)));
+                self.seek_finish(value);
+            }
             SeekDestination::Time(target_time) => {
                 let Ok(event) = next.event() else {
                     return;
@@ -2034,7 +2097,7 @@ impl Viewport {
                 };
 
                 if done {
-                    self.seek_finish(Some(next));
+                    self.seek_finish(Some((next, LineIdx(0))));
                 }
             }
             SeekDestination::Search(regex) => {
@@ -2045,7 +2108,7 @@ impl Viewport {
                 let lines = format_record(&next, &self.render_options);
                 for line in lines {
                     if regex.is_match(&line) {
-                        self.seek_finish(Some(next));
+                        self.seek_finish(Some((next, LineIdx(0))));
                         return;
                     }
                 }
@@ -2053,12 +2116,12 @@ impl Viewport {
         }
     }
 
-    fn seek_finish(&mut self, found: Option<MergeRecord>) {
+    fn seek_finish(&mut self, found: Option<(MergeRecord, LineIdx)>) {
         let mut seek = self
             .pending_seek
             .take()
             .expect("seek_finish() called with seek in progress");
-        let Some(found) = found else {
+        let Some((found, line)) = found else {
             // When we don't find such a record, we don't change the anchor or
             // the rendered window.
             return;
@@ -2078,22 +2141,10 @@ impl Viewport {
                 source_id: found.source_id().clone(),
                 offset: found.offset(),
             },
-            line: 0,
+            line: line.0,
         };
         self.rendered =
             RenderedWindow::new(seek.stepper, 256, 1024, self.render_options);
-    }
-
-    pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
-        self.seek_interrupt();
-        let stepper = engine.stepper(filter, &self.anchor_cursor);
-        self.rendered =
-            RenderedWindow::new(stepper, 256, 1024, self.render_options);
-    }
-
-    pub fn set_render_options(&mut self, render_options: RenderOpts) {
-        self.render_options = render_options;
-        self.rendered.set_render_options(render_options);
     }
 }
 
@@ -2104,6 +2155,7 @@ pub struct RenderedWindow {
     materialized: Materialized,
     ordinals: HashMap<(SourceId, DateTime<Utc>), u64>,
     stepper: Stepper,
+    nrecords: usize,
 }
 
 enum PopulateState {
@@ -2147,6 +2199,12 @@ impl PopulateState {
     }
 }
 
+// XXX-dap currently unused
+// struct WindowPosition {
+//     record_idx: EventIdx,
+//     line_idx: LineIdx,
+// }
+
 impl RenderedWindow {
     pub fn new(
         stepper: Stepper,
@@ -2154,10 +2212,10 @@ impl RenderedWindow {
         after: u32,
         render_options: RenderOpts,
     ) -> RenderedWindow {
-        assert!(after + before > 1); // XXX-dap
         // unwrap(): we're not asking for that many records
-        let records =
-            Vec::with_capacity(usize::try_from(after + before).unwrap());
+        let nrecords = usize::try_from(after + before).unwrap();
+        assert!(nrecords > 1); // XXX-dap
+        let records = Vec::with_capacity(nrecords);
         let events = Vec::with_capacity(records.capacity());
         let formatted = Vec::new();
         let event_for_line = Vec::new();
@@ -2178,6 +2236,7 @@ impl RenderedWindow {
             ordinals,
             stepper,
             state: initial_state,
+            nrecords,
         }
     }
 
@@ -2278,6 +2337,69 @@ impl RenderedWindow {
             (entry.key() == *record_key).then_some(&entry.record)
         })
     }
+
+    pub fn stepper_at_cursor_within_window(&self, cursor: &Cursor) -> Stepper {
+        // Choose a maximum step count just to avoid a logic bug resulting in an
+        // infinite loop.
+        let max_distance = self.nrecords + 1;
+
+        // Start with our own stepper so that we can re-use as much of the data
+        // as we can.
+        let mut stepper = self.stepper.clone();
+
+        // XXX-dap this is a problem!  This could take an unbounded amount of
+        // time.  That's pretty unlikely though since the caller is always
+        // trying to get to the anchor, and most windows will have been created
+        // as a result of a seek to the anchor where they've already loaded that
+        // record (and any others in between the cursor's current position and
+        // the anchor).  This could be bad, though, if somebody navigated to a
+        // bookmark with a selective filter that excluded the bookmarked record
+        // and then immediately tried to seek relative to the anchor.  This
+        // could cause the UI to hang up here while we try to find an unfiltered
+        // record nearest to the anchor.
+        let direction = match stepper.cursor().partial_cmp(cursor) {
+            None => {
+                panic!(
+                    "stepper cursor is not ordered compared \
+                     with requested cursor"
+                );
+            }
+            Some(std::cmp::Ordering::Less) => Direction::Forward,
+            Some(std::cmp::Ordering::Greater) => Direction::Backward,
+            Some(std::cmp::Ordering::Equal) => {
+                return stepper;
+            }
+        };
+
+        for _ in 0..max_distance {
+            let _ = stepper.step(direction);
+
+            if *cursor == stepper.cursor() {
+                return stepper;
+            }
+        }
+
+        panic!(
+            "did not find desired cursor within max_distance {max_distance}"
+        );
+    }
+
+    // XXX-dap not used now, but maybe later
+    // pub fn anchor_position(&self, anchor: &Anchor) -> Option<WindowPosition> {
+    //     match anchor {
+    //         Anchor::On { key, line } => {
+    //             // XXX-dap this could be better
+    //             self.records.iter().enumerate().find_map(|(i, entry)| {
+    //                 (entry.key() == key).then_some((EventIdx(i), LineIdx(line)))
+    //             })
+    //         }
+    //         Anchor::Empty | Anchor::PinFront => Some((EventIdx(0), LineIdx(0))),
+    //         Anchor::PinBack => Some((
+    //             EventIdx(self.records.len() - 1),
+    //             LineIdx(self.records[last].lines.len() - 1),
+    //         )),
+    //     }
+    // }
 }
 
 #[cfg(test)]

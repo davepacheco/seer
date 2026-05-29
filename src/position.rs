@@ -252,6 +252,16 @@ impl Cursor {
     }
 }
 
+// XXX-dap TODO-test implement tests
+impl PartialOrd for Cursor {
+    fn partial_cmp(&self, _other: &Self) -> Option<std::cmp::Ordering> {
+        // XXX-dap TODO implement
+        todo!();
+    }
+}
+
+// XXX-dap implement PartialEq correctly
+
 /// Position within a log stream — a stable anchor that survives filter
 /// changes.
 ///
