@@ -23,6 +23,7 @@
 //! full-pass model since their output is bounded by the histogram
 //! shape, not by the file size.
 
+use crate::Stepper;
 use crate::engine::{
     Cursor, Engine, EngineEvent, FETCH_BATCH_SIZE, MergeRecord, StepperOptions,
 };
@@ -246,6 +247,18 @@ pub struct Materialized {
     pub event_for_line: Vec<EventIdx>,
     pub first_line_for_event: Vec<LineIdx>,
     pub parse_stats: ParseStats,
+}
+
+impl Materialized {
+    pub fn new(expected_records: usize) -> Materialized {
+        Materialized {
+            events: Vec::with_capacity(expected_records),
+            formatted: Vec::new(),
+            event_for_line: Vec::new(),
+            first_line_for_event: Vec::with_capacity(expected_records),
+            parse_stats: Default::default(),
+        }
+    }
 }
 
 /// Renders a [`MergeRecord`] into one or more display lines.
@@ -1858,6 +1871,413 @@ fn anchor_idx_in(
         e.record.source_id() == &key.source_id
             && e.record.offset() == key.offset
     })
+}
+
+// -----------------------------------------------------------------------------
+// XXX-dap TODO move this to src/ui
+
+pub struct Viewport {
+    filter: Filter,
+    render_options: RenderOpts,
+    anchor: Anchor,
+    anchor_cursor: Cursor,
+    rendered: RenderedWindow,
+    pending_seek: Option<SeekOperation>,
+}
+
+struct SeekOperation {
+    stepper: Stepper,
+    direction: Direction,
+    stats: ParseStats,
+    seek_to: SeekDestination,
+}
+
+enum SeekDestination {
+    Time(DateTime<Utc>),
+    Search(Regex),
+}
+
+pub enum ViewportStatus<'a> {
+    Idle,
+    Seeking(&'a ParseStats),
+    Populating,
+}
+
+impl Viewport {
+    pub fn new(
+        engine: &Engine,
+        filter: Filter,
+        render_options: RenderOpts,
+    ) -> Viewport {
+        let anchor = Anchor::PinFront;
+        let anchor_cursor = Cursor::new();
+        let stepper = engine.stepper(filter.clone(), &anchor_cursor);
+        let rendered = RenderedWindow::new(stepper, 256, 1024, render_options); // XXX-dap
+        Viewport {
+            filter,
+            render_options,
+            anchor,
+            anchor_cursor,
+            rendered,
+            pending_seek: None,
+        }
+    }
+
+    pub fn status(&self) -> ViewportStatus<'_> {
+        if let Some(seek) = &self.pending_seek {
+            ViewportStatus::Seeking(&seek.stats)
+        } else if !self.rendered.is_populated() {
+            ViewportStatus::Populating
+        } else {
+            ViewportStatus::Idle
+        }
+    }
+
+    pub fn populate_work(&mut self) {
+        self.rendered.populate_work();
+    }
+
+    pub fn seek_interrupt(&mut self) {
+        self.pending_seek = None;
+    }
+
+    pub fn start_seek_by_time(
+        &mut self,
+        engine: &Engine,
+        direction: Direction,
+        delta: Duration,
+    ) {
+        let Some(record) = self.anchor_record() else {
+            // If there are no records, there's nothing to do.
+            return;
+        };
+
+        let Ok(event) = record.event() else {
+            // If this was an error, we can't seek to a time from here.
+            // We could walk ahead to the next valid record, but so can the
+            // user.
+            return;
+        };
+
+        let end_time = match direction {
+            Direction::Forward => event.time + delta,
+            Direction::Backward => event.time - delta,
+        };
+
+        self.start_seek(engine, direction, SeekDestination::Time(end_time))
+    }
+
+    pub fn start_seek_for_search(
+        &mut self,
+        engine: &Engine,
+        direction: Direction,
+        regex: Regex,
+    ) {
+        self.start_seek(engine, direction, SeekDestination::Search(regex));
+    }
+
+    fn anchor_record(&self) -> Option<&MergeRecord> {
+        match &self.anchor {
+            Anchor::On { key, line: _ } => self.rendered.record_for_key(key),
+            Anchor::Empty => None,
+            Anchor::PinFront => self.rendered.record_first(),
+            Anchor::PinBack => self.rendered.record_last(),
+        }
+    }
+
+    fn start_seek(
+        &mut self,
+        engine: &Engine,
+        direction: Direction,
+        seek_to: SeekDestination,
+    ) {
+        // XXX-dap, if we're pinned to the back, this seems like it won't do
+        // what we want
+        // XXX-dap creating a new stepper here is a little unfortunate when
+        // we've got one sitting in the RenderedWindow that might already have a
+        // bunch of the data we want to search.  Maybe the solution here is to
+        // build a sort of MultiStepper where we hang onto one end while the
+        // other end keeps going.
+        let stepper = engine.stepper(self.filter.clone(), &self.anchor_cursor);
+        self.seek_interrupt();
+        self.pending_seek = Some(SeekOperation {
+            stepper,
+            direction,
+            stats: Default::default(),
+            seek_to,
+        });
+    }
+
+    pub fn seek_work(&mut self) {
+        let Some(seek) = &mut self.pending_seek else {
+            return;
+        };
+
+        // XXX-dap this could end up doing very little work
+        let Some(next) = seek.stepper.step(seek.direction) else {
+            if seek.stepper.is_exhausted(seek.direction) {
+                self.seek_finish(None);
+            }
+
+            return;
+        };
+
+        match &seek.seek_to {
+            SeekDestination::Time(target_time) => {
+                let Ok(event) = next.event() else {
+                    return;
+                };
+
+                let done = match seek.direction {
+                    Direction::Forward => event.time >= *target_time,
+                    Direction::Backward => event.time <= *target_time,
+                };
+
+                if done {
+                    self.seek_finish(Some(next));
+                }
+            }
+            SeekDestination::Search(regex) => {
+                // Render the record so we can see if the regex matches any of
+                // the rendered text.
+                // XXX-dap is this what it was doing before?  what if it gets
+                // line-wrapped?
+                let lines = format_record(&next, &self.render_options);
+                for line in lines {
+                    if regex.is_match(&line) {
+                        self.seek_finish(Some(next));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn seek_finish(&mut self, found: Option<MergeRecord>) {
+        let mut seek = self
+            .pending_seek
+            .take()
+            .expect("seek_finish() called with seek in progress");
+        let Some(found) = found else {
+            // When we don't find such a record, we don't change the anchor or
+            // the rendered window.
+            return;
+        };
+
+        // We found the record we're seeking to.  It's the last record seen by
+        // the stepper.  If this was a backwards search, then the stepper is
+        // pointed in the right spot already.  If it was a forwards search, then
+        // it's just past the record we wanted.  Roll it back to point at that.
+        if seek.direction == Direction::Forward {
+            // expect(): the stepper always keeps at least one previous record.
+            seek.stepper.step_backward().expect("can step backwards");
+        };
+        self.anchor_cursor = seek.stepper.cursor();
+        self.anchor = Anchor::On {
+            key: RecordKey {
+                source_id: found.source_id().clone(),
+                offset: found.offset(),
+            },
+            line: 0,
+        };
+        self.rendered =
+            RenderedWindow::new(seek.stepper, 256, 1024, self.render_options);
+    }
+
+    pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
+        self.seek_interrupt();
+        let stepper = engine.stepper(filter, &self.anchor_cursor);
+        self.rendered =
+            RenderedWindow::new(stepper, 256, 1024, self.render_options);
+    }
+
+    pub fn set_render_options(&mut self, render_options: RenderOpts) {
+        self.render_options = render_options;
+        self.rendered.set_render_options(render_options);
+    }
+}
+
+pub struct RenderedWindow {
+    render_options: RenderOpts,
+    records: Vec<WindowEntry>,
+    state: PopulateState,
+    materialized: Materialized,
+    ordinals: HashMap<(SourceId, DateTime<Utc>), u64>,
+    stepper: Stepper,
+}
+
+enum PopulateState {
+    Backward(u32, u32),
+    Forward(u32),
+    Done,
+}
+
+impl PopulateState {
+    fn initial(before: u32, after: u32) -> PopulateState {
+        if before > 0 {
+            PopulateState::Backward(before, after)
+        } else if after > 0 {
+            PopulateState::Forward(after)
+        } else {
+            PopulateState::Done
+        }
+    }
+
+    fn next(&self, exhausted: bool) -> PopulateState {
+        match *self {
+            PopulateState::Done => PopulateState::Done,
+            PopulateState::Backward(before, after) => {
+                assert!(before > 0);
+                if !exhausted && before > 1 {
+                    PopulateState::Backward(before - 1, after)
+                } else if after > 0 {
+                    PopulateState::Forward(after)
+                } else {
+                    PopulateState::Done
+                }
+            }
+            PopulateState::Forward(after) => {
+                if !exhausted && after > 1 {
+                    PopulateState::Forward(after - 1)
+                } else {
+                    PopulateState::Done
+                }
+            }
+        }
+    }
+}
+
+impl RenderedWindow {
+    pub fn new(
+        stepper: Stepper,
+        before: u32,
+        after: u32,
+        render_options: RenderOpts,
+    ) -> RenderedWindow {
+        assert!(after + before > 1); // XXX-dap
+        // unwrap(): we're not asking for that many records
+        let records =
+            Vec::with_capacity(usize::try_from(after + before).unwrap());
+        let events = Vec::with_capacity(records.capacity());
+        let formatted = Vec::new();
+        let event_for_line = Vec::new();
+        let first_line_for_event = Vec::with_capacity(records.capacity());
+        let ordinals: HashMap<(SourceId, DateTime<Utc>), u64> = HashMap::new();
+        let initial_state = PopulateState::initial(before, after);
+
+        RenderedWindow {
+            render_options,
+            records,
+            materialized: Materialized {
+                events,
+                formatted,
+                event_for_line,
+                first_line_for_event,
+                parse_stats: Default::default(),
+            },
+            ordinals,
+            stepper,
+            state: initial_state,
+        }
+    }
+
+    pub fn is_populated(&self) -> bool {
+        match self.state {
+            PopulateState::Done => true,
+            PopulateState::Backward(_, _) | PopulateState::Forward(_) => false,
+        }
+    }
+
+    pub fn populate_work(&mut self) {
+        // XXX-dap These steps might only do a tiny amount of work, or it might
+        // exhaust our whole budget.  We can't really tell.
+        let exhausted = match self.state {
+            PopulateState::Done => true,
+            PopulateState::Backward(remaining, _after) => {
+                assert!(remaining > 0);
+                let _event = self.stepper.step_backward();
+                self.stepper.is_exhausted(Direction::Backward)
+            }
+            PopulateState::Forward(remaining) => {
+                assert!(remaining > 0);
+                if let Some(record) = self.stepper.step_forward() {
+                    let entry = WindowEntry::new(record, &self.render_options);
+                    self.records.push(entry);
+                    self.render(self.records.len() - 1);
+                    false
+                } else {
+                    self.stepper.is_exhausted(Direction::Forward)
+                }
+            }
+        };
+
+        self.state = self.state.next(exhausted);
+    }
+
+    fn render(&mut self, idx: usize) {
+        let entry = &self.records[idx];
+        let materialized = &mut self.materialized;
+        let event_idx = EventIdx(materialized.events.len());
+        materialized
+            .first_line_for_event
+            .push(LineIdx(materialized.formatted.len()));
+        match entry.record.event() {
+            Ok(event) => {
+                let key = (entry.record.source_id().clone(), event.time);
+                let ordinal = *self.ordinals.entry(key.clone()).or_insert(0);
+                self.ordinals.insert(key, ordinal + 1);
+                let position = LogStreamPosition::new(
+                    entry.record.source_id().clone(),
+                    event.time,
+                    ordinal,
+                );
+                for line in &entry.lines {
+                    materialized.formatted.push(line.clone());
+                    materialized.event_for_line.push(event_idx);
+                }
+                materialized.events.push(Row::Event(EngineEvent {
+                    position,
+                    event: event.clone(),
+                }));
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                materialized.formatted.push(msg.clone());
+                materialized.event_for_line.push(event_idx);
+                materialized.events.push(Row::Error(msg));
+            }
+        }
+    }
+
+    pub fn set_render_options(&mut self, render_options: RenderOpts) {
+        self.render_options = render_options;
+        self.materialized = Materialized::new(self.records.len());
+        for i in 0..self.records.len() {
+            self.render(i);
+        }
+    }
+
+    pub fn materialized(&self) -> &Materialized {
+        &self.materialized
+    }
+
+    pub fn record_first(&self) -> Option<&MergeRecord> {
+        self.records.first().map(|w| &w.record)
+    }
+
+    pub fn record_last(&self) -> Option<&MergeRecord> {
+        self.records.last().map(|w| &w.record)
+    }
+
+    pub fn record_for_key(
+        &self,
+        record_key: &RecordKey,
+    ) -> Option<&MergeRecord> {
+        // XXX-dap this could be better
+        self.records.iter().find_map(|entry| {
+            (entry.key() == *record_key).then_some(&entry.record)
+        })
+    }
 }
 
 #[cfg(test)]

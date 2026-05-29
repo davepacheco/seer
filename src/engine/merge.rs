@@ -524,7 +524,7 @@ impl Stepper {
         self.step(Direction::Backward)
     }
 
-    fn step(&mut self, dir: Direction) -> Option<MergeRecord> {
+    pub fn step(&mut self, dir: Direction) -> Option<MergeRecord> {
         // Multi-source merge requires every source to be "ready" —
         // either holding a buffered head or at EOF in this direction
         // — before we can safely pick one to pop.  Without that, a

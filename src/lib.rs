@@ -17,6 +17,7 @@ pub mod stream;
 pub mod streamview;
 pub mod summary;
 pub mod test_fixtures;
+pub mod ui;
 pub mod view_target;
 
 pub use engine::{
