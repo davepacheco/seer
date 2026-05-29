@@ -16,17 +16,15 @@
 // use regex::Regex;
 // use std::collections::{HashMap, VecDeque};
 // use std::time::{Duration as StdDuration, Instant};
-// 
+//
 // struct StreamWindow {
 //     // defines what records we're looking at and what we're displaying
 //     filter: Filter,
 //     render_options: RenderOpts,
-// 
+//
 //     // stores the UI/operational state about whether we're in the middle of an
 //     // operation that will move the anchor
 //     long_seek_op: Option<LongSeekOperation>,
-// 
+//
 //     materialized: Materialized,
 // }
-
-

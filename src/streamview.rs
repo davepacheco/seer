@@ -1926,6 +1926,29 @@ impl Viewport {
         }
     }
 
+    /// Returns a [`Cursor`] that, when fed back into
+    /// [`Self::start_seek_to_cursor`], lands the viewport on the same record
+    /// the anchor is currently on.
+    ///
+    /// Returns `None` when the window is empty or the anchor isn't pinned to a
+    /// specific record.
+    pub fn cursor_at_anchor(&self) -> Option<Cursor> {
+        match &self.anchor {
+            Anchor::On { .. } => Some(self.anchor_cursor.clone()),
+            Anchor::Empty | Anchor::PinFront | Anchor::PinBack => None,
+        }
+    }
+
+    /// Returns the [`Cursor`] "just before" the record at window index
+    /// `idx` — i.e., a cursor such that `engine.stepper(filter, &cursor)`'s
+    /// next `step_forward` (under the same filter the window was built with)
+    /// returns that record.
+    pub fn cursor_before_record(&self, idx: usize) -> Option<Cursor> {
+        // XXX-dap I can't tell what kind of index this is or how we're going to
+        // compute it.
+        todo!(); // XXX-dap implement me
+    }
+
     pub fn status(&self) -> ViewportStatus<'_> {
         if let Some(seek) = &self.pending_seek {
             ViewportStatus::Seeking(&seek.stats)
@@ -1934,6 +1957,10 @@ impl Viewport {
         } else {
             ViewportStatus::Idle
         }
+    }
+
+    pub fn materialized(&self) -> &Materialized {
+        self.rendered.materialized()
     }
 
     /// Do a bounded amount of work trying to populate the current rendered

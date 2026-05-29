@@ -343,17 +343,17 @@ Current status:
 - I've implemented a Viewport that contains a RenderedWindow and supports seeking
 - In principle, I may need to rethink some of how seer stores its state since I may have moved some of it (the long ops, etc.) into the new Viewport
 - What remains is to identify the gaps between what this supports and what seer needs
-  - cursor_at_anchor() is used to:
+  - done: cursor_at_anchor() is used to:
     - compute byte offset into the merged stream
     - save session state
     - refresh tab after changing filter?  will this go away?
-  - materialized() -- trivial
-  - advance_time() -- I think that's easy?
-  - cursor_before_record(): given index -- used to create a bookmark.  I think this is doable?
+  - done: materialized() -- trivial
+  - done? advance_time() -- I think that's easy?
+  - done? scroll_lines()
+  - done: seek_to_cursor()
   - to figure out:
-    - scroll_lines()
-    - done: seek_to_cursor()
     - Tab::seek_active_to_end() / seek_active_to_start() / seek_active_to_cursor()
+    - cursor_before_record(): given index -- used to create a bookmark.  I think this is doable?
   - to re-review:
     - Seer's Tab::refresh() -- it depends on how this gets called.  This may get eliminated?
     - Seer's Tab::rerender() -- will this go away too?
