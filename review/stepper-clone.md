@@ -89,7 +89,7 @@ pair.
       accessor signatures from step 4 do not change; only the
       internal representation of `MergeRecord` does.
 
-- [ ] **6. Derive `Clone` on `Stepper`, `SourceWindow`,
+- [x] **6. Derive `Clone` on `Stepper`, `SourceWindow`,
       `BufferedRecord`.**  At this point every field is cheaply
       cloneable (`Arc`s, scalars, the existing `Filter: Clone`).
       Add a unit test that:
@@ -99,6 +99,14 @@ pair.
       - verifies the other copy still walks from its prior position
         with its prior filter, exercising the shared cache via
         `Arc::clone`s rather than re-fetching.
+
+      *Note*: `BufferedRecord` ended up not needing `Clone` —
+      with `SourceWindow` holding `Arc<BufferedRecord>`, cloning the
+      window bumps `Arc`s rather than the inner records.  Only
+      `Stepper` and `SourceWindow` got the derive.  The clone test
+      uses the `CountingSource` helper to confirm the inherited
+      buffer is reused (zero new source queries during the clone's
+      prefix walk) rather than re-fetched.
 
 - [ ] **7. Prototype the multi-stepper `StreamView` variant.**  With
       cheap clone in hand, sketch the multi-stepper version.  Shape

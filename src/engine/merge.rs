@@ -164,6 +164,13 @@ impl From<QueryRecord> for BufferedRecord {
 
 /// Per-source state for the merge stepper: a byte-offset cursor, paired
 /// lookahead/lookbehind buffers, and per-direction EOF flags.
+///
+/// Cloneable: every field is either `Copy` or backed by an `Arc`, so
+/// cloning duplicates the per-direction `VecDeque`s (each entry is an
+/// `Arc::clone`, not a deep copy of the underlying `BufferedRecord`)
+/// and shares the source.  The clone's position and EOF flags are
+/// independent of the original's from that point forward.
+#[derive(Clone)]
 struct SourceWindow {
     source: Arc<dyn Source>,
     /// Byte-offset cursor.  Forward step would read the record starting
@@ -394,6 +401,16 @@ impl Default for StepperOptions {
 /// underlying [`Source`] only as needed.  The set of sources is fixed at
 /// construction; filter changes are applied via [`Self::set_filter`]
 /// (which drops buffered records but retains per-source byte offsets).
+///
+/// `Stepper` is cheaply cloneable: the clone duplicates per-source
+/// `VecDeque`s of `Arc<BufferedRecord>`, sharing each cached entry's
+/// payload with the original via `Arc`.  From the point of clone the
+/// two steppers are independent — each has its own per-source
+/// position, EOF flags, and `Filter` — so one can step or
+/// [`Self::set_filter`] without affecting the other.  Independent
+/// fills past the shared cache hit the source separately and don't
+/// share their new entries.
+#[derive(Clone)]
 pub struct Stepper {
     sources: Vec<SourceWindow>,
     filter: Filter,
@@ -485,6 +502,10 @@ impl Stepper {
 
     /// Returns a snapshot of every source's current byte offset,
     /// suitable for serialization.
+    ///
+    /// On a cloned `Stepper`, this reflects that copy's per-source
+    /// position — the clone advances its own positions independently
+    /// of the original.
     pub fn cursor(&self) -> Cursor {
         Cursor::with(
             self.sources.iter().map(|s| (s.source.id().clone(), s.position)),
@@ -1150,6 +1171,60 @@ mod tests {
             }
         }
         assert_eq!(msgs, vec!["match-b", "match-a"]);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn clone_yields_independent_steppers_sharing_buffer() {
+        // Walk one step on `a` to prime its forward buffer, then
+        // clone.  `b` inherits the cached entries via `Arc::clone`.
+        // From there the two copies advance independently and a
+        // filter change on one does not perturb the other.  The
+        // sources are wrapped in a `CountingSource` so we can also
+        // confirm the clone's prefix walk hits the shared cache
+        // rather than the underlying source.
+        let dir = TestDir::new();
+        let p = dir.path().join("a.log");
+        write_fixture(&p, "x", &[10, 20, 30, 40, 50]);
+        let inner = FileSource::open(&p).unwrap();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let src: Arc<dyn Source> =
+            Arc::new(CountingSource { inner, count: counter.clone() });
+        let sources = vec![src];
+        let mut a = make_stepper(&sources);
+        // First step on `a` triggers one fill that pulls the whole
+        // file (5 < FETCH_BATCH_SIZE) into the forward buffer.
+        let r1 = a.step_forward().unwrap();
+        assert_eq!(r1.event().as_ref().unwrap().msg, "m10");
+        let queries_before_clone = counter.load(Ordering::SeqCst);
+
+        // Clone after the first step.  `b` should see m20..m50 from
+        // a's cached forward buffer (via Arc::clone) and replay m10
+        // backward from a's backward buffer.
+        let mut b = a.clone();
+        // Walking b forward to EOF must not trigger any new
+        // source queries: every record is already in the cached
+        // buffer.
+        let mut b_msgs = Vec::new();
+        while let Some(r) = b.step_forward() {
+            b_msgs.push(r.event().as_ref().unwrap().msg.clone());
+        }
+        assert_eq!(b_msgs, vec!["m20", "m30", "m40", "m50"]);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            queries_before_clone,
+            "b should walk entirely from the shared cache",
+        );
+
+        // Cursors reflect each copy's own progress.
+        assert_ne!(a.cursor(), b.cursor());
+
+        // Filter change on `a` clears a's buffers but leaves b
+        // untouched: `b` is already past EOF.
+        a.set_filter("msg=m40".parse().unwrap());
+        let r = a.step_forward().expect("a finds m40 under new filter");
+        assert_eq!(r.event().as_ref().unwrap().msg, "m40");
+        assert!(b.step_forward().is_none(), "b is still at EOF");
         dir.cleanup();
     }
 
