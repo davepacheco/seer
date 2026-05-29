@@ -496,7 +496,7 @@ fn emit_records_window(
 /// should construct a fresh stepper at the same cursor.  Used by
 /// [`emit_records_window`] to assemble `--before N`'s pre-cursor
 /// window.
-fn step_backward_n(stepper: &mut Stepper<'_>, n: usize) -> Vec<MergeRecord> {
+fn step_backward_n(stepper: &mut Stepper, n: usize) -> Vec<MergeRecord> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         match stepper.step_backward() {

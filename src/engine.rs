@@ -17,6 +17,7 @@ use crate::source::{FileSource, Source, SourceError};
 use camino::Utf8Path;
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 mod merge;
 
@@ -40,7 +41,7 @@ pub struct EngineEvent {
 /// Tracks the current set of sources and serves event queries.
 #[derive(Default)]
 pub struct Engine {
-    sources: Vec<Box<dyn Source>>,
+    sources: Vec<Arc<dyn Source>>,
 }
 
 impl Engine {
@@ -57,7 +58,7 @@ impl Engine {
     ) -> std::io::Result<SourceId> {
         let source = FileSource::open(path)?;
         let id = source.id().clone();
-        self.sources.push(Box::new(source));
+        self.sources.push(Arc::new(source));
         Ok(id)
     }
 
@@ -74,7 +75,7 @@ impl Engine {
     /// (which retains positions); changing the *source-id* filter
     /// requires building a fresh stepper, since the source set is
     /// fixed at construction.
-    pub fn stepper(&self, filter: Filter, cursor: &Cursor) -> Stepper<'_> {
+    pub fn stepper(&self, filter: Filter, cursor: &Cursor) -> Stepper {
         self.stepper_with(filter, cursor, StepperOptions::default())
     }
 
@@ -91,12 +92,12 @@ impl Engine {
         filter: Filter,
         cursor: &Cursor,
         options: StepperOptions,
-    ) -> Stepper<'_> {
-        let sources: Vec<&dyn Source> = self
+    ) -> Stepper {
+        let sources: Vec<Arc<dyn Source>> = self
             .sources
             .iter()
             .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| s.as_ref())
+            .map(Arc::clone)
             .collect();
         Stepper::with_options(sources, filter, cursor, options)
     }

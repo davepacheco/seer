@@ -39,7 +39,7 @@ pair.
       behavioral change.  Self-contained commit so any fallout is
       isolated.
 
-- [ ] **2. Hand sources out as `Arc<dyn Source>`.**  Change `Engine`'s
+- [x] **2. Hand sources out as `Arc<dyn Source>`.**  Change `Engine`'s
       source storage to `Vec<Arc<dyn Source>>`.  Update
       `Engine::stepper` / `Engine::stepper_with` to return `Stepper`
       (no lifetime parameter) and to clone the `Arc`s into the
@@ -47,11 +47,15 @@ pair.
       `seeit.rs`, `streamview.rs`, plus the tests in
       `engine/merge.rs` and `engine.rs`.
 
-- [ ] **3. Drop the lifetime from `Stepper` and `SourceWindow`.**
+- [x] **3. Drop the lifetime from `Stepper` and `SourceWindow`.**
       Replace `source: &'a dyn Source` with
       `source: Arc<dyn Source>`, delete the `'a` parameter, and
       remove the cached `source_id` field on `SourceWindow` —
       `source.id()` provides it.  Mostly mechanical once step 2 is in.
+
+      *Note*: steps 2 and 3 are mechanically inseparable (you cannot
+      keep the `'a` while moving `Engine` to `Arc<dyn Source>`); both
+      were landed in one commit.
 
 - [ ] **4. Migrate `MergeRecord` to getters and an `Arc<dyn Source>`.**
       Replace the `pub` fields with accessor methods:

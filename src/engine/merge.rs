@@ -127,9 +127,8 @@ impl From<QueryRecord> for BufferedRecord {
 
 /// Per-source state for the merge stepper: a byte-offset cursor, paired
 /// lookahead/lookbehind buffers, and per-direction EOF flags.
-struct SourceWindow<'a> {
-    source: &'a dyn Source,
-    source_id: SourceId,
+struct SourceWindow {
+    source: Arc<dyn Source>,
     /// Byte-offset cursor.  Forward step would read the record starting
     /// at `position`; backward step would read the record ending at
     /// `position`.
@@ -149,11 +148,10 @@ struct SourceWindow<'a> {
     backward_eof: bool,
 }
 
-impl<'a> SourceWindow<'a> {
-    fn new(source: &'a dyn Source, position: ByteOffset) -> Self {
+impl SourceWindow {
+    fn new(source: Arc<dyn Source>, position: ByteOffset) -> Self {
         Self {
             source,
-            source_id: source.id().clone(),
             position,
             forward_buf: VecDeque::new(),
             backward_buf: VecDeque::new(),
@@ -302,7 +300,7 @@ impl<'a> SourceWindow<'a> {
             self.buf_mut(opp).pop_back();
         }
         MergeRecord {
-            source_id: self.source_id.clone(),
+            source_id: self.source.id().clone(),
             offset: r.offset,
             length: r.length,
             event: r.event,
@@ -360,8 +358,8 @@ impl Default for StepperOptions {
 /// underlying [`Source`] only as needed.  The set of sources is fixed at
 /// construction; filter changes are applied via [`Self::set_filter`]
 /// (which drops buffered records but retains per-source byte offsets).
-pub struct Stepper<'a> {
-    sources: Vec<SourceWindow<'a>>,
+pub struct Stepper {
+    sources: Vec<SourceWindow>,
     filter: Filter,
     batch_size: usize,
     /// When `Some(n)`, each [`SourceWindow::fill`] examines at most
@@ -377,13 +375,13 @@ pub struct Stepper<'a> {
     walked_bytes: ByteLen,
 }
 
-impl<'a> Stepper<'a> {
+impl Stepper {
     /// Internal constructor with default [`StepperOptions`].  Used by
     /// this module's own tests; public callers go through
     /// [`super::Engine::stepper`].
     #[cfg(test)]
     fn new(
-        sources: Vec<&'a dyn Source>,
+        sources: Vec<Arc<dyn Source>>,
         filter: Filter,
         cursor: &Cursor,
     ) -> Self {
@@ -394,7 +392,7 @@ impl<'a> Stepper<'a> {
     /// per-fill batch size and records-to-scan budget.  Public callers go
     /// through [`super::Engine::stepper_with`].
     pub(super) fn with_options(
-        sources: Vec<&'a dyn Source>,
+        sources: Vec<Arc<dyn Source>>,
         filter: Filter,
         cursor: &Cursor,
         options: StepperOptions,
@@ -453,7 +451,7 @@ impl<'a> Stepper<'a> {
     /// suitable for serialization.
     pub fn cursor(&self) -> Cursor {
         Cursor::with(
-            self.sources.iter().map(|s| (s.source_id.clone(), s.position)),
+            self.sources.iter().map(|s| (s.source.id().clone(), s.position)),
         )
     }
 
@@ -533,7 +531,7 @@ impl<'a> Stepper<'a> {
 /// — so backward stepping over a run of equal-timestamped events from
 /// multiple sources retraces the forward emit order in reverse.  Among
 /// multiple error heads the same direction-aware tiebreak applies.
-fn pick(sources: &[SourceWindow<'_>], direction: Direction) -> Option<usize> {
+fn pick(sources: &[SourceWindow], direction: Direction) -> Option<usize> {
     let mut best: Option<usize> = None;
     let mut best_is_err = false;
     let mut best_time: Option<DateTime<Utc>> = None;
@@ -598,19 +596,17 @@ mod tests {
     }
 
     /// Builds a [`Stepper`] over the given sources, all starting at
-    /// byte zero with the default filter.  Returned alongside the
-    /// boxed sources so the borrow checker is happy: the stepper
-    /// borrows from the slice we keep alive in the caller.
-    fn make_stepper<'a>(sources: &'a [Box<dyn Source>]) -> Stepper<'a> {
-        let refs: Vec<&dyn Source> =
-            sources.iter().map(|s| s.as_ref()).collect();
-        Stepper::new(refs, Filter::default(), &Cursor::new())
+    /// byte zero with the default filter.  Clones the `Arc`s into the
+    /// stepper, so the caller's slice can be reused for `id()`
+    /// lookups while the stepper runs.
+    fn make_stepper(sources: &[Arc<dyn Source>]) -> Stepper {
+        Stepper::new(sources.to_vec(), Filter::default(), &Cursor::new())
     }
 
     /// Drains a stepper forward and returns just the parsed event
     /// messages, panicking on any error item.  Used by tests that
     /// build error-free fixtures.
-    fn forward_msgs(stepper: &mut Stepper<'_>) -> Vec<String> {
+    fn forward_msgs(stepper: &mut Stepper) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(r) = stepper.step_forward() {
             match r.event {
@@ -622,7 +618,7 @@ mod tests {
     }
 
     /// Symmetric: drains a stepper backward.
-    fn backward_msgs(stepper: &mut Stepper<'_>) -> Vec<String> {
+    fn backward_msgs(stepper: &mut Stepper) -> Vec<String> {
         let mut out = Vec::new();
         while let Some(r) = stepper.step_backward() {
             match r.event {
@@ -636,7 +632,7 @@ mod tests {
     #[test]
     fn empty_engine_yields_no_steps() {
         // No sources at all: both directions return None immediately.
-        let sources: Vec<Box<dyn Source>> = Vec::new();
+        let sources: Vec<Arc<dyn Source>> = Vec::new();
         let mut stepper = make_stepper(&sources);
         assert!(stepper.step_forward().is_none());
         assert!(stepper.step_backward().is_none());
@@ -648,7 +644,7 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("empty.log");
         std::fs::File::create(&p).unwrap();
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         assert!(stepper.step_forward().is_none());
@@ -663,7 +659,7 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20, 30]);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m20", "m30"]);
@@ -679,7 +675,7 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20]);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         assert!(stepper.step_backward().is_none());
@@ -693,7 +689,7 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20, 30, 40]);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let mut fwd = Vec::new();
@@ -724,8 +720,8 @@ mod tests {
         let b = dir.path().join("b.log");
         write_fixture(&a, "x", &[10, 30]);
         write_fixture(&b, "x", &[20, 40]);
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
         let sources = vec![sa, sb];
         let mut stepper = make_stepper(&sources);
         assert_eq!(
@@ -742,8 +738,8 @@ mod tests {
         let b = dir.path().join("b.log");
         write_fixture(&a, "x", &[10, 30]);
         write_fixture(&b, "x", &[20, 40]);
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
         let sources = vec![sa, sb];
         let mut stepper = make_stepper(&sources);
         // Drive forward to the end first.
@@ -764,8 +760,8 @@ mod tests {
         let b = dir.path().join("b.log");
         append_bunyan_at(&a, "x", t(50), "a-tie");
         append_bunyan_at(&b, "x", t(50), "b-tie");
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
         let sources = vec![sa, sb];
         let mut stepper = make_stepper(&sources);
         assert_eq!(forward_msgs(&mut stepper), vec!["a-tie", "b-tie"]);
@@ -785,9 +781,9 @@ mod tests {
         append_bunyan_at(&a, "x", t(50), "tie-a");
         append_bunyan_at(&b, "x", t(50), "tie-b");
         append_bunyan_at(&c, "x", t(50), "tie-c");
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
-        let sc: Box<dyn Source> = Box::new(FileSource::open(&c).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
+        let sc: Arc<dyn Source> = Arc::new(FileSource::open(&c).unwrap());
         let sources = vec![sa, sb, sc];
         let mut stepper = make_stepper(&sources);
         let fwd = forward_msgs(&mut stepper);
@@ -806,8 +802,8 @@ mod tests {
         let b = dir.path().join("b.log");
         write_fixture(&a, "x", &[10, 30, 50]);
         write_fixture(&b, "x", &[20, 40, 60]);
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
         let sources = vec![sa, sb];
         let mut stepper = make_stepper(&sources);
         // Consume the first three events: m10, m20, m30.
@@ -816,9 +812,8 @@ mod tests {
         }
         let snapshot = stepper.cursor();
         // Build a brand-new stepper at that cursor.
-        let refs: Vec<&dyn Source> =
-            sources.iter().map(|s| s.as_ref()).collect();
-        let mut resumed = Stepper::new(refs, Filter::default(), &snapshot);
+        let mut resumed =
+            Stepper::new(sources.clone(), Filter::default(), &snapshot);
         assert_eq!(forward_msgs(&mut resumed), vec!["m40", "m50", "m60"],);
         dir.cleanup();
     }
@@ -830,12 +825,10 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20]);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
-        let sources = [src];
-        let refs: Vec<&dyn Source> =
-            sources.iter().map(|s| s.as_ref()).collect();
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
+        let sources = vec![src];
         let mut stepper =
-            Stepper::new(refs, Filter::default(), &Cursor::default());
+            Stepper::new(sources, Filter::default(), &Cursor::default());
         assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m20"]);
         dir.cleanup();
     }
@@ -848,13 +841,11 @@ mod tests {
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20, 30]);
         let len = std::fs::metadata(&p).unwrap().len();
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
-        let sources = [src];
-        let id = sources[0].id().clone();
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
+        let id = src.id().clone();
+        let sources = vec![src];
         let cursor = Cursor::with([(id, ByteOffset::from(len))]);
-        let refs: Vec<&dyn Source> =
-            sources.iter().map(|s| s.as_ref()).collect();
-        let mut stepper = Stepper::new(refs, Filter::default(), &cursor);
+        let mut stepper = Stepper::new(sources, Filter::default(), &cursor);
         assert!(stepper.step_forward().is_none());
         assert_eq!(backward_msgs(&mut stepper), vec!["m30", "m20", "m10"],);
         dir.cleanup();
@@ -884,7 +875,7 @@ mod tests {
         for s in &[10i64, 20, 30, 40] {
             append_bunyan_at(&p, "x", t(*s), &format!("m{s}"));
         }
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         // Consume m10 and m20.
@@ -912,8 +903,8 @@ mod tests {
         let b = dir.path().join("b.log");
         write_fixture(&a, "x", &[10, 30]);
         write_fixture(&b, "x", &[20, 40]);
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b).unwrap());
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b).unwrap());
         let id_b = sb.id().clone();
         let sources = [sa, sb];
         // Build an Engine-style filter directly; the stepper applies
@@ -923,12 +914,12 @@ mod tests {
             format!("source_id!~{}", regex::escape(id_b.as_ref()))
                 .parse()
                 .unwrap();
-        let refs: Vec<&dyn Source> = sources
+        let selected: Vec<Arc<dyn Source>> = sources
             .iter()
             .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| s.as_ref())
+            .map(Arc::clone)
             .collect();
-        let mut stepper = Stepper::new(refs, filter, &Cursor::new());
+        let mut stepper = Stepper::new(selected, filter, &Cursor::new());
         assert_eq!(forward_msgs(&mut stepper), vec!["m10", "m30"]);
         dir.cleanup();
     }
@@ -942,7 +933,7 @@ mod tests {
         append_bunyan_at(&p, "x", t(10), "m10");
         append_raw(&p, "not json");
         append_bunyan_at(&p, "x", t(20), "m20");
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let r1 = stepper.step_forward().unwrap();
@@ -964,7 +955,7 @@ mod tests {
         append_bunyan_at(&p, "x", t(10), "m10");
         append_raw(&p, "not json");
         append_bunyan_at(&p, "x", t(20), "m20");
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         // Drain forward.
@@ -995,8 +986,8 @@ mod tests {
         write_fixture(&p, "x", &secs);
         let inner = FileSource::open(&p).unwrap();
         let counter = Arc::new(AtomicUsize::new(0));
-        let src: Box<dyn Source> =
-            Box::new(CountingSource { inner, count: counter.clone() });
+        let src: Arc<dyn Source> =
+            Arc::new(CountingSource { inner, count: counter.clone() });
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let msgs = forward_msgs(&mut stepper);
@@ -1024,7 +1015,7 @@ mod tests {
         let n = (BUFFER_LIMIT + 10) as i64;
         let secs: Vec<i64> = (0..n).collect();
         write_fixture(&p, "x", &secs);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         // Forward all the way.
@@ -1045,7 +1036,7 @@ mod tests {
         let dir = TestDir::new();
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20]);
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         forward_msgs(&mut stepper);
@@ -1066,7 +1057,7 @@ mod tests {
         let p = dir.path().join("a.log");
         write_fixture(&p, "x", &[10, 20, 30]);
         let len = std::fs::metadata(&p).unwrap().len();
-        let src: Box<dyn Source> = Box::new(FileSource::open(&p).unwrap());
+        let src: Arc<dyn Source> = Arc::new(FileSource::open(&p).unwrap());
         let sources = vec![src];
         let mut stepper = make_stepper(&sources);
         let mut expected_offset = ByteOffset::ZERO;
@@ -1098,14 +1089,12 @@ mod tests {
             append_bunyan_at(&b_path, "x", t(i), "noise");
         }
         append_bunyan_at(&b_path, "x", t(21), "match-b");
-        let sa: Box<dyn Source> = Box::new(FileSource::open(&a_path).unwrap());
-        let sb: Box<dyn Source> = Box::new(FileSource::open(&b_path).unwrap());
-        let sources = [sa, sb];
+        let sa: Arc<dyn Source> = Arc::new(FileSource::open(&a_path).unwrap());
+        let sb: Arc<dyn Source> = Arc::new(FileSource::open(&b_path).unwrap());
+        let sources = vec![sa, sb];
         let filter: Filter = "msg!=noise".parse().unwrap();
-        let refs: Vec<&dyn Source> =
-            sources.iter().map(|s| s.as_ref()).collect();
         let mut stepper = Stepper::with_options(
-            refs,
+            sources,
             filter,
             &Cursor::new(),
             StepperOptions {
