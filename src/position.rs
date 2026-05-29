@@ -13,7 +13,8 @@ use chrono::{DateTime, Utc};
 use derive_more::{AsRef, Display, From};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Add, AddAssign, Sub};
 
 /// Identifier for a source.
@@ -191,20 +192,19 @@ impl Sub<ByteLen> for ByteOffset {
 /// [`ByteOffset::ZERO`]" mean the same thing — both place the stepper
 /// at the start of that source.  The map shape is *not* normalized on
 /// construction (we'd have to know the full engine source set to do
-/// that, which the type doesn't), so two cursors that produce identical
-/// navigation behavior can still differ as `BTreeMap`s and therefore
-/// compare unequal under the derived [`PartialEq`].
+/// that, which the type doesn't), so two cursors that describe the
+/// same logical position can differ as `BTreeMap`s.  [`PartialEq`]
+/// and [`PartialOrd`] honor that equivalence: missing entries are
+/// treated as [`ByteOffset::ZERO`] on both sides, so `{s: 0}` and
+/// `{}` compare equal.
 ///
-/// Today nothing observable depends on this distinction: bookmark
-/// dedup and session save/load all round-trip the exact map the
-/// caller built.  But a future caller comparing two cursors for
-/// "do they refer to the same logical position?" must walk the
-/// shared key set with [`Self::get`] (which returns `None` →
-/// `ByteOffset::ZERO`) rather than relying on `==`, or normalize both
-/// against a shared source set first.
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
-)]
+/// [`PartialOrd`] is a *partial* order — the product order on the
+/// union of source ids.  Two cursors are comparable only when every
+/// source agrees on the direction; mixed directions (A ahead of B on
+/// one source and behind on another) return `None`.  That is also why
+/// there is no `Ord` impl: cursors don't have a meaningful total
+/// order across distinct streams.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Cursor {
     offsets: BTreeMap<SourceId, ByteOffset>,
@@ -252,15 +252,38 @@ impl Cursor {
     }
 }
 
-// XXX-dap TODO-test implement tests
-impl PartialOrd for Cursor {
-    fn partial_cmp(&self, _other: &Self) -> Option<std::cmp::Ordering> {
-        // XXX-dap TODO implement
-        todo!();
+impl PartialEq for Cursor {
+    fn eq(&self, other: &Self) -> bool {
+        self.partial_cmp(other) == Some(Ordering::Equal)
     }
 }
 
-// XXX-dap implement PartialEq correctly
+impl Eq for Cursor {}
+
+impl PartialOrd for Cursor {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Product order on the union of source ids, with missing
+        // entries treated as `ByteOffset::ZERO`.  Two cursors are
+        // comparable only when every source agrees on the direction;
+        // mixed directions yield `None`.
+        let keys: BTreeSet<&SourceId> =
+            self.offsets.keys().chain(other.offsets.keys()).collect();
+        let mut result = Ordering::Equal;
+        for k in keys {
+            let a = self.get(k).unwrap_or(ByteOffset::ZERO);
+            let b = other.get(k).unwrap_or(ByteOffset::ZERO);
+            match (result, a.cmp(&b)) {
+                (_, Ordering::Equal) => {}
+                (Ordering::Equal, c) => result = c,
+                (Ordering::Less, Ordering::Less)
+                | (Ordering::Greater, Ordering::Greater) => {}
+                (Ordering::Less, Ordering::Greater)
+                | (Ordering::Greater, Ordering::Less) => return None,
+            }
+        }
+        Some(result)
+    }
+}
 
 /// Position within a log stream — a stable anchor that survives filter
 /// changes.
@@ -316,5 +339,134 @@ impl LogStreamPosition {
     /// position.
     pub fn ordinal_within_time(&self) -> u64 {
         self.ordinal_within_time
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sid(s: &str) -> SourceId {
+        SourceId::from(s.to_string())
+    }
+
+    fn off(n: u64) -> ByteOffset {
+        ByteOffset::from(n)
+    }
+
+    #[test]
+    fn cursor_eq_empty() {
+        assert_eq!(Cursor::new(), Cursor::default());
+        assert_eq!(Cursor::new(), Cursor::with([]));
+    }
+
+    #[test]
+    fn cursor_eq_absent_is_zero() {
+        // A source mapped to ZERO is equivalent to that source being
+        // absent from the map.
+        let with_zero = Cursor::with([(sid("a"), ByteOffset::ZERO)]);
+        assert_eq!(with_zero, Cursor::new());
+        assert_eq!(Cursor::new(), with_zero);
+
+        let mixed =
+            Cursor::with([(sid("a"), off(5)), (sid("b"), ByteOffset::ZERO)]);
+        let just_a = Cursor::with([(sid("a"), off(5))]);
+        assert_eq!(mixed, just_a);
+    }
+
+    #[test]
+    fn cursor_eq_distinct_offsets() {
+        let a = Cursor::with([(sid("a"), off(5))]);
+        let b = Cursor::with([(sid("a"), off(6))]);
+        assert_ne!(a, b);
+
+        let with_extra = Cursor::with([(sid("a"), off(5)), (sid("b"), off(1))]);
+        assert_ne!(a, with_extra);
+    }
+
+    #[test]
+    fn cursor_partial_cmp_equal() {
+        let a = Cursor::with([(sid("a"), off(5)), (sid("b"), off(7))]);
+        let b = a.clone();
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Equal));
+
+        // Equivalent under absent-vs-zero.
+        let c = Cursor::with([
+            (sid("a"), off(5)),
+            (sid("b"), off(7)),
+            (sid("c"), ByteOffset::ZERO),
+        ]);
+        assert_eq!(a.partial_cmp(&c), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn cursor_partial_cmp_less_and_greater() {
+        let a = Cursor::with([(sid("a"), off(1)), (sid("b"), off(2))]);
+        let b = Cursor::with([(sid("a"), off(3)), (sid("b"), off(4))]);
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
+
+        // Equal on one source, less on another → Less overall.
+        let c = Cursor::with([(sid("a"), off(1)), (sid("b"), off(4))]);
+        assert_eq!(a.partial_cmp(&c), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn cursor_partial_cmp_incomparable() {
+        // Mixed directions across sources → None.
+        let a = Cursor::with([(sid("a"), off(1)), (sid("b"), off(5))]);
+        let b = Cursor::with([(sid("a"), off(2)), (sid("b"), off(4))]);
+        assert_eq!(a.partial_cmp(&b), None);
+        assert_eq!(b.partial_cmp(&a), None);
+    }
+
+    #[test]
+    fn cursor_partial_cmp_missing_keys() {
+        // A source missing on one side counts as ZERO there.
+        let empty = Cursor::new();
+        let one = Cursor::with([(sid("a"), off(5))]);
+        assert_eq!(empty.partial_cmp(&one), Some(Ordering::Less));
+        assert_eq!(one.partial_cmp(&empty), Some(Ordering::Greater));
+
+        // Less on the shared key, missing (i.e. ZERO) vs non-zero on
+        // another: still ordered, in the same direction.
+        let a = Cursor::with([(sid("a"), off(1))]);
+        let b = Cursor::with([(sid("a"), off(3)), (sid("b"), off(2))]);
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+
+        // Less on the shared key but greater on the missing-vs-present
+        // key → incomparable.
+        let c = Cursor::with([(sid("a"), off(1)), (sid("b"), off(2))]);
+        let d = Cursor::with([(sid("a"), off(3))]);
+        assert_eq!(c.partial_cmp(&d), None);
+    }
+
+    #[test]
+    fn cursor_eq_matches_partial_cmp() {
+        // `eq` and `partial_cmp == Some(Equal)` must agree, per the
+        // PartialEq/PartialOrd contract.
+        let cases = [
+            (Cursor::new(), Cursor::new()),
+            (
+                Cursor::with([(sid("a"), off(5))]),
+                Cursor::with([
+                    (sid("a"), off(5)),
+                    (sid("b"), ByteOffset::ZERO),
+                ]),
+            ),
+            (
+                Cursor::with([(sid("a"), off(5))]),
+                Cursor::with([(sid("a"), off(6))]),
+            ),
+        ];
+        for (a, b) in &cases {
+            assert_eq!(
+                a == b,
+                a.partial_cmp(b) == Some(Ordering::Equal),
+                "eq/partial_cmp disagree on {:?} vs {:?}",
+                a,
+                b,
+            );
+        }
     }
 }
