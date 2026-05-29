@@ -473,24 +473,24 @@ impl<'a> Stepper<'a> {
         // Multi-source merge requires every source to be "ready" —
         // either holding a buffered head or at EOF in this direction
         // — before we can safely pick one to pop.  Without that, a
-        // selective filter under a bounded records-to-scan budget can leave one
-        // source mid-scan while another has surfaced its next match;
-        // popping that match would emit a record out of time order
+        // selective filter under a bounded records-to-scan budget can
+        // leave one source mid-scan while another has surfaced its
+        // next match; popping that match would emit out of time order
         // (the still-scanning source could turn up a record with a
-        // closer time on a later fill).  Keep filling non-ready
-        // sources until every one of them either has a head or has
-        // hit its direction's edge.
+        // closer time on a later fill).
         //
-        // `progressed` tracks whether a fill in this pass actually
-        // made a previously non-ready source ready (surfaced a record
-        // or hit EOF), not merely that fill was called.  With that,
-        // the loop's single exit covers both natural cases: every
-        // source was already ready (no fills attempted, progressed
-        // stays false), or every fill walked without finding a match
-        // and without hitting EOF — only possible under a bounded records-to-scan budget
-        // (e.g., `max_records_to_scan_per_fill` exhausted before the scan
-        // caught up).  In the latter case we yield to the caller,
-        // who can drive another step to resume the scan.
+        // The loop refills non-ready sources until every one of them
+        // has a head or has hit its direction's edge, or until no
+        // source progressed in an iteration (only possible under a
+        // records-to-scan budget that expired without surfacing a
+        // match).  `progressed` tracks whether a fill actually made a
+        // previously non-ready source ready (surfaced a record or hit
+        // EOF), not merely that fill was called.  When the loop exits
+        // with some sources still mid-scan, the post-loop check
+        // refuses to pick and returns `None`; the caller can drive
+        // another step to resume the scan, and distinguishes this
+        // budget-suspended `None` from true exhaustion via
+        // [`Self::is_exhausted`].
         loop {
             let mut progressed = false;
             for s in &mut self.sources {
@@ -511,6 +511,9 @@ impl<'a> Stepper<'a> {
             if !progressed {
                 break;
             }
+        }
+        if !self.sources.iter().all(|s| !s.buf(dir).is_empty() || s.eof(dir)) {
+            return None;
         }
         let idx = pick(&self.sources, dir)?;
         Some(self.sources[idx].pop(dir))
@@ -1072,6 +1075,56 @@ mod tests {
             expected_offset += r.length;
         }
         assert_eq!(expected_offset.get(), len);
+        dir.cleanup();
+    }
+
+    #[test]
+    fn budgeted_step_preserves_time_order_with_mid_scan_sibling() {
+        // Regression test: with `max_records_to_scan_per_fill` set,
+        // a `step()` that surfaces a head from source A while
+        // source B is still mid-scan must not emit A's record —
+        // B might surface an earlier record on a later fill.
+        //
+        // A holds one match at t=200; B holds 20 noise records
+        // (filtered out) at t=1..=20 followed by one match at
+        // t=21.  Budget of 5 records per fill means B needs
+        // several fills to reach its match.  Correct order is
+        // B's match first (t=21), then A's match (t=200).
+        let dir = TestDir::new();
+        let a_path = dir.path().join("a.log");
+        let b_path = dir.path().join("b.log");
+        append_bunyan_at(&a_path, "x", t(200), "match-a");
+        for i in 1..=20 {
+            append_bunyan_at(&b_path, "x", t(i), "noise");
+        }
+        append_bunyan_at(&b_path, "x", t(21), "match-b");
+        let sa: Box<dyn Source> = Box::new(FileSource::open(&a_path).unwrap());
+        let sb: Box<dyn Source> = Box::new(FileSource::open(&b_path).unwrap());
+        let sources = [sa, sb];
+        let filter: Filter = "msg!=noise".parse().unwrap();
+        let refs: Vec<&dyn Source> =
+            sources.iter().map(|s| s.as_ref()).collect();
+        let mut stepper = Stepper::with_options(
+            refs,
+            filter,
+            &Cursor::new(),
+            StepperOptions {
+                batch_size: FETCH_BATCH_SIZE,
+                max_records_to_scan_per_fill: Some(5),
+            },
+        );
+        let mut msgs = Vec::new();
+        loop {
+            match stepper.step_forward() {
+                Some(r) => msgs.push(r.event.unwrap().msg),
+                None => {
+                    if stepper.is_exhausted(Direction::Forward) {
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(msgs, vec!["match-b", "match-a"]);
         dir.cleanup();
     }
 
