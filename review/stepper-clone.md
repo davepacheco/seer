@@ -79,7 +79,7 @@ pair.
       diff smaller and separates API migration from the
       perf-affecting representation change.
 
-- [ ] **5. Share the buffered entries via `Arc<BufferedRecord>`.**
+- [x] **5. Share the buffered entries via `Arc<BufferedRecord>`.**
       Change `SourceWindow`'s two `VecDeque<BufferedRecord>` to
       `VecDeque<Arc<BufferedRecord>>`.  `fill()` wraps each
       `QueryRecord` in an `Arc`.  `pop()` becomes `Arc::clone` into

@@ -64,30 +64,21 @@ const BUFFER_LIMIT: usize = 256;
 /// fails (e.g. the file was deleted out from under us); a real
 /// on-disk record always has positive length.
 ///
-/// Fields are accessed through getters rather than directly so the
-/// internal representation can share buffered storage between cloned
-/// [`Stepper`]s in a later refactor.  Cloning a `MergeRecord` is
-/// cheap on the source side (the source is held by `Arc`) but still
-/// deep-copies the inline `event` / `raw` fields; that becomes cheap
-/// in the follow-up that moves the inline fields behind an
-/// `Arc<BufferedRecord>`.
+/// The record's payload is held behind an `Arc<BufferedRecord>` shared
+/// with the originating [`SourceWindow`]'s buffer, so cloning a
+/// `MergeRecord` (or cloning the parent [`Stepper`]) is cheap: just
+/// two `Arc` clones, no deep copy of the inner `Event` or raw bytes.
+/// Accessors take the place of `pub` fields so the indirection stays
+/// an implementation detail.
 #[derive(Debug, Clone)]
 pub struct MergeRecord {
     /// source the record came from; carried so [`Self::source_id`]
     /// can route through the source's own `id()` accessor without
-    /// duplicating the id in this struct
+    /// duplicating the id in this struct or in [`BufferedRecord`]
     source: Arc<dyn Source>,
-    /// byte offset in `source` where the record begins
-    offset: ByteOffset,
-    /// length of the record in bytes (including the trailing newline,
-    /// if present); [`ByteLen::ZERO`] for synthetic error placeholders
-    length: ByteLen,
-    /// parsed event when the line was valid; otherwise the per-line
-    /// parse or I/O error
-    event: Result<Event, MergeError>,
-    /// the record's bytes as they appear in the source, minus any
-    /// trailing line terminator; empty for synthetic error placeholders
-    raw: String,
+    /// the record's content, shared with the originating
+    /// [`SourceWindow`]'s lookahead / lookbehind buffer
+    buffered: Arc<BufferedRecord>,
 }
 
 impl MergeRecord {
@@ -98,7 +89,7 @@ impl MergeRecord {
 
     /// Returns the byte offset in the source where this record begins.
     pub fn offset(&self) -> ByteOffset {
-        self.offset
+        self.buffered.offset
     }
 
     /// Returns the length of this record in bytes, including the
@@ -106,20 +97,20 @@ impl MergeRecord {
     /// placeholder emitted when the storage layer's `query` itself
     /// fails.
     pub fn length(&self) -> ByteLen {
-        self.length
+        self.buffered.length
     }
 
     /// Returns the parsed event, or the per-line parse / I/O error
     /// surfaced inline by the merge layer.
     pub fn event(&self) -> &Result<Event, MergeError> {
-        &self.event
+        &self.buffered.event
     }
 
     /// Returns the record's bytes as they appear in the source, minus
     /// any trailing line terminator.  Empty for the synthetic error
     /// placeholder.
     pub fn raw(&self) -> &str {
-        &self.raw
+        &self.buffered.raw
     }
 }
 
@@ -145,10 +136,13 @@ enum EofMark {
     Cleared,
 }
 
-/// Internal cloneable buffer entry — same fields as [`MergeRecord`] but
-/// without the per-record `source_id` (it's a property of the owning
-/// [`SourceWindow`]).
-#[derive(Debug, Clone)]
+/// Internal buffer entry — same fields as [`MergeRecord`] but without
+/// the per-record source (it's a property of the owning
+/// [`SourceWindow`]).  Held inside an `Arc` in the window's lookahead
+/// and lookbehind buffers and shared with each emitted
+/// [`MergeRecord`], so a single entry is never deep-cloned: an `Arc`
+/// is bumped instead.
+#[derive(Debug)]
 struct BufferedRecord {
     offset: ByteOffset,
     length: ByteLen,
@@ -177,13 +171,15 @@ struct SourceWindow {
     /// `position`.
     position: ByteOffset,
     /// Records starting at or after `position`, earliest-first.  When
-    /// non-empty, `forward_buf.front().offset == position`.
-    forward_buf: VecDeque<BufferedRecord>,
+    /// non-empty, `forward_buf.front().offset == position`.  Entries
+    /// are shared with the [`MergeRecord`]s emitted by `pop` and with
+    /// cloned [`Stepper`]s' opposite-direction buffers via `Arc`.
+    forward_buf: VecDeque<Arc<BufferedRecord>>,
     /// Records ending at or before `position`, most-recent-first.  When
     /// non-empty,
     /// `backward_buf.front().offset + backward_buf.front().length ==
     /// position`.
-    backward_buf: VecDeque<BufferedRecord>,
+    backward_buf: VecDeque<Arc<BufferedRecord>>,
     /// Source has no more records past the cached forward window.
     /// Cleared whenever cached forward records are dropped.
     forward_eof: bool,
@@ -203,14 +199,17 @@ impl SourceWindow {
         }
     }
 
-    fn buf(&self, dir: Direction) -> &VecDeque<BufferedRecord> {
+    fn buf(&self, dir: Direction) -> &VecDeque<Arc<BufferedRecord>> {
         match dir {
             Direction::Forward => &self.forward_buf,
             Direction::Backward => &self.backward_buf,
         }
     }
 
-    fn buf_mut(&mut self, dir: Direction) -> &mut VecDeque<BufferedRecord> {
+    fn buf_mut(
+        &mut self,
+        dir: Direction,
+    ) -> &mut VecDeque<Arc<BufferedRecord>> {
         match dir {
             Direction::Forward => &mut self.forward_buf,
             Direction::Backward => &mut self.backward_buf,
@@ -298,7 +297,7 @@ impl SourceWindow {
                 }
                 let buf = self.buf_mut(dir);
                 for r in batch.records {
-                    buf.push_back(BufferedRecord::from(r));
+                    buf.push_back(Arc::new(BufferedRecord::from(r)));
                 }
                 walked
             }
@@ -308,14 +307,14 @@ impl SourceWindow {
                 // shows up in the merged stream the same as a per-line
                 // parse error, then mark the direction exhausted to
                 // avoid hammering the failed fetch.
-                let synth = BufferedRecord {
+                let synth = Arc::new(BufferedRecord {
                     offset: self.position,
                     length: ByteLen::ZERO,
                     event: Err(MergeError::from(Arc::new(SourceError::from(
                         e,
                     )))),
                     raw: String::new(),
-                };
+                });
                 self.buf_mut(dir).push_back(synth);
                 self.set_eof(dir, EofMark::Reached);
                 ByteLen::ZERO
@@ -333,7 +332,7 @@ impl SourceWindow {
             Direction::Backward => r.offset,
         };
         let opp = opposite(dir);
-        self.buf_mut(opp).push_front(r.clone());
+        self.buf_mut(opp).push_front(Arc::clone(&r));
         // Stepping in `dir` exposes new ground in the opposite
         // direction, so any prior "exhausted" determination there is
         // stale.  Trimming below would clear it again; we set it once
@@ -342,13 +341,7 @@ impl SourceWindow {
         while self.buf(opp).len() > BUFFER_LIMIT {
             self.buf_mut(opp).pop_back();
         }
-        MergeRecord {
-            source: Arc::clone(&self.source),
-            offset: r.offset,
-            length: r.length,
-            event: r.event,
-            raw: r.raw,
-        }
+        MergeRecord { source: Arc::clone(&self.source), buffered: r }
     }
 
     /// Drops both buffers and clears EOF flags.  Used on filter changes
