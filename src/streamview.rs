@@ -2378,6 +2378,13 @@ impl RenderedWindow {
     pub fn set_render_options(&mut self, render_options: RenderOpts) {
         self.render_options = render_options;
         self.materialized = Materialized::new(self.records.len());
+        self.ordinals.clear(); // XXX-dap belongs elsewhere?
+        let mut records = Vec::with_capacity(self.records.len());
+        std::mem::swap(&mut records, &mut self.records);
+        for entry in records {
+            self.records
+                .push(WindowEntry::new(entry.record, &self.render_options));
+        }
         for i in 0..self.records.len() {
             self.render(i);
         }
