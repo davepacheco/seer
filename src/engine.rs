@@ -79,6 +79,18 @@ impl Engine {
         self.stepper_with(filter, cursor, StepperOptions::default())
     }
 
+    // XXX-dap TODO-doc
+    pub fn stepper_batched(&self, filter: Filter, cursor: &Cursor) -> Stepper {
+        self.stepper_with(
+            filter,
+            cursor,
+            StepperOptions {
+                max_records_to_scan_per_fill: Some(256), // XXX-dap
+                ..Default::default()
+            },
+        )
+    }
+
     /// Like [`Self::stepper`] but lets the caller customize the
     /// per-fill batch size and an optional per-fill records-walked
     /// budget via [`StepperOptions`].  The TUI's long-op driver uses

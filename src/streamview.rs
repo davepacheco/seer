@@ -1916,7 +1916,7 @@ impl Viewport {
     ) -> Viewport {
         let anchor = Anchor::PinFront;
         let anchor_cursor = Cursor::new();
-        let stepper = engine.stepper(filter.clone(), &anchor_cursor);
+        let stepper = engine.stepper_batched(filter.clone(), &anchor_cursor);
         let rendered = RenderedWindow::new(stepper, 256, 1024, render_options); // XXX-dap
         Viewport {
             filter,
@@ -1988,7 +1988,7 @@ impl Viewport {
     pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
         self.seek_interrupt();
         self.filter = filter.clone();
-        let stepper = engine.stepper(filter, &self.anchor_cursor);
+        let stepper = engine.stepper_batched(filter, &self.anchor_cursor);
         self.rendered =
             RenderedWindow::new(stepper, 256, 1024, self.render_options);
     }
@@ -2068,7 +2068,7 @@ impl Viewport {
         // Unlike the other seek operations, we create a fresh Stepper from the
         // engine here because we want to load this position directly rather
         // than stepping to it.  It could be very far away.
-        let stepper = engine.stepper(self.filter.clone(), cursor);
+        let stepper = engine.stepper_batched(self.filter.clone(), cursor);
 
         // The direction is unused here.
         // XXX-dap TODO-cleanup better strong type safety
@@ -2083,7 +2083,9 @@ impl Viewport {
         // XXX-dap do we need to position the anchor specially?
         // XXX-dap do we need to do something to step back a bit from where we
         // ended?
-        self.start_seek_to_cursor(engine, &engine.cursor_at_end());
+        // XXX-dap unwrap(): source should store size instead of fetching each
+        // time
+        self.start_seek_to_cursor(engine, &engine.cursor_at_end().unwrap());
     }
 
     fn anchor_record(&self) -> Option<&MergeRecord> {
