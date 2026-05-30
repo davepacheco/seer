@@ -1917,7 +1917,7 @@ impl Viewport {
         let anchor = Anchor::PinFront;
         let anchor_cursor = Cursor::new();
         let stepper = engine.stepper_batched(filter.clone(), &anchor_cursor);
-        let rendered = RenderedWindow::new(stepper, 256, 1024, render_options); // XXX-dap
+        let rendered = RenderedWindow::new(stepper, 0, 1024, render_options); // XXX-dap
         Viewport {
             filter,
             render_options,
@@ -1986,11 +1986,11 @@ impl Viewport {
     }
 
     pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
+        // XXX-dap need to adjust anchor, which might now be filtered out
         self.seek_interrupt();
         self.filter = filter.clone();
-        let stepper = engine.stepper_batched(filter, &self.anchor_cursor);
-        self.rendered =
-            RenderedWindow::new(stepper, 256, 1024, self.render_options);
+        // Re-seek to the cursor under the new filter.
+        self.start_seek_to_cursor(engine, &self.anchor_cursor.clone());
     }
 
     pub fn set_render_options(&mut self, render_options: RenderOpts) {
@@ -2201,8 +2201,9 @@ impl Viewport {
             },
             line: line.0,
         };
+        // XXX-dap constants
         self.rendered =
-            RenderedWindow::new(seek.stepper, 256, 1024, self.render_options);
+            RenderedWindow::new(seek.stepper, 0, 1024, self.render_options);
     }
 }
 
