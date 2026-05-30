@@ -2079,8 +2079,11 @@ impl Viewport {
         self.start_seek_to_cursor(engine, &Cursor::new());
     }
 
-    pub fn start_seek_to_end(&mut self, _engine: &Engine) {
-        // XXX-dap how do we do this lol
+    pub fn start_seek_to_end(&mut self, engine: &Engine) {
+        // XXX-dap do we need to position the anchor specially?
+        // XXX-dap do we need to do something to step back a bit from where we
+        // ended?
+        self.start_seek_to_cursor(engine, &engine.cursor_at_end());
     }
 
     fn anchor_record(&self) -> Option<&MergeRecord> {
