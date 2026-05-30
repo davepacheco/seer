@@ -2188,7 +2188,9 @@ impl Viewport {
         // the stepper.  If this was a backwards search, then the stepper is
         // pointed in the right spot already.  If it was a forwards search, then
         // it's just past the record we wanted.  Roll it back to point at that.
-        // XXX-dap was this just wrong?
+        // XXX-dap was this just wrong?  we definitely *do* need to do this
+        // sometimes (e.g., searching).  But not other times (e.g., scrolling
+        // forward)
         // if seek.direction == Direction::Forward {
         //     // expect(): the stepper always keeps at least one previous record.
         //     seek.stepper.step_backward().expect("can step backwards");

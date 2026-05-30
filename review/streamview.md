@@ -376,13 +376,12 @@ Current status:
       RenderedWindow (reusing data as needed) and so viewport_top would still be 0?
   - TODO: figuring out why it doesn't work
     - scrolling down doesn't work until you've scrolled through a whole window
-    - filtering doesn't filter... when I navigate after that, it crashes
-      - using "exclude" does seem to work --- but leaves me in select mode
+    - filtering then navigating crashes
+    - using "exclude" does seem to work --- but leaves me in select mode
     - I got into some state (by searching) where hitting 'j' put me in a
       navigation *loop* somehow
-    - enabling all fields seems to work but only after you navigate *again*
     - seeking by time seems like it might be working?!
-    - search does highlight matching things but doesn't navigate right
+    - G doesn't work
   - TODO: figure out what to do with summary builds
   - TODO: lots of XXXs
   - TODO: fix up cursor_before_record()
