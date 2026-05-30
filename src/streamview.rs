@@ -413,6 +413,7 @@ struct DirectionalEof {
     backward: bool,
 }
 
+// XXX-dap rip me out!
 /// Lazy-windowed materialization for one stream tab's view of the
 /// merged event stream.
 ///
@@ -1900,6 +1901,7 @@ enum SeekDestination {
     Search(Regex),
 }
 
+#[derive(Debug)]
 pub enum ViewportStatus<'a> {
     Idle,
     Seeking(&'a ParseStats),
@@ -1985,6 +1987,7 @@ impl Viewport {
 
     pub fn set_filter(&mut self, engine: &Engine, filter: Filter) {
         self.seek_interrupt();
+        self.filter = filter.clone();
         let stepper = engine.stepper(filter, &self.anchor_cursor);
         self.rendered =
             RenderedWindow::new(stepper, 256, 1024, self.render_options);
@@ -2180,10 +2183,11 @@ impl Viewport {
         // the stepper.  If this was a backwards search, then the stepper is
         // pointed in the right spot already.  If it was a forwards search, then
         // it's just past the record we wanted.  Roll it back to point at that.
-        if seek.direction == Direction::Forward {
-            // expect(): the stepper always keeps at least one previous record.
-            seek.stepper.step_backward().expect("can step backwards");
-        };
+        // XXX-dap was this just wrong?
+        // if seek.direction == Direction::Forward {
+        //     // expect(): the stepper always keeps at least one previous record.
+        //     seek.stepper.step_backward().expect("can step backwards");
+        // };
         self.anchor_cursor = seek.stepper.cursor();
         self.anchor = Anchor::On {
             key: RecordKey {
@@ -2208,6 +2212,7 @@ pub struct RenderedWindow {
     forward_eof: bool,
 }
 
+#[derive(Debug)]
 enum PopulateState {
     Backward(u32, u32),
     Forward(u32),

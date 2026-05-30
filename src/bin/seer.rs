@@ -1531,8 +1531,9 @@ impl Tab {
         if self.kind == TabKind::Summary {
             return;
         }
-        let anchor_event =
-            self.event_for_line().get(self.viewport_top.get()).copied();
+        // XXX-dap viewport_top = 0?
+        // let anchor_event =
+        //     self.event_for_line().get(self.viewport_top.get()).copied();
         if let Some(view) = self.viewport.as_mut() {
             view.set_render_options(opts);
         } else {
@@ -1544,9 +1545,10 @@ impl Tab {
             ));
             self.standalone_materialized = Materialized::default();
         }
-        self.viewport_top = anchor_event
-            .and_then(|i| self.first_line_for_event().get(i.get()).copied())
-            .unwrap_or(LineIdx::ZERO);
+        // XXX-dap viewport_top = 0?
+        //self.viewport_top = anchor_event
+        //    .and_then(|i| self.first_line_for_event().get(i.get()).copied())
+        //    .unwrap_or(LineIdx::ZERO);
         self.search = None;
     }
 
@@ -1573,12 +1575,13 @@ impl Tab {
         _viewport_height: u16,
         _viewport_width: u16,
     ) {
-        // XXX-dap
-        todo!();
+        let Some(view) = self.viewport.as_ref() else {
+            return;
+        };
+        // XXX-dap viewport_top = 0?
+        self.viewport_top = LineIdx::ZERO;
 
-        // let Some(view) = self.viewport.as_ref() else {
-        //     return;
-        // };
+        // XXX-dap viewport_top = 0?
         // let anchor = LineIdx(view.anchor_flat_line());
         // let max = self.max_top(viewport_height, viewport_width);
         // self.viewport_top = anchor.min(max);
@@ -2226,9 +2229,12 @@ impl App {
             return false;
         };
 
+        // XXX-dap this isn't quite right.  We have two different bits to
+        // return: whether we're interruptible right now and whether the caller
+        // should call do_work().  Right now we implement the latter.
         match viewport.status() {
-            ViewportStatus::Idle | ViewportStatus::Populating => false,
-            ViewportStatus::Seeking(_) => true,
+            ViewportStatus::Idle => false,
+            ViewportStatus::Populating | ViewportStatus::Seeking(_) => true,
         }
     }
 
@@ -2615,7 +2621,9 @@ impl App {
         // the simple synchronous max_top clamp.  The long-op chunking
         // only helps the engine-backed path.
         let Some(view) = self.tabs[active].viewport.as_mut() else {
-            self.tabs[active].viewport_top = self.tabs[active].max_top(h, w);
+            // XXX-dap viewport_top = 0
+            // self.tabs[active].viewport_top = self.tabs[active].max_top(h, w);
+            self.tabs[active].viewport_top = LineIdx::ZERO;
             return;
         };
         view.start_seek_to_end(&self.engine);
