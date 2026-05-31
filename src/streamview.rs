@@ -2008,6 +2008,75 @@ impl Viewport {
     // window size.  I guess we could pass that through to the point where we
     // create the window
     pub fn scroll_lines(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        // Check for the intra-record fast path: if the requested movement
+        // fits inside the anchor record's own lines, just adjust
+        // `anchor.line`.
+        //
+        // In every other case, we'll do a full seek.  The full seek uses a
+        // stepper pointed at the anchor record.  But if we *are* anchored to a
+        // specific row, we may have some offset within that row that needs to
+        // be accounted for.  See comments on the specific cases below.
+        let delta = if let Anchor::On { key, line } = &self.anchor {
+            let key = key.clone();
+            let line = *line;
+            if let Some(lines) = self.rendered.formatted_record_for_key(&key) {
+                let nlines = lines.len();
+                if delta > 0 {
+                    let delta_u = usize::try_from(delta).unwrap();
+                    if line + delta_u < nlines {
+                        // We're advancing to a subsequent line in the same
+                        // record.
+                        self.anchor = Anchor::On { key, line: line + delta_u };
+                        return;
+                    }
+
+                    // The seek below will start at the anchor record and we
+                    // know that it will consume the whole anchor record.  But
+                    // we're already `line` lines into that record.  To
+                    // calculate the equivalent seek distance from the start of
+                    // the anchor record, we have to add `line`.
+                    //
+                    // unwrap(): formatted records are not that many lines.
+                    delta + isize::try_from(line).unwrap()
+                } else {
+                    let delta_abs = delta.unsigned_abs();
+                    if delta_abs <= line {
+                        // We're seeking back to an earlier line in the same
+                        // record.
+                        self.anchor =
+                            Anchor::On { key, line: line - delta_abs };
+                        return;
+                    }
+
+                    // The seek below will start just before the anchor record.
+                    // But we're already `line` lines into that record.  To find
+                    // the equivalent seek distance from the *start* of the
+                    // anchor record, we need to subtract `line` from the
+                    // distance we're seeking back.  But `delta` is negative in
+                    // this case, so this is the same as adding `line`.
+                    //
+                    // unwrap(): formatted records are not that many lines.
+                    delta + isize::try_from(line).unwrap()
+                }
+            } else {
+                // We haven't populated the anchor record.  This is possible
+                // (e.g., if we just did a bookmark seek to this spot and
+                // haven't loaded it yet), but pretty unlikely.  In that case,
+                // we'll do a full seek from the beginning of the anchor -- no
+                // adjustment needed.
+                delta
+            }
+        } else {
+            // We're anchored to the front or back or the window's empty.
+            // We'll do a full seek from the beginning of the anchor -- no
+            // adjustment needed.
+            delta
+        };
+
         let stepper =
             self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
         let direction =
@@ -2017,6 +2086,7 @@ impl Viewport {
             direction,
             SeekDestination::Distance(delta.unsigned_abs()),
         );
+
         // Try doing a unit of work.  In the common case, this is going to be
         // pretty quick.
         self.seek_work();
@@ -2135,13 +2205,26 @@ impl Viewport {
             SeekDestination::Distance(remaining) => {
                 // Render the record to figure out how many lines it takes up.
                 let nlines = format_record(&next, &self.render_options).len();
-                if *remaining > nlines {
-                    *remaining -= nlines;
-                    return;
+                let vremaining = *remaining;
+                match seek.direction {
+                    Direction::Forward => {
+                        if vremaining < nlines {
+                            self.seek_finish(Some((next, LineIdx(vremaining))));
+                            return;
+                        }
+                    }
+                    Direction::Backward => {
+                        if vremaining <= nlines {
+                            self.seek_finish(Some((
+                                next,
+                                LineIdx(nlines - vremaining),
+                            )));
+                            return;
+                        }
+                    }
                 }
 
-                let value = Some((next, LineIdx(*remaining)));
-                self.seek_finish(value);
+                *remaining -= nlines;
             }
             SeekDestination::Time(target_time) => {
                 let Ok(event) = next.event() else {
@@ -2188,13 +2271,10 @@ impl Viewport {
         // the stepper.  If this was a backwards search, then the stepper is
         // pointed in the right spot already.  If it was a forwards search, then
         // it's just past the record we wanted.  Roll it back to point at that.
-        // XXX-dap was this just wrong?  we definitely *do* need to do this
-        // sometimes (e.g., searching).  But not other times (e.g., scrolling
-        // forward)
-        // if seek.direction == Direction::Forward {
-        //     // expect(): the stepper always keeps at least one previous record.
-        //     seek.stepper.step_backward().expect("can step backwards");
-        // };
+        if seek.direction == Direction::Forward {
+            // expect(): the stepper always keeps at least one previous record.
+            seek.stepper.step_backward().expect("can step backwards");
+        }
         self.anchor_cursor = seek.stepper.cursor();
         self.anchor = Anchor::On {
             key: RecordKey {
@@ -2412,6 +2492,16 @@ impl RenderedWindow {
         // XXX-dap this could be better
         self.records.iter().find_map(|entry| {
             (entry.key() == *record_key).then_some(&entry.record)
+        })
+    }
+
+    pub fn formatted_record_for_key(
+        &self,
+        record_key: &RecordKey,
+    ) -> Option<&[String]> {
+        // XXX-dap this could be better
+        self.records.iter().find_map(|entry| {
+            (entry.key() == *record_key).then_some(entry.lines.as_ref())
         })
     }
 

@@ -387,3 +387,4 @@ Current status:
   - TODO: fix up cursor_before_record()
   - TODO: fix up tests
   - TODO: it is regrettably a fair bit slower to scroll up/down each line
+  - TODO: have claude write tests for all the streamview.rs stuff, including the "j → k → j → k → j" seek test it mentioned ("on a fixture with a mix of single-line and multi-line records")
