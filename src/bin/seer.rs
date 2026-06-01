@@ -32,7 +32,7 @@ use seer::{
     HostnameDisplay, LineIdx, LogStream, LogStreamId, MatchKind, Materialized,
     ParseStats, RenderOpts, Row, SavePolicy, SearchAnchor, SearchDir,
     SearchOutcome, Selector, Session, SessionId, SessionMatch, SessionSource,
-    SessionStore, SourceId, StoreError, SummaryBuilder, TabKind,
+    SessionStore, SourceId, Stepper, StoreError, SummaryBuilder, TabKind,
     build_seeit_command, format_summary,
 };
 #[cfg(test)]
@@ -747,10 +747,11 @@ fn parse_tab_number(name: &str) -> Option<usize> {
 
 /// Placeholder rows for a Summary tab whose build hasn't run yet.
 /// Surfaced by [`Tab::new`] when constructing a Summary tab and by
-/// [`App::start_summary_build`] when an existing tab is being
+/// [`App::enqueue_summary_build`] when an existing tab is being
 /// rebuilt.  Rendered as a single "Computing summary..." line so the
-/// pane isn't visually empty while the [`LongOp`] populates the real
-/// histogram; the progress bar lives below in the parse-stats row.
+/// pane isn't visually empty while the in-progress [`SummaryOp`]
+/// folds records into the histogram; the progress bar (once wired)
+/// lives below in the parse-stats row.
 fn summary_placeholder_rows() -> Materialized {
     Materialized {
         events: Vec::new(),
@@ -917,26 +918,17 @@ fn format_fetch_stats(stats: &ParseStats) -> String {
     )
 }
 
-/// Records processed per [`LongOp::advance`] chunk.  Sized so that even
-/// on slow machines a chunk completes in well under the 16 ms it would
-/// take to drop a frame at 60 Hz, while still being large enough that
-/// the per-chunk overhead (rebuilding a [`Stepper`] from the saved
-/// [`Cursor`] for summary builds, handing back to the event loop for
-/// search) doesn't dominate the parse cost.
-const LONG_OP_CHUNK_RECORDS: usize = 4_000;
-
 /// A multi-chunk operation driven by the main event loop in between
 /// frame draws.  This is used for anything where the TUI would be otherwise
 /// unresponsive for an unbounded amount of time, which basically means any time
-/// an indefinite amount of scanning is required (e.g., building a summary,
-/// searching, seeking to a specific spot).
+/// an indefinite amount of scanning is required (e.g., searching, seeking to a
+/// specific spot).  Summary builds use the same chunked-work pattern but live
+/// directly on the owning [`Tab`] as [`Tab::summary_work`] — they're driven
+/// per-tab rather than through a single shared slot.
 ///
 /// While a [`LongOp`] is active, the parse-stats line is replaced with
-/// a progress bar; Ctrl-C cancels and unwinds (no partial summary, no
-/// anchor change for search).
+/// a progress bar; Ctrl-C cancels and unwinds (no anchor change for search).
 enum LongOp {
-    // Box the [`SummaryOp`] to keep this enum compact.
-    BuildSummary(Box<SummaryOp>),
     Search(SearchOp),
     /// Chunked window-fill behind `g`, `G`, bookmark navigation, and
     /// filter rebuild.  See [`SeekOp`].
@@ -948,7 +940,6 @@ impl LongOp {
     /// of the progress bar.
     fn bytes_done(&self) -> ByteLen {
         match self {
-            LongOp::BuildSummary(op) => op.bytes_read,
             LongOp::Search(op) => op.bytes_done(),
             LongOp::Seek(op) => op.bytes_done,
         }
@@ -958,29 +949,25 @@ impl LongOp {
     /// Drives the denominator of the progress bar.
     fn total_bytes(&self) -> ByteLen {
         match self {
-            LongOp::BuildSummary(op) => op.total_bytes,
             LongOp::Search(op) => op.total_bytes,
             LongOp::Seek(op) => op.total_bytes,
         }
     }
 
-    /// Records observed so far.  For Summary, filter-passing records
-    /// folded into the builder; for Search, records walked; for Seek,
+    /// Records observed so far.  For Search, records walked; for Seek,
     /// records cached so far by the in-flight window-fill.
     fn records(&self) -> u64 {
         match self {
-            LongOp::BuildSummary(op) => op.records,
             LongOp::Search(op) => op.records,
             LongOp::Seek(op) => op.records,
         }
     }
 
-    /// Verb shown in the progress bar.  Built-ins are static; Seek
-    /// picks its label at construction so `g`/`G`/filter-rebuild can
-    /// each surface what they're doing.
+    /// Verb shown in the progress bar.  Search is static; Seek picks
+    /// its label at construction so `g`/`G`/filter-rebuild can each
+    /// surface what they're doing.
     fn label(&self) -> &str {
         match self {
-            LongOp::BuildSummary(_) => "Computing summary",
             LongOp::Search(_) => "Searching",
             LongOp::Seek(op) => op.label.as_str(),
         }
@@ -991,41 +978,60 @@ impl LongOp {
     /// progress bar in for the active tab's parse-stats line.
     fn targets_tab(&self, tab_idx: TabIdx) -> bool {
         match self {
-            LongOp::BuildSummary(op) => op.tab_idx == tab_idx,
             LongOp::Search(op) => op.tab_idx == tab_idx,
             LongOp::Seek(op) => op.tab_idx == tab_idx,
         }
     }
 }
 
-/// In-progress Summary build.  Holds the partial [`SummaryBuilder`]
-/// across chunks plus a [`Cursor`] from which the next [`Stepper`] is
-/// built.  Drained by repeated calls to [`Self::advance`].  On
-/// completion, [`Self::finalize`] turns it into the histogram lines
-/// the destination tab will display.
+/// State about an in-progress Summary build.
+///
+/// The TUI drives the summary operation forward with [`Self::advance`].  On
+/// completion, [`Self::finalize`] turns the builder into the histogram lines
+/// that the destination tab will display.
+///
+/// Lives on the owning [`Tab`] as [`Tab::summary_work`].  Only the
+/// active tab's work runs each tick; inactive tabs keep their work
+/// suspended until they're focused.
 struct SummaryOp {
-    /// Index in `App.tabs` of the Summary tab being built.  Captured at
-    /// creation; the tab itself is left with empty `formatted` until
-    /// `finalize` runs.
-    tab_idx: TabIdx,
-    filter: Filter,
+    /// Walks the merged stream forward, fetching from each source as
+    /// needed.  Carries the filter that defines this summary's scope —
+    /// a filter change on the host stream drops the whole `SummaryOp`
+    /// and starts a fresh one.
+    stepper: Stepper,
+    /// Accumulates the histogram as records flow through.  Owned across
+    /// chunks; consumed by [`Self::finalize`].
     builder: SummaryBuilder,
-    cursor: Cursor,
-    bytes_read: ByteLen,
+    /// Records folded into the builder so far (parsed successfully and
+    /// accepted by the filter).  Separate from the stepper's
+    /// `walked_bytes`, which also covers filter-rejected and
+    /// parse-failed records.
     records: u64,
+    /// Total bytes across all sources that pass the filter's source-id
+    /// predicates.  Denominator of the progress bar; captured at
+    /// construction since the source set is fixed for the build.
     total_bytes: ByteLen,
+    /// Wall-clock start, surfaced through the finished
+    /// [`ParseStats::elapsed`].
     started: Instant,
+    /// True once the stepper returns `None` — the merge is exhausted
+    /// and the next `advance` call is a no-op.  Caller polls this (via
+    /// `advance`'s return value) to know when to finalize.
     eof: bool,
 }
 
 impl SummaryOp {
-    fn new(tab_idx: TabIdx, filter: Filter, total_bytes: ByteLen) -> Self {
+    fn new(filter: Filter, engine: &Engine) -> Self {
+        let total_bytes = engine.filtered_total_bytes(&filter);
+        // A bounded stepper caps the records walked per `step_forward`
+        // call.  A selective filter under an unbounded stepper can
+        // make a single step walk arbitrarily many on-disk records
+        // before surfacing a match (or before discovering it has
+        // none), freezing the UI and defeating cancellation.
+        let stepper = engine.stepper_batched(filter, &Cursor::new());
         Self {
-            tab_idx,
-            filter,
+            stepper,
             builder: SummaryBuilder::default(),
-            cursor: Cursor::new(),
-            bytes_read: ByteLen::ZERO,
             records: 0,
             total_bytes,
             started: Instant::now(),
@@ -1033,30 +1039,50 @@ impl SummaryOp {
         }
     }
 
-    /// Folds up to [`LONG_OP_CHUNK_RECORDS`] more records (parsed
-    /// successfully and accepted by the filter) into the builder.
-    /// Returns `true` once the merge is exhausted and the caller should
-    /// finalize.
-    fn advance(&mut self, engine: &Engine) -> bool {
+    /// Bytes the stepper has walked off disk so far, including bytes
+    /// from records the filter rejected.  Drives the progress bar's
+    /// numerator.
+    fn bytes_read(&self) -> ByteLen {
+        self.stepper.walked_bytes()
+    }
+
+    /// Performs one bounded unit of work against the merged stream:
+    /// at most one `step_forward` call, which itself walks at most
+    /// the stepper's per-fill records-to-scan budget.  Returns `true`
+    /// once the merge is fully exhausted and the caller should
+    /// finalize; `false` when there's more to do (either the step
+    /// produced a record or the per-fill budget ran out before EOF).
+    ///
+    /// The caller is responsible for re-driving `advance` until it
+    /// returns `true` (or for cancelling the build), which gives the
+    /// event loop a chance to redraw and observe user input between
+    /// every step.
+    fn advance(&mut self) -> bool {
         if self.eof {
             return true;
         }
-        let mut stepper = engine.stepper(self.filter.clone(), &self.cursor);
-        let mut count = 0;
-        while count < LONG_OP_CHUNK_RECORDS {
-            let Some(rec) = stepper.step_forward() else {
-                self.eof = true;
-                break;
-            };
-            self.bytes_read += rec.length();
-            if let Ok(event) = rec.event() {
-                self.builder.observe(event);
-                self.records += 1;
+        match self.stepper.step_forward() {
+            Some(rec) => {
+                if let Ok(event) = rec.event() {
+                    self.builder.observe(event);
+                    self.records += 1;
+                }
+                false
             }
-            count += 1;
+            None => {
+                // `None` is ambiguous under a bounded stepper: either
+                // a real EOF, or the per-fill budget ran out before
+                // the next match was found.  Only the former is
+                // terminal — for the latter, a subsequent
+                // `step_forward` resumes the scan.
+                if self.stepper.is_exhausted(Direction::Forward) {
+                    self.eof = true;
+                    true
+                } else {
+                    false
+                }
+            }
         }
-        self.cursor = stepper.cursor();
-        self.eof
     }
 
     /// Consumes the in-progress build and returns the histogram rows.
@@ -1064,13 +1090,11 @@ impl SummaryOp {
     /// [`Tab::standalone_materialized`] slot.
     fn finalize(self) -> Materialized {
         let elapsed = self.started.elapsed();
+        let walked_bytes = self.stepper.walked_bytes();
         let summary = self.builder.finish();
         let formatted = format_summary(&summary);
-        let parse_stats = ParseStats {
-            records: self.records,
-            walked_bytes: self.bytes_read,
-            elapsed,
-        };
+        let parse_stats =
+            ParseStats { records: self.records, walked_bytes, elapsed };
         Materialized {
             events: Vec::new(),
             formatted,
@@ -1392,6 +1416,14 @@ struct Tab {
     /// constructed via [`App::with_rows`] / [`App::with_events`] that
     /// bypass the engine.
     viewport: Option<Viewport>,
+    /// For [`TabKind::Summary`] tabs: the in-progress chunked
+    /// histogram build that the main loop advances each tick while
+    /// this tab is active.  `None` once the build has finished (its
+    /// rows now live in [`Self::standalone_materialized`]) or when the
+    /// tab isn't a Summary tab.  A fresh build supersedes any prior
+    /// one — filter changes on the host stream drop the existing
+    /// `summary_work` and install a new one targeting the new filter.
+    summary_work: Option<SummaryOp>,
     /// Owned [`Materialized`] used by tabs without a streamview:
     /// [`TabKind::Summary`] (filled by [`SummaryOp::finalize`]) and
     /// test fixtures.  When `streamview` is `Some`, this field is
@@ -1460,11 +1492,12 @@ impl Tab {
                 );
                 (Some(view), Materialized::default())
             }
-            // Summary tabs defer their build to a [`LongOp`] driven by
-            // the main loop.  Construction installs the placeholder
-            // ("Computing summary…") into the standalone slot; the
-            // App spins up a [`SummaryOp`] right after pushing the
-            // tab so the progress bar shows up on the next frame.
+            // Summary tabs defer their build to a [`SummaryOp`] on
+            // [`Self::summary_work`], pumped by the main loop while
+            // the tab is active.  Construction installs the
+            // placeholder ("Computing summary…") into the standalone
+            // slot; the App attaches the [`SummaryOp`] right after
+            // pushing the tab.
             TabKind::Summary => (None, summary_placeholder_rows()),
         };
         Self {
@@ -1472,6 +1505,7 @@ impl Tab {
             stream,
             kind,
             viewport,
+            summary_work: None,
             standalone_materialized,
             viewport_top: LineIdx::ZERO,
             search: None,
@@ -2045,8 +2079,8 @@ impl App {
             }
             let tab_idx = TabIdx(self.tabs.len());
             self.tabs.push(tab);
-            // Summary tabs need their long-op build queued, same as
-            // when the user opens one interactively.
+            // Summary tabs need their build re-attached after restore,
+            // same as when the user opens one interactively.
             if ptab.kind == TabKind::Summary {
                 self.enqueue_summary_build(tab_idx, filter);
             }
@@ -2166,8 +2200,8 @@ impl App {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         // Summary tabs are placeholder-only at construction; the
-        // build runs as a [`LongOp`] so the user sees a progress bar
-        // while the histogram is computed.
+        // build runs as a [`SummaryOp`] on the tab itself, pumped by
+        // the main loop while the tab is active.
         if kind == TabKind::Summary {
             self.enqueue_summary_build(
                 TabIdx(self.tabs.len() - 1),
@@ -2177,49 +2211,34 @@ impl App {
         self.save_after_inline_mutation();
     }
 
-    /// Queues a Summary rebuild for the tab at `tab_idx`.  Starts the
-    /// build immediately when no [`LongOp`] is in flight; otherwise
-    /// the request waits in [`Self::pending_summary_builds`] and is
-    /// dispatched when the active op finalizes.  Replacing an
-    /// already-pending build for the same tab keeps the queue
-    /// monotonic — only the most recent filter for a given tab is
-    /// honored, since older requests would compute against stale data.
-    fn enqueue_summary_build(&mut self, _tab_idx: TabIdx, _filter: Filter) {
-        // Drop any earlier pending request for the same tab — a fresh
-        // request supersedes it.
-        // self.pending_summary_builds.retain(|(idx, _)| *idx != tab_idx);
-        // XXX-dap need to figure out how builds fit into this
-        // if self.long_op.is_none() {
-        //     self.start_summary_build(tab_idx, filter);
-        // } else {
-        //     self.pending_summary_builds.push_back((tab_idx, filter));
-        // }
-    }
-
-    /// Resets the destination tab to the placeholder shape and
-    /// installs a fresh [`SummaryOp`] in [`Self::long_op`].  Caller is
-    /// responsible for ensuring no other [`LongOp`] is in flight.
-    fn start_summary_build(&mut self, tab_idx: TabIdx, _filter: Filter) {
-        // XXX-dap
-        // debug_assert!(self.long_op.is_none());
-        if let Some(tab) = self.tab_mut(tab_idx) {
-            tab.standalone_materialized = summary_placeholder_rows();
-            tab.viewport_top = LineIdx::ZERO;
-            tab.search = None;
-        }
-        // let total_bytes = self.engine.filtered_total_bytes(&filter);
-        // XXX-dap need to figure out how summaries fit into this
-        // self.long_op = Some(LongOp::BuildSummary(Box::new(SummaryOp::new(
-        //     tab_idx,
-        //     filter,
-        //     total_bytes,
-        // ))));
+    /// Installs (or replaces) the in-progress Summary build on the
+    /// tab at `tab_idx`.  Resets the tab to the placeholder rows and
+    /// builds a fresh [`SummaryOp`] against `filter`; any earlier
+    /// `summary_work` on that tab is dropped, so a filter change that
+    /// arrives mid-build supersedes the obsolete pass rather than
+    /// letting it finish against stale criteria.
+    ///
+    /// The build itself runs in [`Self::do_work`] when the tab is
+    /// active.  A non-active Summary tab keeps its `summary_work`
+    /// suspended until the user switches to it.
+    fn enqueue_summary_build(&mut self, tab_idx: TabIdx, filter: Filter) {
+        let summary_work = SummaryOp::new(filter, &self.engine);
+        let Some(tab) = self.tabs.get_mut(tab_idx.0) else {
+            return;
+        };
+        tab.standalone_materialized = summary_placeholder_rows();
+        tab.viewport_top = LineIdx::ZERO;
+        tab.search = None;
+        tab.summary_work = Some(summary_work);
     }
 
     fn is_busy(&self) -> bool {
         let tab = self.active_tab();
 
-        // XXX-dap summary tabs will need to do something
+        if tab.summary_work.is_some() {
+            return true;
+        }
+
         let Some(viewport) = &tab.viewport else {
             return false;
         };
@@ -2235,6 +2254,20 @@ impl App {
 
     fn do_work(&mut self) {
         let tab = self.active_tab_mut();
+
+        // Summary tabs have no viewport; they have an in-flight
+        // `SummaryOp` instead.  Advance one chunk, and if the merge
+        // is exhausted, swap the placeholder rows out for the
+        // finished histogram.
+        if let Some(op) = tab.summary_work.as_mut() {
+            if op.advance() {
+                let finished =
+                    tab.summary_work.take().expect("checked Some above");
+                tab.standalone_materialized = finished.finalize();
+            }
+            return;
+        }
+
         let Some(viewport) = &mut tab.viewport else {
             return;
         };
@@ -2479,23 +2512,6 @@ impl App {
     //        self.drain_pending_summary_builds();
     //    }
 
-    /// Pops one pending Summary build off the queue and starts it,
-    /// installing it as the active long op.  No-op when the queue is
-    /// empty or a long op is already running (so the caller can use
-    /// this freely after any other long-op finalize without risking a
-    /// race).
-    fn drain_pending_summary_builds(&mut self) {
-        // XXX-dap
-        // if self.long_op.is_some() {
-        //     return;
-        // }
-        // if let Some((next_idx, next_filter)) =
-        //     self.pending_summary_builds.pop_front()
-        // {
-        //     self.start_summary_build(next_idx, next_filter);
-        // }
-    }
-
     // XXX-dap
     //    /// Cancels the active [`LongOp`], discarding any partial work.
     //    /// Summary builds drop their accumulator (the destination tab is
@@ -2715,13 +2731,13 @@ impl App {
             .filter_map(|(i, t)| (t.stream == stream_id).then_some((i, t.kind)))
             .collect();
 
-        // For each affected stream, if it's got a viewport, update its filter.
-        // Other affected tabs go through the synchronous refresh
-        // path (Stream tabs) or the summary-build queue (Summary
-        // tabs) — they aren't user-visible during the active tab's
-        // long op, so the freeze that a selective filter causes is
-        // hidden behind the active tab's progress bar.
-        // XXX-dap get rid of the queued summary builds
+        // For each affected tab, hand the new filter to whatever
+        // owns the work for that tab kind.  Stream tabs forward the
+        // change to the viewport, which updates its filter in place.
+        // Summary tabs tear down any in-progress build via
+        // [`Self::enqueue_summary_build`] and install a fresh
+        // [`SummaryOp`] targeting the new filter; the next time the
+        // tab is active, [`Self::do_work`] picks it up.
         for (i, kind) in affected {
             match kind {
                 TabKind::Stream => {
@@ -8757,124 +8773,44 @@ mod tests {
     }
 
     #[test]
-    fn format_long_op_progress_includes_label_pct_bytes_records() {
-        // Build a SummaryOp whose state is set up by hand so the
-        // formatted output is deterministic — we don't drive a real
-        // engine here.
-        let mut s =
-            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(1024));
-        s.bytes_read = ByteLen::from(256);
-        s.records = 42;
-        let op = LongOp::BuildSummary(Box::new(s));
-        let out = format_long_op_progress(&op, 80);
-        assert!(out.contains("Computing summary"), "{out}");
-        assert!(out.contains("25.0%"), "{out}");
-        assert!(out.contains("256 B"), "{out}");
-        assert!(out.contains("1.0 KiB"), "{out}");
-        assert!(out.contains("42 records"), "{out}");
-        // The bar should fit alongside the numeric components on an
-        // 80-column terminal.
-        assert!(out.contains('['), "{out}");
-        assert!(out.contains(']'), "{out}");
-    }
-
-    #[test]
-    fn format_long_op_progress_drops_bar_at_narrow_widths() {
-        // At 30 cells there isn't room for a useful bar plus the
-        // numbers; the bar is dropped rather than truncating the
-        // numbers.
-        let mut s =
-            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(1024));
-        s.bytes_read = ByteLen::from(256);
-        s.records = 42;
-        let op = LongOp::BuildSummary(Box::new(s));
-        let out = format_long_op_progress(&op, 30);
-        assert!(out.contains("25.0%"), "{out}");
-        assert!(out.contains("42 records"), "{out}");
-        assert!(!out.contains('['), "expected no bar; got: {out}");
-    }
-
-    #[test]
-    fn format_long_op_progress_caps_at_100() {
-        // Search ops can overshoot total_bytes when the streamview
-        // had already pulled bytes for back-fetch that we count
-        // against the same denominator; the bar should clamp to 100%.
-        let mut s =
-            SummaryOp::new(TabIdx(0), Filter::default(), ByteLen::from(100));
-        s.bytes_read = ByteLen::from(200);
-        s.records = 1;
-        let op = LongOp::BuildSummary(Box::new(s));
-        let out = format_long_op_progress(&op, 80);
-        assert!(out.contains("100.0%"), "{out}");
-    }
-
-    #[test]
-    fn long_op_drives_summary_to_completion() {
-        // End-to-end: pressing `S` installs a placeholder, then the
-        // long op chunks through the merged stream until the summary
-        // is fully built.  After draining, the rendered rows should
-        // match what the synchronous build produced previously.
+    fn summary_build_drives_to_completion() {
+        // Pressing `S` opens a Summary tab, installs the
+        // "Computing summary..." placeholder, and attaches a
+        // [`SummaryOp`] to the new tab.  Pumping [`App::do_work`]
+        // folds records into the builder one bounded step at a time
+        // until the merge is exhausted, at which point the
+        // placeholder is swapped out for the rendered histogram.
         let (mut a, dir) = multi_line_app(&[
             (10, "first", &[]),
             (20, "first", &[]),
             (30, "second", &[]),
         ]);
         a.handle_key(shift('S'));
-        // Before draining: placeholder lives in the tab, long op is
-        // active, progress is reported on the active tab's stats row.
         assert_eq!(
             a.active_tab().formatted(),
             &["Computing summary...".to_string()],
         );
-        assert!(a.long_op.is_some());
-        a.drain_long_op();
-        assert!(a.long_op.is_none());
+        assert!(a.active_tab().summary_work.is_some());
+        assert!(a.is_busy());
+        // Pump until the build finishes.  Each `do_work` advances a
+        // single bounded step, so the loop count is "many more than
+        // the number of records plus per-fill yields" rather than a
+        // fixed chunk multiple; the upper bound guards against
+        // pathological non-convergence.
+        for _ in 0..10_000 {
+            if !a.is_busy() {
+                break;
+            }
+            a.do_work();
+        }
+        assert!(!a.is_busy(), "summary build did not converge");
+        assert!(a.active_tab().summary_work.is_none());
         let lines = a.active_tab().formatted();
         assert!(
             lines.iter().any(|l| l.starts_with("Summary: 3 events")),
             "got:\n{}",
             lines.join("\n"),
         );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn long_op_summary_cancel_leaves_placeholder_and_clears_queue() {
-        let (mut a, dir) =
-            multi_line_app(&[(10, "first", &[]), (20, "second", &[])]);
-        a.handle_key(shift('S'));
-        assert!(matches!(a.long_op, Some(LongOp::BuildSummary(_))));
-        a.cancel_long_op();
-        assert!(a.long_op.is_none());
-        assert!(a.pending_summary_builds.is_empty());
-        let lines = a.active_tab().formatted();
-        assert!(
-            lines.iter().any(|l| l.contains("cancelled")),
-            "expected cancel notice, got: {lines:?}"
-        );
-        dir.cleanup();
-    }
-
-    #[test]
-    fn long_op_summary_filter_change_supersedes_pending() {
-        // A second build for the same tab while the first is still
-        // pending should drop the older request — only the newest
-        // filter is honored.
-        let (mut a, dir) =
-            multi_line_app(&[(10, "alpha", &[]), (20, "beta", &[])]);
-        a.handle_key(shift('S'));
-        // Force a pending state by stalling the active op without
-        // finishing it: spin a no-op LongOp::Search would be wrong;
-        // just enqueue another build for the same tab while the
-        // current one is still in flight.  enqueue_summary_build
-        // de-dupes pending entries for the same tab.
-        let active_tab = TabIdx(a.active);
-        a.pending_summary_builds
-            .push_back((active_tab, "msg=alpha".parse().unwrap()));
-        a.enqueue_summary_build(active_tab, "msg=beta".parse().unwrap());
-        assert_eq!(a.pending_summary_builds.len(), 1);
-        let (_, last) = a.pending_summary_builds.front().unwrap();
-        assert_eq!(last.to_string(), "msg=beta");
         dir.cleanup();
     }
 
