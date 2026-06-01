@@ -2233,128 +2233,6 @@ impl App {
         viewport.seek_interrupt();
     }
 
-    //    XXX-dap
-    //    /// Drives the active [`LongOp`] forward by one chunk.  No-op when
-    //    /// no op is in flight.  The op owns its own borrowing rules: a
-    //    /// summary build talks only to the engine, while a search step
-    //    /// also needs the destination tab's [`StreamView`].
-    //    ///
-    //    /// Returns `true` if the op finished (or was already finished) on
-    //    /// this call — the caller can use that as a signal to schedule a
-    //    /// final repaint, but it is not required: `long_op` is also
-    //    /// cleared as a side effect.
-    //    fn advance_long_op(&mut self) -> bool {
-    //        let Some(mut op) = self.long_op.take() else { return false };
-    //        let h = self.viewport_height;
-    //        let done = match &mut op {
-    //            LongOp::BuildSummary(s) => s.advance(&self.engine),
-    //            LongOp::Search(s) => self.advance_search_op(s, h),
-    //            LongOp::Seek(s) => self.advance_seek_op(s, h),
-    //        };
-    //        if done {
-    //            self.finalize_long_op(op);
-    //            true
-    //        } else {
-    //            self.long_op = Some(op);
-    //            false
-    //        }
-    //    }
-    //
-    //    /// Drives one tick of an in-progress seek.  Each call to
-    //    /// [`StreamView::ensure_window_step`] runs at most one bounded
-    //    /// scan (capped at `LONG_OP_RECORDS_TO_SCAN_PER_FILL` records examined),
-    //    /// so the wall time per tick is predictable even when the
-    //    /// active filter rejects almost everything.  Returns `true` once
-    //    /// the window-fill reaches its target or hits EOF in the fill
-    //    /// direction.
-    //    fn advance_seek_op(
-    //        &mut self,
-    //        s: &mut SeekOp,
-    //        viewport_height: u16,
-    //    ) -> bool {
-    //        let tab_idx = s.tab_idx;
-    //        let App { tabs, engine, .. } = self;
-    //        let Some(view) =
-    //            tabs.get_mut(tab_idx.get()).and_then(|t| t.streamview.as_mut())
-    //        else {
-    //            // Tab vanished (closed under us) or never had a
-    //            // streamview to begin with.  Nothing left to fill.
-    //            s.complete = true;
-    //            return true;
-    //        };
-    //        let completed = matches!(
-    //            view.ensure_window_step(engine, viewport_height),
-    //            WindowFillStatus::Done
-    //        );
-    //        let stats = view.parse_stats();
-    //        s.bytes_done =
-    //            stats.walked_bytes.saturating_sub(s.walked_bytes_at_start);
-    //        s.records = stats.records.saturating_sub(s.records_at_start);
-    //        if completed {
-    //            s.complete = true;
-    //        }
-    //        completed
-    //    }
-
-    //    /// Drives one chunk of an in-progress search.  Borrows the
-    //    /// destination tab's [`StreamView`] mutably to call
-    //    /// [`StreamView::search_step_with_budget`], then snapshots the
-    //    /// streamview's running parse stats into the op so the progress
-    //    /// bar can read them later without re-borrowing.  Returns `true`
-    //    /// when the search is terminal (Found / NotFound / Cancelled),
-    //    /// `false` when the streamview wants to be called again (budget
-    //    /// exhausted).
-    //    fn advance_search_op(
-    //        &mut self,
-    //        s: &mut SearchOp,
-    //        viewport_height: u16,
-    //    ) -> bool {
-    //        let tab_idx = s.tab_idx;
-    //        // Split-borrow `self` so the streamview (in `tabs[tab_idx]`)
-    //        // can be borrowed mutably while `engine` is borrowed shared
-    //        // for the same call.  Field-level destructure makes the two
-    //        // borrows independent in the borrow checker's eyes.
-    //        let App { tabs, engine, .. } = self;
-    //        let Some(view) =
-    //            tabs.get_mut(tab_idx.get()).and_then(|t| t.streamview.as_mut())
-    //        else {
-    //            // The tab disappeared (closed under us) or never had a
-    //            // streamview to begin with.  Treat as terminal — nothing
-    //            // to scan.
-    //            s.outcome = Some(SearchOutcome::NotFound);
-    //            return true;
-    //        };
-    //        let outcome = view.search_step_with_budget(
-    //            engine,
-    //            &s.regex,
-    //            s.direction,
-    //            s.anchor,
-    //            viewport_height,
-    //            LONG_OP_CHUNK_RECORDS,
-    //            &mut || false,
-    //        );
-    //        // After the first chunk subsequent chunks must not skip the
-    //        // anchor again — the streamview's saved resume point handles
-    //        // "where did we leave off."
-    //        s.anchor = SearchAnchor::Include;
-    //        let stats = view.parse_stats();
-    //        s.bytes_done =
-    //            stats.walked_bytes.saturating_sub(s.walked_bytes_at_start);
-    //        s.records = stats.records.saturating_sub(s.records_at_start);
-    //        match outcome {
-    //            SearchOutcome::Found
-    //            | SearchOutcome::NotFound
-    //            | SearchOutcome::Cancelled => {
-    //                s.outcome = Some(outcome);
-    //                true
-    //            }
-    //            // Auto-resume.  The streamview saved a resume point
-    //            // internally; the next chunk picks up where this one
-    //            // stopped.
-    //            SearchOutcome::BudgetExhausted => false,
-    //        }
-    //    }
-
     //     XXX-dap need to replace some of the functionality here
     //     /// Installs the result of a finished [`LongOp`] into the
     //     /// destination tab.  For Summary, swaps in the histogram lines and
@@ -2363,22 +2241,6 @@ impl App {
     //     /// "no match" notice when the scan ran out without one.
     //     fn finalize_long_op(&mut self, op: LongOp) {
     //         match op {
-    //             LongOp::BuildSummary(s) => {
-    //                 let tab_idx = s.tab_idx;
-    //                 let materialized = s.finalize();
-    //                 if let Some(tab) = self.tab_mut(tab_idx) {
-    //                     tab.standalone_materialized = materialized;
-    //                     tab.viewport_top = LineIdx::ZERO;
-    //                 }
-    //                 // Drain a queued Summary build so a filter change
-    //                 // that dirtied multiple Summary tabs progresses
-    //                 // through them one after another.
-    //                 if let Some((next_idx, next_filter)) =
-    //                     self.pending_summary_builds.pop_front()
-    //                 {
-    //                     self.start_summary_build(next_idx, next_filter);
-    //                 }
-    //             }
     //             LongOp::Search(s) => {
     //                 let tab_idx = s.tab_idx;
     //                 let outcome = s.outcome.unwrap_or(SearchOutcome::NotFound);
@@ -2410,9 +2272,6 @@ impl App {
     //                         );
     //                     }
     //                 }
-    //             }
-    //             LongOp::Seek(s) => {
-    //                 self.finalize_seek_op(s);
     //             }
     //         }
     //     }
@@ -2502,22 +2361,6 @@ impl App {
     //            }
     //        }
     //    }
-
-    // XXX-dap
-    ///// Convenience for tests (and code that wants to wait for an op to
-    ///// finish): drives [`Self::advance_long_op`] in a loop until no
-    ///// long op is in flight.  Caps iterations to avoid an infinite
-    ///// loop if some advance ever stops making progress.
-    //#[cfg(test)]
-    //fn drain_long_op(&mut self) {
-    //    for _ in 0..1_000_000 {
-    //        if self.long_op.is_none() {
-    //            return;
-    //        }
-    //        self.advance_long_op();
-    //    }
-    //    panic!("drain_long_op did not converge");
-    //}
 
     /// Pushes a new tab targeting an existing [`LogStream`] (looked up
     /// in `session.streams`).  Used when navigating to a bookmark
@@ -3121,7 +2964,7 @@ impl App {
     fn jump_to_match_via_streamview(
         &mut self,
         direction: SearchDirection,
-        _anchor: SearchAnchor, // XXX-dap
+        search_anchor: SearchAnchor,
     ) {
         let active = self.active;
         let Some(regex) =
@@ -3143,7 +2986,7 @@ impl App {
             .viewport
             .as_mut()
             .expect("caller checked streamview is_some");
-        view.start_seek_for_search(dir, regex);
+        view.start_seek_for_search(dir, regex, search_anchor);
     }
 
     fn jump_to_match_via_matches(

@@ -1903,7 +1903,7 @@ enum SeekDestination {
     Cursor,
     Distance(usize),
     Time(DateTime<Utc>),
-    Search(Regex),
+    Search(Regex, SearchAnchor),
 }
 
 #[derive(Debug)]
@@ -2158,10 +2158,15 @@ impl Viewport {
         &mut self,
         direction: Direction,
         regex: Regex,
+        search_anchor: SearchAnchor,
     ) {
         let stepper =
             self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
-        self.start_seek(stepper, direction, SeekDestination::Search(regex));
+        self.start_seek(
+            stepper,
+            direction,
+            SeekDestination::Search(regex, search_anchor),
+        );
     }
 
     pub fn start_seek_to_cursor(&mut self, engine: &Engine, cursor: &Cursor) {
@@ -2275,15 +2280,42 @@ impl Viewport {
                     self.seek_finish(Some((next, LineIdx(0))));
                 }
             }
-            SeekDestination::Search(regex) => {
+            SeekDestination::Search(regex, search_anchor) => {
                 // Render the record so we can see if the regex matches any of
                 // the rendered text.
                 // XXX-dap is this what it was doing before?  what if it gets
                 // line-wrapped?
                 let lines = format_record(&next, &self.render_options);
-                for (i, line) in lines.into_iter().enumerate() {
+
+                // The search starts from the anchor *line*.  But since we're
+                // using a stepper(), we're always walking in units of an entire
+                // record.  That means that we started with the whole anchor
+                // record, even if the anchor line was somewhere past the start
+                // of that record.  We must skip any lines from the anchor
+                // record that are prior to the anchor line, lest we report
+                // search results in the wrong direction!
+                //
+                // If `search_anchor` says we should skip the anchor line, then
+                // we need to skip that one, too.
+                // XXX-dap TODO-test
+                let nskip = match &self.anchor {
+                    Anchor::On { key, line } => {
+                        if RecordKey::from_record(&next) == *key {
+                            assert!(*line < lines.len());
+                            match search_anchor {
+                                SearchAnchor::Include => *line,
+                                SearchAnchor::Skip => *line + 1,
+                            }
+                        } else {
+                            0
+                        }
+                    }
+                    Anchor::Empty | Anchor::PinFront | Anchor::PinBack => 0,
+                };
+
+                for (i, line) in lines.into_iter().skip(nskip).enumerate() {
                     if regex.is_match(&line) {
-                        self.seek_finish(Some((next, LineIdx(i))));
+                        self.seek_finish(Some((next, LineIdx(i + nskip))));
                         return;
                     }
                 }
