@@ -2281,9 +2281,9 @@ impl Viewport {
                 // XXX-dap is this what it was doing before?  what if it gets
                 // line-wrapped?
                 let lines = format_record(&next, &self.render_options);
-                for line in lines {
+                for (i, line) in lines.into_iter().enumerate() {
                     if regex.is_match(&line) {
-                        self.seek_finish(Some((next, LineIdx(0))));
+                        self.seek_finish(Some((next, LineIdx(i))));
                         return;
                     }
                 }

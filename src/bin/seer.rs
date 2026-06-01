@@ -928,72 +928,6 @@ fn format_fetch_stats(stats: &ParseStats) -> String {
     )
 }
 
-/// A multi-chunk operation driven by the main event loop in between
-/// frame draws.  This is used for anything where the TUI would be otherwise
-/// unresponsive for an unbounded amount of time, which basically means any time
-/// an indefinite amount of scanning is required (e.g., searching, seeking to a
-/// specific spot).  Summary builds use the same chunked-work pattern but live
-/// directly on the owning [`Tab`] as [`Tab::summary_work`] — they're driven
-/// per-tab rather than through a single shared slot.
-///
-/// While a [`LongOp`] is active, the parse-stats line is replaced with
-/// a progress bar; Ctrl-C cancels and unwinds (no anchor change for search).
-enum LongOp {
-    Search(SearchOp),
-    /// Chunked window-fill behind `g`, `G`, bookmark navigation, and
-    /// filter rebuild.  See [`SeekOp`].
-    Seek(SeekOp),
-}
-
-impl LongOp {
-    /// Bytes processed so far across all sources.  Drives the numerator
-    /// of the progress bar.
-    fn bytes_done(&self) -> ByteLen {
-        match self {
-            LongOp::Search(op) => op.bytes_done(),
-            LongOp::Seek(op) => op.bytes_done,
-        }
-    }
-
-    /// Total bytes the operation would process if it ran to completion.
-    /// Drives the denominator of the progress bar.
-    fn total_bytes(&self) -> ByteLen {
-        match self {
-            LongOp::Search(op) => op.total_bytes,
-            LongOp::Seek(op) => op.total_bytes,
-        }
-    }
-
-    /// Records observed so far.  For Search, records walked; for Seek,
-    /// records cached so far by the in-flight window-fill.
-    fn records(&self) -> u64 {
-        match self {
-            LongOp::Search(op) => op.records,
-            LongOp::Seek(op) => op.records,
-        }
-    }
-
-    /// Verb shown in the progress bar.  Search is static; Seek picks
-    /// its label at construction so `g`/`G`/filter-rebuild can each
-    /// surface what they're doing.
-    fn label(&self) -> &str {
-        match self {
-            LongOp::Search(_) => "Searching",
-            LongOp::Seek(op) => op.label.as_str(),
-        }
-    }
-
-    /// True iff this op writes its result back to the tab at
-    /// `tab_idx`.  Used by the renderer to decide whether to swap the
-    /// progress bar in for the active tab's parse-stats line.
-    fn targets_tab(&self, tab_idx: TabIdx) -> bool {
-        match self {
-            LongOp::Search(op) => op.tab_idx == tab_idx,
-            LongOp::Seek(op) => op.tab_idx == tab_idx,
-        }
-    }
-}
-
 /// State about an in-progress Summary build.
 ///
 /// The TUI drives the summary operation forward with [`Self::advance`].  On
@@ -1115,6 +1049,7 @@ impl SummaryOp {
     }
 }
 
+// XXX-dap rip out: is there any functionality here missing from the new impl?
 /// In-progress search.  Wraps repeated calls to
 /// [`StreamView::search_step_with_budget`]: each chunk consumes one
 /// budget's worth of records, and the op auto-resumes through
@@ -1254,56 +1189,57 @@ impl SeekOp {
     }
 }
 
-/// Formats a [`LongOp`]'s running progress as a single-line status
-/// string sized to fit `width` columns.  Replaces [`format_user_status`]
-/// in the user status row while the op is in flight; on completion the
-/// user status line takes over again on the next frame.
-///
-/// Layout, from left to right:
-///
-/// 1. The verb ("Computing summary"/"Searching") followed by a colon.
-/// 2. A bracketed bar showing percentage.
-/// 3. The percentage as a number.
-/// 4. Bytes-done / total-bytes.
-/// 5. Records-so-far.
-///
-/// The bar shrinks (and at very narrow widths is dropped entirely) so
-/// the numeric components are never truncated — losing the percent
-/// number is more confusing than losing bar resolution.
-fn format_long_op_progress(op: &LongOp, width: usize) -> String {
-    let bytes_done = op.bytes_done();
-    let total_bytes = op.total_bytes();
-    let pct = if total_bytes == ByteLen::ZERO {
-        100.0
-    } else {
-        // Cap at 100 — search ops that walk back-fetch buffers (or
-        // hypothetical accounting drift) can otherwise overshoot.
-        ((bytes_done.get() as f64 / total_bytes.get() as f64) * 100.0)
-            .min(100.0)
-    };
-    let label = op.label();
-    let numbers = format!(
-        "{:>5.1}%   {} / {}   {} records",
-        pct,
-        format_bytes(bytes_done.get()),
-        format_bytes(total_bytes.get()),
-        op.records(),
-    );
-    let prefix = format!("{label}: ");
-    // Compute remaining width for the bar.  Reserve two extra cells
-    // for the brackets `[ ... ]` and one for the trailing space
-    // between bar and numbers.  When the terminal is too narrow to
-    // fit a useful bar, drop it and print just the prefix + numbers.
-    let fixed = prefix.chars().count() + numbers.chars().count();
-    const MIN_BAR_INNER: usize = 8;
-    let bar = if width >= fixed + MIN_BAR_INNER + 3 {
-        let bar_inner = width - fixed - 3;
-        format!("[{}] ", progress_bar_inner(pct, bar_inner))
-    } else {
-        String::new()
-    };
-    format!("{prefix}{bar}{numbers}")
-}
+// XXX-dap rip it out
+// /// Formats a [`LongOp`]'s running progress as a single-line status
+// /// string sized to fit `width` columns.  Replaces [`format_user_status`]
+// /// in the user status row while the op is in flight; on completion the
+// /// user status line takes over again on the next frame.
+// ///
+// /// Layout, from left to right:
+// ///
+// /// 1. The verb ("Computing summary"/"Searching") followed by a colon.
+// /// 2. A bracketed bar showing percentage.
+// /// 3. The percentage as a number.
+// /// 4. Bytes-done / total-bytes.
+// /// 5. Records-so-far.
+// ///
+// /// The bar shrinks (and at very narrow widths is dropped entirely) so
+// /// the numeric components are never truncated — losing the percent
+// /// number is more confusing than losing bar resolution.
+// fn format_long_op_progress(op: &LongOp, width: usize) -> String {
+//     let bytes_done = op.bytes_done();
+//     let total_bytes = op.total_bytes();
+//     let pct = if total_bytes == ByteLen::ZERO {
+//         100.0
+//     } else {
+//         // Cap at 100 — search ops that walk back-fetch buffers (or
+//         // hypothetical accounting drift) can otherwise overshoot.
+//         ((bytes_done.get() as f64 / total_bytes.get() as f64) * 100.0)
+//             .min(100.0)
+//     };
+//     let label = op.label();
+//     let numbers = format!(
+//         "{:>5.1}%   {} / {}   {} records",
+//         pct,
+//         format_bytes(bytes_done.get()),
+//         format_bytes(total_bytes.get()),
+//         op.records(),
+//     );
+//     let prefix = format!("{label}: ");
+//     // Compute remaining width for the bar.  Reserve two extra cells
+//     // for the brackets `[ ... ]` and one for the trailing space
+//     // between bar and numbers.  When the terminal is too narrow to
+//     // fit a useful bar, drop it and print just the prefix + numbers.
+//     let fixed = prefix.chars().count() + numbers.chars().count();
+//     const MIN_BAR_INNER: usize = 8;
+//     let bar = if width >= fixed + MIN_BAR_INNER + 3 {
+//         let bar_inner = width - fixed - 3;
+//         format!("[{}] ", progress_bar_inner(pct, bar_inner))
+//     } else {
+//         String::new()
+//     };
+//     format!("{prefix}{bar}{numbers}")
+// }
 
 /// Renders the inner portion of the progress bar (no brackets) into a
 /// `width`-cell string.  Filled cells use the block character `█`;

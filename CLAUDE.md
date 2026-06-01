@@ -217,6 +217,14 @@ Most Rust files should have a Rustdoc comment for the file.
 
 ## TODO list
 
+### Rip out `EventStream`
+
+EventStream is only used by `query_events()`, which I think is only used by tests and `seeit.rs`.  Consumers of `EventStream` should just use a stepper instead.
+
+### Better `Tab` type-safety
+
+Right now, `Tab` has a `kind` field and a few optional fields depending on what kind of data is in it.  This should use enum variants with data in them for stronger type-safety (and much improved clarity).  The first step will be to characterize all the tabs.
+
 ### "Create filter" dialog
 
 I want to make the "create filter" dialog easier to use.  I want folks to be presented with:

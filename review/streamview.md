@@ -374,15 +374,13 @@ Current status:
       not move that window at all, but we might shift the viewport.
       I think after my changes, scrolling up or down slides the entire
       RenderedWindow (reusing data as needed) and so viewport_top would still be 0?
+  - done: figure out what to do with summary builds
   - TODO: figuring out why it doesn't work
-    - scrolling down doesn't work until you've scrolled through a whole window
     - filtering then navigating crashes
     - using "exclude" does seem to work --- but leaves me in select mode
+    - G doesn't work
     - I got into some state (by searching) where hitting 'j' put me in a
       navigation *loop* somehow
-    - seeking by time seems like it might be working?!
-    - G doesn't work
-  - TODO: figure out what to do with summary builds
   - TODO: lots of XXXs
   - TODO: fix up cursor_before_record()
   - TODO: fix up tests
