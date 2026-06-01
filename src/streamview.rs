@@ -1957,6 +1957,36 @@ impl Viewport {
         todo!(); // XXX-dap implement me
     }
 
+    /// Returns the flat line index of the current anchor within the
+    /// rendered window, or `LineIdx(0)` when the window is empty.
+    pub fn anchor_flat_line(&self) -> LineIdx {
+        self.rendered.anchor_flat_line(&self.anchor)
+    }
+
+    /// Sets the anchor to the record/line at flat line index
+    /// `flat_line` within the current window.  Out-of-range values
+    /// clamp to the nearest valid line; an empty window leaves the
+    /// anchor at [`Anchor::Empty`].
+    pub fn set_anchor_to_flat_line(&mut self, flat_line: LineIdx) {
+        if self.rendered.records.is_empty() {
+            self.anchor = Anchor::Empty;
+            return;
+        }
+        let mut remaining = flat_line.get();
+        for entry in self.rendered.records.iter() {
+            if remaining < entry.lines.len() {
+                self.anchor = Anchor::On { key: entry.key(), line: remaining };
+                return;
+            }
+            remaining -= entry.lines.len();
+        }
+        // Past end: clamp to last record's last line.  unwrap(): records
+        // is non-empty (checked above).
+        let last = self.rendered.records.last().unwrap();
+        self.anchor =
+            Anchor::On { key: last.key(), line: last.lines.len() - 1 };
+    }
+
     pub fn status(&self) -> ViewportStatus<'_> {
         if let Some(seek) = &self.pending_seek {
             ViewportStatus::Seeking(&seek.stats)
@@ -2475,6 +2505,33 @@ impl RenderedWindow {
 
     pub fn materialized(&self) -> &Materialized {
         &self.materialized
+    }
+
+    /// Returns the flat line index (across the window's records) at
+    /// which `anchor` sits, or `LineIdx(0)` when the window is empty.
+    /// The returned value is an index into [`Self::materialized`]'s
+    /// `formatted` vector.
+    fn anchor_flat_line(&self, anchor: &Anchor) -> LineIdx {
+        match anchor {
+            Anchor::Empty | Anchor::PinFront => LineIdx(0),
+            Anchor::On { key, line } => {
+                let mut prefix = 0;
+                for entry in &self.records {
+                    if entry.key() == *key {
+                        return LineIdx(prefix + *line);
+                    }
+                    prefix += entry.lines.len();
+                }
+                LineIdx(0)
+            }
+            Anchor::PinBack => LineIdx(
+                self.records
+                    .iter()
+                    .map(|e| e.lines.len())
+                    .sum::<usize>()
+                    .saturating_sub(1),
+            ),
+        }
     }
 
     pub fn record_first(&self) -> Option<&MergeRecord> {

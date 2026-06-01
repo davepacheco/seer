@@ -1572,33 +1572,30 @@ impl Tab {
     /// record/line.  No-op for tabs without a [`StreamView`].
     fn resync_from_streamview(
         &mut self,
-        _viewport_height: u16,
-        _viewport_width: u16,
+        viewport_height: u16,
+        viewport_width: u16,
     ) {
         let Some(view) = self.viewport.as_ref() else {
             return;
         };
-        // XXX-dap viewport_top = 0?
-        self.viewport_top = LineIdx::ZERO;
 
-        // XXX-dap viewport_top = 0?
-        // let anchor = LineIdx(view.anchor_flat_line());
-        // let max = self.max_top(viewport_height, viewport_width);
-        // self.viewport_top = anchor.min(max);
-        // // When the streamview's anchor sat past `max_top` (e.g. after
-        // // `seek_to_end` leaves it on the very last line, or after a
-        // // search lands near the buffer's tail), sync the anchor back
-        // // to `max_top` so the next backward scroll moves the visible
-        // // viewport on the first keystroke.  Without this sync the
-        // // anchor and `viewport_top` would drift apart and `k`
-        // // keystrokes would shuffle the anchor through the (clamped)
-        // // viewport until it dropped below `max_top`, looking to the
-        // // user like navigation had stopped.
-        // if anchor > max
-        //     && let Some(view) = self.streamview.as_mut()
-        // {
-        //     view.set_anchor_to_flat_line(max.get());
-        // }
+        let anchor = view.anchor_flat_line();
+        let max = self.max_top(viewport_height, viewport_width);
+        self.viewport_top = anchor.min(max);
+        // When the streamview's anchor sat past `max_top` (e.g. after
+        // `seek_to_end` leaves it on the very last line, or after a
+        // search lands near the buffer's tail), sync the anchor back
+        // to `max_top` so the next backward scroll moves the visible
+        // viewport on the first keystroke.  Without this sync the
+        // anchor and `viewport_top` would drift apart and `k`
+        // keystrokes would shuffle the anchor through the (clamped)
+        // viewport until it dropped below `max_top`, looking to the
+        // user like navigation had stopped.
+        if anchor > max
+            && let Some(view) = self.viewport.as_mut()
+        {
+            view.set_anchor_to_flat_line(max);
+        }
     }
 
     /// Last *display line* index belonging to record `event_idx`,
