@@ -1000,7 +1000,8 @@ impl SummaryOp {
     /// The caller is responsible for re-driving `advance` until it
     /// returns `true` (or for cancelling the build), which gives the
     /// event loop a chance to redraw and observe user input between
-    /// every step.
+    /// every step and gives the outer wall-clock budget direct
+    /// control over how much work runs per tick.
     fn advance(&mut self) -> bool {
         if self.eof {
             return true;

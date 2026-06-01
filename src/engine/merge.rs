@@ -5,11 +5,11 @@
 //! Merge stepper: forward/backward k-way merge over the engine's sources
 //! with per-source lookahead and lookbehind buffers.
 //!
-//! [`Stepper`] is the navigation engine that powers the TUI's scrolling.
-//! Unlike [`super::EventStream`], which materializes every event in one
-//! full pass, the stepper fetches lazily via [`Source::query`] and caches
-//! a bounded window of records in each direction so small navigation
-//! moves don't trigger fresh I/O.
+//! [`Stepper`] is the navigation engine that powers the TUI's scrolling
+//! and is also driven to EOF by the non-interactive consumers
+//! (`seeit` records mode, `summarize`).  It fetches lazily via
+//! [`Source::query`] and caches a bounded window of records in each
+//! direction so small navigation moves don't trigger fresh I/O.
 //!
 //! Use [`super::Engine::stepper`] to construct one.  The stepper is
 //! restored to a previous [`Cursor`] on construction; calling
@@ -426,6 +426,12 @@ pub struct Stepper {
     /// Surfaced to callers via [`Self::walked_bytes`] so the TUI's
     /// progress bar can tick even when fills produce no matches.
     walked_bytes: ByteLen,
+    /// Count of `Ok` records the stepper has emitted via
+    /// [`Self::step_forward`] / [`Self::step_backward`] since
+    /// construction.  The throughput counter used by the summary
+    /// build (and indirectly by the TUI's parse-stats row) to show
+    /// how much of the work has actually surfaced events.
+    records_parsed: u64,
 }
 
 impl Stepper {
@@ -465,6 +471,7 @@ impl Stepper {
             batch_size,
             max_records_to_scan_per_fill,
             walked_bytes: ByteLen::ZERO,
+            records_parsed: 0,
         }
     }
 
@@ -472,6 +479,14 @@ impl Stepper {
     /// (matching plus filter-rejected records).
     pub fn walked_bytes(&self) -> ByteLen {
         self.walked_bytes
+    }
+
+    /// Count of `Ok` records the stepper has emitted via
+    /// [`Self::step_forward`] / [`Self::step_backward`] since
+    /// construction.  Per-line errors are not counted, so this is the
+    /// natural denominator for "records parsed per second" displays.
+    pub fn records_parsed(&self) -> u64 {
+        self.records_parsed
     }
 
     /// True iff every per-source window has hit EOF in `dir`.  Used
@@ -571,7 +586,11 @@ impl Stepper {
             return None;
         }
         let idx = pick(&self.sources, dir)?;
-        Some(self.sources[idx].pop(dir))
+        let record = self.sources[idx].pop(dir);
+        if record.event().is_ok() {
+            self.records_parsed += 1;
+        }
+        Some(record)
     }
 }
 

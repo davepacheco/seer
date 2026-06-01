@@ -381,6 +381,8 @@ Current status:
     - G doesn't work
     - I got into some state (by searching) where hitting 'j' put me in a
       navigation *loop* somehow
+  - notes from June 1 Claude session about set_filter() with a filter that
+    matches no rows leaving the window unchanged
   - TODO: lots of XXXs
   - TODO: fix up cursor_before_record()
   - TODO: fix up tests

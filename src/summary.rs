@@ -34,6 +34,7 @@
 use crate::engine::Engine;
 use crate::event::Event;
 use crate::filter::Filter;
+use crate::position::Cursor;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
@@ -214,27 +215,31 @@ impl TimeBucket {
 /// Returns a [`Summary`] of every event in `engine` that passes
 /// `filter`.
 ///
-/// Traverses the event stream once.  Source-id filtering is applied at
-/// the engine level (so excluded sources are never opened); event-level
-/// predicates are applied per record.  Parse errors and out-of-order
-/// warnings are skipped — the summary describes what was successfully
-/// parsed and accepted by the filter.
+/// Traverses the merged event stream once via a [`Stepper`].  Source-id
+/// filtering is applied at the engine level (so excluded sources are
+/// never opened); event-level predicates are applied per record by the
+/// stepper.  Parse errors are skipped — the summary describes what was
+/// successfully parsed and accepted by the filter.
 pub fn summarize(engine: &Engine, filter: &Filter) -> Summary {
+    let mut stepper = engine.stepper(filter.clone(), &Cursor::new());
     let mut builder = SummaryBuilder::default();
-    // `flatten` discards `Err` items (parse errors and out-of-order
-    // warnings): the summary describes only what was successfully
-    // parsed.
-    for ee in engine.query_events(filter).flatten() {
-        builder.observe(&ee.event);
+    // The stepper here has no per-fill records-to-scan budget, so
+    // `step_forward` returns `None` only at true EOF; we don't need
+    // to consult `is_exhausted`.
+    while let Some(record) = stepper.step_forward() {
+        if let Ok(event) = record.event() {
+            builder.observe(event);
+        }
     }
     builder.finish()
 }
 
 /// Streaming accumulator for a [`Summary`].
 ///
-/// Public so callers that want to share a single pass over the engine
-/// (e.g. the TUI, which also wants the [`crate::engine::EventStream`]'s
-/// parse-rate counters) can drive the same accumulator the convenience
+/// Public so callers that want incremental control over the pass
+/// (e.g. the TUI, which drives a stepper one record at a time so the
+/// outer wall-clock budget controls how long each tick spends folding)
+/// can feed matching events into the same accumulator the convenience
 /// [`summarize`] function uses.  Keeps everything in memory until
 /// [`Self::finish`] trims to the top-K shapes.
 #[derive(Default)]

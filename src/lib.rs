@@ -21,7 +21,7 @@ pub mod ui;
 pub mod view_target;
 
 pub use engine::{
-    Cursor, Engine, EngineEvent, EventStream, MergeError, MergeRecord, Stepper,
+    Cursor, Engine, EngineEvent, MergeError, MergeRecord, Stepper,
 };
 pub use event::{Event, Hostname, Level, LoggerName, Pid, UnknownLevel};
 pub use filter::{

@@ -4,19 +4,16 @@
 
 //! Engine: the library-level entry point used by both `seeit` and `seer`.
 //!
-//! The engine owns the set of [`Source`]s currently in play and exposes
-//! queries over them.  Multi-source queries are time-merged: each source
-//! is assumed to be locally sorted by [`Event::time`] (when it is not,
-//! the engine emits a one-shot [`SourceError::OutOfOrder`] warning for
-//! that source and proceeds anyway).
+//! The engine owns the set of [`Source`]s currently in play and hands
+//! them out to a [`Stepper`] for time-merged iteration.  Each source
+//! is assumed to be locally sorted by [`Event::time`]; the engine
+//! does not re-check that invariant.
 
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::position::{ByteLen, LogStreamPosition, SourceId};
-use crate::source::{FileSource, Source, SourceError};
+use crate::source::{FileSource, Source};
 use camino::Utf8Path;
-use chrono::{DateTime, Utc};
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 mod merge;
@@ -68,13 +65,12 @@ impl Engine {
     /// [`crate::source::ByteOffset::ZERO`] for sources missing from the
     /// cursor).
     ///
-    /// Unlike [`Self::query_events`], a stepper fetches lazily and keeps
-    /// per-source lookahead/lookbehind buffers so the TUI can scroll
-    /// forward and backward without re-reading the whole file each
-    /// time.  Filter changes are applied via [`Stepper::set_filter`]
-    /// (which retains positions); changing the *source-id* filter
-    /// requires building a fresh stepper, since the source set is
-    /// fixed at construction.
+    /// The stepper fetches lazily and keeps per-source
+    /// lookahead/lookbehind buffers so the TUI can scroll forward and
+    /// backward without re-reading the whole file each time.  Filter
+    /// changes are applied via [`Stepper::set_filter`] (which retains
+    /// positions); changing the *source-id* filter requires building a
+    /// fresh stepper, since the source set is fixed at construction.
     pub fn stepper(&self, filter: Filter, cursor: &Cursor) -> Stepper {
         self.stepper_with(filter, cursor, StepperOptions::default())
     }
@@ -118,7 +114,7 @@ impl Engine {
     /// `filter`'s source-id predicates.  Used as the denominator for a
     /// progress bar over a full-file pass: a long-running operation
     /// (Summary build, search across an unmatched file) can divide its
-    /// running [`EventStream::bytes_read`] by this to drive a percentage.
+    /// running [`Stepper::walked_bytes`] by this to drive a percentage.
     /// Sources whose `byte_len()` syscall fails contribute zero — the
     /// progress will overshoot rather than fail outright, which is the
     /// less surprising behavior here.
@@ -144,247 +140,31 @@ impl Engine {
         }
         Ok(cursor)
     }
-
-    /// Returns an iterator over every event in every source that
-    /// matches `filter`.
-    ///
-    /// Sources whose ids fail the filter's source-id predicates are
-    /// skipped entirely — the engine never opens them or iterates
-    /// their events, which is the whole point of having a source-id
-    /// predicate (a regex over an absolute path can prune a multi-GB
-    /// log file before any reads).  The remaining sources' events are
-    /// interleaved by time so the caller sees the full timeline, not
-    /// one source at a time.  Each source is assumed to be locally
-    /// sorted; if a source has an out-of-order entry, a one-shot
-    /// [`SourceError::OutOfOrder`] warning for that source is emitted
-    /// *before* the offending event (and the merge continues with the
-    /// timestamps as given).  Per-line parse and I/O errors appear
-    /// inline as `Err` items, kept close to their position in the
-    /// source file rather than being slotted by time.  The filter only
-    /// applies to `Ok` items, so errors and warnings are always
-    /// surfaced regardless of the filter.
-    pub fn query_events<'a>(&'a self, filter: &'a Filter) -> EventStream<'a> {
-        let cursors = self
-            .sources
-            .iter()
-            .filter(|s| filter.matches_source_id(s.id()))
-            .map(|s| SourceCursor::new(s.as_ref()))
-            .collect();
-        EventStream { cursors, filter, records_parsed: 0 }
-    }
-}
-
-/// One-step lookahead over a single [`Source`]'s event stream, with
-/// out-of-order detection.
-///
-/// `pending` holds the next item(s) the merge will see.  Normally that
-/// is exactly one item — the head — but when an out-of-order regression
-/// is detected the cursor pushes a synthetic
-/// [`SourceError::OutOfOrder`] *before* the offending event, so the
-/// queue briefly holds two.  `last_time` is the timestamp of the most
-/// recent `Ok` event, used to detect regressions.  `out_of_order_warned`
-/// makes the warning one-shot per source: a wildly unsorted file
-/// shouldn't drown its real entries in repeated warnings.
-struct SourceCursor<'a> {
-    iter: Box<dyn Iterator<Item = (u64, Result<Event, SourceError>)> + 'a>,
-    pending: VecDeque<Result<EngineEvent, SourceError>>,
-    last_time: Option<DateTime<Utc>>,
-    /// Number of events already emitted whose `time` matches `last_time`.
-    /// Used to compute the next event's intra-time ordinal so two events
-    /// with identical timestamps still have distinct
-    /// [`LogStreamPosition`]s.  Resets to 0 whenever the timestamp
-    /// changes.
-    intra_time_count: u64,
-    source_id: SourceId,
-    out_of_order_warned: bool,
-    /// Total source bytes pulled off this source so far, including
-    /// bytes from parse-error lines and (when present) line
-    /// terminators.  Summed across cursors to drive the
-    /// [`EventStream::bytes_read`] accessor.
-    bytes_read: ByteLen,
-}
-
-impl<'a> SourceCursor<'a> {
-    fn new(source: &'a dyn Source) -> Self {
-        Self {
-            iter: source.events(),
-            pending: VecDeque::new(),
-            last_time: None,
-            intra_time_count: 0,
-            source_id: source.id().clone(),
-            out_of_order_warned: false,
-            bytes_read: ByteLen::ZERO,
-        }
-    }
-
-    /// Ensures `pending` has at least one item if the underlying
-    /// iterator hasn't been exhausted.  When the next item is an event
-    /// whose timestamp regresses, prepends a one-shot
-    /// `OutOfOrder` warning ahead of it.
-    fn fill(&mut self) {
-        if !self.pending.is_empty() {
-            return;
-        }
-        let Some((bytes, item)) = self.iter.next() else {
-            return;
-        };
-        self.bytes_read += ByteLen::from(bytes);
-        match item {
-            Err(e) => {
-                self.pending.push_back(Err(e));
-            }
-            Ok(event) => {
-                if let Some(prev) = self.last_time
-                    && event.time < prev
-                    && !self.out_of_order_warned
-                {
-                    self.pending.push_back(Err(SourceError::OutOfOrder {
-                        source_id: self.source_id.clone(),
-                        seen: event.time,
-                        last_seen: prev,
-                    }));
-                    self.out_of_order_warned = true;
-                }
-                let ordinal = if self.last_time == Some(event.time) {
-                    self.intra_time_count
-                } else {
-                    0
-                };
-                self.intra_time_count = ordinal + 1;
-                self.last_time = Some(event.time);
-                let position = LogStreamPosition::new(
-                    self.source_id.clone(),
-                    event.time,
-                    ordinal,
-                );
-                self.pending.push_back(Ok(EngineEvent { position, event }));
-            }
-        }
-    }
-
-    /// Returns the head of the cursor without consuming it.  Returns
-    /// `None` once the source is fully drained.
-    fn peek(&mut self) -> Option<&Result<EngineEvent, SourceError>> {
-        self.fill();
-        self.pending.front()
-    }
-
-    /// Consumes and returns the head of the cursor.
-    fn pop(&mut self) -> Option<Result<EngineEvent, SourceError>> {
-        self.fill();
-        self.pending.pop_front()
-    }
-}
-
-/// Streaming output of [`Engine::query_events`].
-///
-/// Wraps the per-source cursors plus the active filter, and surfaces
-/// running parse statistics that the TUI uses to render its
-/// "N records (M MiB) parsed in T..." status row.  The counters reflect
-/// what has been pulled so far; for the final totals, drain the
-/// iterator first and then read the accessors.
-///
-/// The event-level filter is applied here (errors and warnings always
-/// pass through); the source-id filter is applied at construction by
-/// only creating cursors for matching sources.
-pub struct EventStream<'a> {
-    cursors: Vec<SourceCursor<'a>>,
-    filter: &'a Filter,
-    records_parsed: u64,
-}
-
-impl<'a> EventStream<'a> {
-    /// Total number of `Ok` events produced by the underlying sources
-    /// so far, regardless of whether the active event filter accepted
-    /// them.  Counts events that came off disk and parsed cleanly —
-    /// the natural denominator for "records parsed per second".
-    pub fn records_parsed(&self) -> u64 {
-        self.records_parsed
-    }
-
-    /// Total source bytes consumed across all sources so far,
-    /// including bytes for parse-error lines and (when present) line
-    /// terminators.
-    pub fn bytes_read(&self) -> ByteLen {
-        self.cursors.iter().map(|c| c.bytes_read).sum()
-    }
-}
-
-impl<'a> Iterator for EventStream<'a> {
-    type Item = Result<EngineEvent, SourceError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = pop_next(&mut self.cursors)?;
-            if item.is_ok() {
-                self.records_parsed += 1;
-            }
-            if let Ok(ee) = &item
-                && !self.filter.matches_event(&ee.event)
-            {
-                continue;
-            }
-            return Some(item);
-        }
-    }
-}
-
-/// Pops the next item across `cursors`: error/warning heads are emitted ahead
-/// of any event head; among event heads, smallest timestamp wins; ties break by
-/// add-order.  Returns `None` once every cursor is drained.
-fn pop_next<'a>(
-    cursors: &mut [SourceCursor<'a>],
-) -> Option<Result<EngineEvent, SourceError>> {
-    let mut best: Option<usize> = None;
-    let mut best_time: Option<DateTime<Utc>> = None;
-    let mut best_is_err = false;
-
-    // Index-based loop: each iteration mutably borrows a different
-    // cursor (peek takes `&mut self`), which `iter_mut().enumerate()`
-    // can't express without splitting the slice.
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..cursors.len() {
-        // Decide based on this cursor's head, then drop the borrow so
-        // the next iteration can mutably borrow another cursor.
-        let outcome = match cursors[i].peek() {
-            None => None,
-            Some(Err(_)) => Some((true, None)),
-            Some(Ok(ev)) => Some((false, Some(ev.event.time))),
-        };
-        let Some((is_err, time)) = outcome else {
-            continue;
-        };
-        if is_err {
-            if !best_is_err {
-                best = Some(i);
-                best_is_err = true;
-            }
-            // Earlier source already wins on err-vs-err tie.
-            continue;
-        }
-        if best_is_err {
-            continue;
-        }
-        let t = time.expect("non-error head has a time");
-        if best_time.is_none_or(|bt| t < bt) {
-            best = Some(i);
-            best_time = Some(t);
-        }
-    }
-
-    let idx = best?;
-    cursors[idx].pop()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Level;
     use crate::position::ByteOffset;
-    use crate::test_fixtures::{
-        TestDir, append_bunyan, append_bunyan_at, append_raw, t,
-    };
-    use slog::{debug, error, info};
+    use crate::source::SourceError;
+    use crate::test_fixtures::{TestDir, append_bunyan, append_bunyan_at, t};
+    use slog::{error, info};
+
+    /// Drains `engine.stepper(filter, &Cursor::new())` forward and
+    /// returns the `Ok` event messages.  Used by the source-id-filter
+    /// regression tests below: they care about which events make it
+    /// past Engine-level source-id pruning, not about the stepper's
+    /// own buffering details.
+    fn forward_msgs(engine: &Engine, filter: &Filter) -> Vec<String> {
+        let mut stepper = engine.stepper(filter.clone(), &Cursor::new());
+        let mut out = Vec::new();
+        while let Some(r) = stepper.step_forward() {
+            if let Ok(event) = r.event() {
+                out.push(event.msg.clone());
+            }
+        }
+        out
+    }
 
     #[test]
     fn filtered_total_bytes_sums_byte_lens_of_matching_sources() {
@@ -426,176 +206,11 @@ mod tests {
     }
 
     #[test]
-    fn query_merges_sources_in_time_order() {
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        append_bunyan_at(&a, "x", t(10), "a1");
-        append_bunyan_at(&a, "x", t(30), "a2");
-        append_bunyan_at(&b, "x", t(20), "b1");
-        append_bunyan_at(&b, "x", t(40), "b2");
-
-        let mut engine = Engine::new();
-        let id_a = engine.add_file_source(&a).unwrap();
-        let id_b = engine.add_file_source(&b).unwrap();
-        assert_ne!(id_a, id_b);
-
-        let filter = Filter::default();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|e| e.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["a1", "b1", "a2", "b2"]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_breaks_ties_by_source_add_order() {
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        // Both events are at the same instant; the source added first
-        // should be emitted first.
-        append_bunyan_at(&a, "x", t(50), "a-tie");
-        append_bunyan_at(&b, "x", t(50), "b-tie");
-
-        let mut engine = Engine::new();
-        engine.add_file_source(&a).unwrap();
-        engine.add_file_source(&b).unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&Filter::default())
-            .map(|e| e.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["a-tie", "b-tie"]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_skips_empty_source_in_merge() {
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        // Empty source between two populated ones.
-        std::fs::File::create(&b).unwrap();
-        append_bunyan_at(&a, "x", t(10), "a1");
-        append_bunyan_at(&a, "x", t(20), "a2");
-
-        let mut engine = Engine::new();
-        engine.add_file_source(&a).unwrap();
-        engine.add_file_source(&b).unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&Filter::default())
-            .map(|e| e.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["a1", "a2"]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_keeps_errors_near_source_position() {
-        // Source A:  t=10, parse_err, t=30
-        // Source B:  t=20
-        // Expected:  A's t=10 (smallest time wins),
-        //            A's parse error (head is err -> emitted eagerly,
-        //              regardless of B's smaller-time head),
-        //            B's t=20,
-        //            A's t=30.
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        append_bunyan_at(&a, "x", t(10), "a1");
-        append_raw(&a, "not json");
-        append_bunyan_at(&a, "x", t(30), "a2");
-        append_bunyan_at(&b, "x", t(20), "b1");
-
-        let mut engine = Engine::new();
-        engine.add_file_source(&a).unwrap();
-        engine.add_file_source(&b).unwrap();
-        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
-        assert_eq!(results.len(), 4);
-        assert_eq!(results[0].as_ref().unwrap().event.msg, "a1");
-        assert!(matches!(
-            results[1].as_ref().unwrap_err(),
-            SourceError::Parse(_),
-        ));
-        assert_eq!(results[2].as_ref().unwrap().event.msg, "b1");
-        assert_eq!(results[3].as_ref().unwrap().event.msg, "a2");
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_warns_when_source_out_of_order() {
-        let dir = TestDir::new();
-        let p = dir.path().join("unsorted.log");
-        append_bunyan_at(&p, "x", t(10), "first");
-        append_bunyan_at(&p, "x", t(30), "second");
-        // Regression: t=20 follows t=30.
-        append_bunyan_at(&p, "x", t(20), "third");
-        // Another regression that should NOT trigger a second warning.
-        append_bunyan_at(&p, "x", t(15), "fourth");
-
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
-
-        // Output: first, second, [warning], third, fourth.  The warning
-        // is emitted just before the first regressing event, and only
-        // once for the source.
-        assert_eq!(results.len(), 5);
-        assert_eq!(results[0].as_ref().unwrap().event.msg, "first");
-        assert_eq!(results[1].as_ref().unwrap().event.msg, "second");
-        let warning = results[2].as_ref().unwrap_err();
-        match warning {
-            SourceError::OutOfOrder { seen, last_seen, .. } => {
-                assert_eq!(*seen, t(20));
-                assert_eq!(*last_seen, t(30));
-            }
-            other => panic!("expected OutOfOrder, got {other:?}"),
-        }
-        assert_eq!(results[3].as_ref().unwrap().event.msg, "third");
-        assert_eq!(results[4].as_ref().unwrap().event.msg, "fourth");
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_warns_independently_per_source() {
-        // Two sources, each with their own regression.  Each source
-        // should emit one warning, indexed by its own `source_id`.
-        let dir = TestDir::new();
-        let a = dir.path().join("a.log");
-        let b = dir.path().join("b.log");
-        append_bunyan_at(&a, "x", t(100), "a1");
-        append_bunyan_at(&a, "x", t(50), "a-back"); // regression
-        append_bunyan_at(&b, "x", t(200), "b1");
-        append_bunyan_at(&b, "x", t(60), "b-back"); // regression
-
-        let mut engine = Engine::new();
-        let id_a = engine.add_file_source(&a).unwrap();
-        let id_b = engine.add_file_source(&b).unwrap();
-        let results: Vec<_> = engine.query_events(&Filter::default()).collect();
-        let warnings: Vec<_> = results
-            .iter()
-            .filter_map(|r| match r {
-                Err(SourceError::OutOfOrder { source_id, .. }) => {
-                    Some(source_id.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(warnings.len(), 2);
-        assert!(warnings.contains(&id_a));
-        assert!(warnings.contains(&id_b));
-
-        dir.cleanup();
-    }
-
-    #[test]
     fn out_of_order_display_includes_source_id() {
+        // No production code path emits `SourceError::OutOfOrder`
+        // today; the variant is reserved for a future regression
+        // detector and its `Display` is what that detector would
+        // surface to the user, so we keep the format pinned here.
         let err = SourceError::OutOfOrder {
             source_id: SourceId::from("x.log".to_string()),
             seen: t(20),
@@ -607,71 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn query_preserves_levels() {
-        let dir = TestDir::new();
-        let p = dir.path().join("c.log");
-        append_bunyan(&p, "x", |log| {
-            debug!(log, "d");
-            error!(log, "e");
-        });
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-        let filter = Filter::default();
-        let levels: Vec<_> = engine
-            .query_events(&filter)
-            .map(|e| e.unwrap().event.level)
-            .collect();
-        assert_eq!(levels, vec![Level::Debug, Level::Error]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_filters_by_level() {
-        let dir = TestDir::new();
-        let p = dir.path().join("levels.log");
-        append_bunyan(&p, "x", |log| {
-            debug!(log, "d");
-            info!(log, "i");
-            error!(log, "e");
-        });
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-
-        let filter: Filter = "level>=warn".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["e"]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_filters_by_field_and_msg_regex() {
-        let dir = TestDir::new();
-        let p = dir.path().join("fields.log");
-        append_bunyan(&p, "Nexus", |log| {
-            info!(log, "blueprint executed");
-            info!(log, "boot complete");
-            info!(log, "blueprint failed");
-        });
-        let mut engine = Engine::new();
-        engine.add_file_source(&p).unwrap();
-
-        let filter: Filter = "name=Nexus msg=~blueprint".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["blueprint executed", "blueprint failed"]);
-
-        dir.cleanup();
-    }
-
-    #[test]
-    fn query_filters_by_source_id_regex() {
+    fn stepper_filters_by_source_id_regex() {
         // Two sources whose canonical paths contain different basename
         // tokens.  A `source_id=~nexus` predicate must keep nexus's
         // events and drop sled-agent's, regardless of event-level
@@ -687,18 +238,10 @@ mod tests {
         engine.add_file_source(&sled).unwrap();
 
         let filter: Filter = "source_id=~nexus".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["n1", "n2"]);
+        assert_eq!(forward_msgs(&engine, &filter), vec!["n1", "n2"]);
 
         let filter: Filter = "source_id!~nexus".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["s1"]);
+        assert_eq!(forward_msgs(&engine, &filter), vec!["s1"]);
 
         dir.cleanup();
     }
@@ -709,9 +252,9 @@ mod tests {
         // between `add_file_source` and the query) would normally
         // surface an `Io` error from its iterator.  When the source-id
         // filter rejects that source, the engine must not even
-        // construct its cursor — proven here by deleting the file
-        // after registering it: an `Io` error would only appear if the
-        // engine still tried to read it.
+        // construct a per-source window for it — proven here by
+        // deleting the file after registering it: an `Io` error would
+        // only appear if the engine still tried to read it.
         let dir = TestDir::new();
         let nexus = dir.path().join("nexus.log");
         let agent = dir.path().join("agent.log");
@@ -722,13 +265,17 @@ mod tests {
         engine.add_file_source(&agent).unwrap();
         // Delete the agent file *after* it has been registered.  A
         // naive query would now surface an Io error from the agent
-        // cursor; the regex must keep the engine from ever opening it.
+        // source; the regex must keep the engine from ever opening it.
         std::fs::remove_file(&agent).unwrap();
 
         let filter: Filter = "source_id=~nexus".parse().unwrap();
-        let results: Vec<_> = engine.query_events(&filter).collect();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].as_ref().unwrap().event.msg, "n1");
+        let mut stepper = engine.stepper(filter, &Cursor::new());
+        let mut records = Vec::new();
+        while let Some(r) = stepper.step_forward() {
+            records.push(r);
+        }
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event().as_ref().unwrap().msg, "n1");
 
         dir.cleanup();
     }
@@ -753,11 +300,7 @@ mod tests {
         engine.add_file_source(&sled).unwrap();
 
         let filter: Filter = "source_id=~nexus level>=warn".parse().unwrap();
-        let msgs: Vec<_> = engine
-            .query_events(&filter)
-            .map(|r| r.unwrap().event.msg)
-            .collect();
-        assert_eq!(msgs, vec!["n-error"]);
+        assert_eq!(forward_msgs(&engine, &filter), vec!["n-error"]);
 
         dir.cleanup();
     }

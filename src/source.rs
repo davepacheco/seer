@@ -111,6 +111,7 @@ pub enum SourceError {
         "warning: source {source_id} is not sorted by time: \
          {seen} appeared after {last_seen}"
     )]
+    // XXX-dap this is not used -- it should be
     OutOfOrder {
         source_id: SourceId,
         seen: DateTime<Utc>,
