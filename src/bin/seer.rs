@@ -946,11 +946,6 @@ struct SummaryOp {
     /// Accumulates the histogram as records flow through.  Owned across
     /// chunks; consumed by [`Self::finalize`].
     builder: SummaryBuilder,
-    /// Records folded into the builder so far (parsed successfully and
-    /// accepted by the filter).  Separate from the stepper's
-    /// `walked_bytes`, which also covers filter-rejected and
-    /// parse-failed records.
-    records: u64,
     /// Total bytes across all sources that pass the filter's source-id
     /// predicates.  Denominator of the progress bar; captured at
     /// construction since the source set is fixed for the build.
@@ -958,10 +953,6 @@ struct SummaryOp {
     /// Wall-clock start, surfaced through the finished
     /// [`ParseStats::elapsed`].
     started: Instant,
-    /// True once the stepper returns `None` — the merge is exhausted
-    /// and the next `advance` call is a no-op.  Caller polls this (via
-    /// `advance`'s return value) to know when to finalize.
-    eof: bool,
 }
 
 impl SummaryOp {
@@ -976,10 +967,8 @@ impl SummaryOp {
         Self {
             stepper,
             builder: SummaryBuilder::default(),
-            records: 0,
             total_bytes,
             started: Instant::now(),
-            eof: false,
         }
     }
 
@@ -1003,31 +992,13 @@ impl SummaryOp {
     /// every step and gives the outer wall-clock budget direct
     /// control over how much work runs per tick.
     fn advance(&mut self) -> bool {
-        if self.eof {
-            return true;
-        }
-        match self.stepper.step_forward() {
-            Some(rec) => {
-                if let Ok(event) = rec.event() {
-                    self.builder.observe(event);
-                    self.records += 1;
-                }
-                false
-            }
-            None => {
-                // `None` is ambiguous under a bounded stepper: either
-                // a real EOF, or the per-fill budget ran out before
-                // the next match was found.  Only the former is
-                // terminal — for the latter, a subsequent
-                // `step_forward` resumes the scan.
-                if self.stepper.is_exhausted(Direction::Forward) {
-                    self.eof = true;
-                    true
-                } else {
-                    false
-                }
+        while let Some(rec) = self.stepper.step_forward() {
+            if let Ok(event) = rec.event() {
+                self.builder.observe(event);
             }
         }
+
+        self.stepper.is_exhausted(Direction::Forward)
     }
 
     /// Consumes the in-progress build and returns the histogram rows.
@@ -1038,8 +1009,11 @@ impl SummaryOp {
         let walked_bytes = self.stepper.walked_bytes();
         let summary = self.builder.finish();
         let formatted = format_summary(&summary);
-        let parse_stats =
-            ParseStats { records: self.records, walked_bytes, elapsed };
+        let parse_stats = ParseStats {
+            records: self.stepper.records_parsed(),
+            walked_bytes,
+            elapsed,
+        };
         Materialized {
             events: Vec::new(),
             formatted,

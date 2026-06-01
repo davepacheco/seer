@@ -31,10 +31,10 @@
 //! `Vec<String>` shape that the regular log view uses so the TUI's
 //! viewport, search, and rendering paths can be reused unchanged.
 
-use crate::engine::Engine;
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::position::Cursor;
+use crate::{Direction, engine::Engine};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
@@ -223,14 +223,16 @@ impl TimeBucket {
 pub fn summarize(engine: &Engine, filter: &Filter) -> Summary {
     let mut stepper = engine.stepper(filter.clone(), &Cursor::new());
     let mut builder = SummaryBuilder::default();
-    // The stepper here has no per-fill records-to-scan budget, so
-    // `step_forward` returns `None` only at true EOF; we don't need
-    // to consult `is_exhausted`.
     while let Some(record) = stepper.step_forward() {
         if let Ok(event) = record.event() {
             builder.observe(event);
         }
     }
+
+    // The stepper here has no per-fill records-to-scan budget, so
+    // `step_forward` returns `None` only at true EOF.
+    assert!(stepper.is_exhausted(Direction::Forward));
+
     builder.finish()
 }
 
