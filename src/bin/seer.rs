@@ -992,7 +992,7 @@ impl SummaryOp {
     /// every step and gives the outer wall-clock budget direct
     /// control over how much work runs per tick.
     fn advance(&mut self) -> bool {
-        while let Some(rec) = self.stepper.step_forward() {
+        if let Some(rec) = self.stepper.step_forward() {
             if let Ok(event) = rec.event() {
                 self.builder.observe(event);
             }
