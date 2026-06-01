@@ -1877,6 +1877,11 @@ fn anchor_idx_in(
 
 // -----------------------------------------------------------------------------
 // XXX-dap TODO move this to src/ui
+// XXX-dap We've re-introduced some confusion of concerns here since the caller
+// still needs `viewport_top` to be able to index into the `Materialized`
+// struct's formatted records at the right spot.  I'm not sure it's wrong for it
+// to do this, in that it needs to do this for synthetic Materialized's.  But
+// it's worth thinking through the right abstractions here.
 
 pub struct Viewport {
     filter: Filter,
