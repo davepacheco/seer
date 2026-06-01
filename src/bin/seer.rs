@@ -632,15 +632,14 @@ fn run_tui(
         app.flush_if_due();
         terminal.draw(|frame| render(frame, &mut app))?;
         let poll_duration = if app.is_busy() {
-            // Long-op mode: advance one chunk per loop iteration and
-            // poll briefly for input.  The chunk size is tuned so a
-            // single advance returns in well under a frame; the
-            // zero-duration poll lets a Ctrl-C land between chunks
-            // without slowing the steady state.  Other keys are
-            // intentionally ignored — the user is waiting on the
-            // active op and surprise key reactions would race the op
-            // anyway.
-            app.do_work();
+            // Long-op mode: hand `do_work` a bounded slice of wall
+            // time and let it drain as many bounded units as fit.
+            // The zero-duration poll afterward lets a Ctrl-C land
+            // between chunks without slowing the steady state.
+            // Other keys are intentionally ignored — the user is
+            // waiting on the active op and surprise key reactions
+            // would race the op anyway.
+            app.do_work(PER_TICK_WORK_BUDGET);
             Duration::ZERO
         } else {
             Duration::from_millis(100)
@@ -671,6 +670,17 @@ impl Drop for TerminalGuard {
 /// enough to fill any reasonable terminal so the initial fetch covers
 /// the visible area; the streamview will extend further if needed.
 const INITIAL_VIEWPORT_HEIGHT: u16 = 80;
+
+/// Wall-clock budget that the main loop hands to [`App::do_work`] each time it
+/// pumps the active tab's outstanding work (summary build, viewport seek,
+/// viewport populate).  `do_work` drives one bounded unit at a time in a loop,
+/// yielding back to the event loop once this budget elapses, so a redraw and an
+/// input poll get a turn at least every `PER_TICK_WORK_BUDGET`.  Sized to keep
+/// redraw cadence above ~30 fps under sustained work while leaving enough wall
+/// time per tick that the per-iteration overhead (one ratatui repaint, one
+/// zero-timeout event poll) doesn't dominate throughput on permissive filters
+/// where each step is essentially a buffer pop.
+const PER_TICK_WORK_BUDGET: Duration = Duration::from_millis(30);
 
 /// Returns the number of visual rows a `formatted` line will occupy
 /// when wrapped at `width` columns.
@@ -2252,28 +2262,55 @@ impl App {
         }
     }
 
-    fn do_work(&mut self) {
-        let tab = self.active_tab_mut();
-
-        // Summary tabs have no viewport; they have an in-flight
-        // `SummaryOp` instead.  Advance one chunk, and if the merge
-        // is exhausted, swap the placeholder rows out for the
-        // finished histogram.
-        if let Some(op) = tab.summary_work.as_mut() {
-            if op.advance() {
-                let finished =
-                    tab.summary_work.take().expect("checked Some above");
-                tab.standalone_materialized = finished.finalize();
+    /// Drives the active tab's outstanding work forward for up to
+    /// `budget` wall-clock time.  Each iteration of the inner loop
+    /// runs one bounded unit (a `SummaryOp::advance`, or one
+    /// `Viewport::seek_work` + `populate_work` pair); the loop exits
+    /// as soon as the active tab is idle or the deadline elapses,
+    /// whichever comes first.
+    ///
+    /// The per-unit bound lives inside each unit (the stepper's
+    /// per-fill records-to-scan budget for summary; the
+    /// one-step-per-call shape for the viewport methods).  The
+    /// outer deadline gives a permissive filter — where each step
+    /// is effectively a buffer pop — enough wall time to amortize
+    /// the ratatui repaint and event poll the main loop wraps
+    /// around each `do_work` call.
+    fn do_work(&mut self, budget: Duration) {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() >= budget {
+                return;
             }
-            return;
+
+            let tab = self.active_tab_mut();
+
+            // Summary tabs have no viewport; they have an in-flight
+            // `SummaryOp` instead.  Advance one bounded step, and when
+            // the merge is exhausted, swap the placeholder rows out for
+            // the finished histogram.  Return `true` either way: if the
+            // op finished on this call, the next `do_one_unit_of_work`
+            // sees `summary_work = None` and reports idle.
+            if let Some(op) = tab.summary_work.as_mut() {
+                if op.advance() {
+                    let finished =
+                        tab.summary_work.take().expect("checked Some above");
+                    tab.standalone_materialized = finished.finalize();
+                }
+                return;
+            }
+
+            let Some(viewport) = &mut tab.viewport else {
+                return;
+            };
+
+            if matches!(viewport.status(), ViewportStatus::Idle) {
+                return;
+            }
+
+            viewport.seek_work();
+            viewport.populate_work();
         }
-
-        let Some(viewport) = &mut tab.viewport else {
-            return;
-        };
-
-        viewport.seek_work();
-        viewport.populate_work();
     }
 
     fn interrupt(&mut self) {
@@ -8792,16 +8829,16 @@ mod tests {
         );
         assert!(a.active_tab().summary_work.is_some());
         assert!(a.is_busy());
-        // Pump until the build finishes.  Each `do_work` advances a
-        // single bounded step, so the loop count is "many more than
-        // the number of records plus per-fill yields" rather than a
-        // fixed chunk multiple; the upper bound guards against
-        // pathological non-convergence.
-        for _ in 0..10_000 {
+        // Pump until the build finishes.  A generous per-tick budget
+        // lets each `do_work` call drain many bounded units, so this
+        // typically converges in a single iteration; the outer cap
+        // guards against pathological non-convergence.
+        let budget = Duration::from_secs(1);
+        for _ in 0..100 {
             if !a.is_busy() {
                 break;
             }
-            a.do_work();
+            a.do_work(budget);
         }
         assert!(!a.is_busy(), "summary build did not converge");
         assert!(a.active_tab().summary_work.is_none());
