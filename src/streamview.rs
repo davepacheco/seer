@@ -1903,7 +1903,15 @@ enum SeekDestination {
     Cursor,
     Distance(usize),
     Time(DateTime<Utc>),
-    Search(Regex, SearchAnchor),
+    Search {
+        regex: Regex,
+        search_anchor: SearchAnchor,
+        /// True iff the stepper still needs a priming `step_forward` before the
+        /// seek can start walking backward.  This is needed at the start of
+        /// backwards searches in order to make sure the seek process sees the
+        /// current record.
+        needs_step_forward: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -2029,8 +2037,19 @@ impl Viewport {
     }
 
     pub fn set_render_options(&mut self, render_options: RenderOpts) {
+        // show_extras and show_raw change the per-record line count.  An
+        // anchor pointing at one of the extras rows could end up beyond
+        // the record's new line count, so snap to line 0 of the anchor
+        // record when either knob flips.
+        let line_count_changed = render_options.show_extras
+            != self.render_options.show_extras
+            || render_options.show_raw != self.render_options.show_raw;
         self.render_options = render_options;
         self.rendered.set_render_options(render_options);
+        if line_count_changed && let Anchor::On { line, .. } = &mut self.anchor
+        {
+            *line = 0;
+        }
     }
 
     // Seeking
@@ -2162,10 +2181,25 @@ impl Viewport {
     ) {
         let stepper =
             self.rendered.stepper_at_cursor_within_window(&self.anchor_cursor);
+        // For backward search from a concrete anchor, the stepper
+        // needs a priming `step_forward` so its first `step_backward`
+        // returns the anchor record itself (rather than the record
+        // before it, which is what `anchor_cursor` would otherwise
+        // hand back).  The priming runs in `seek_work` because under
+        // a selective filter the step may exhaust its per-fill budget
+        // before surfacing a record, in which case priming has to be
+        // retried on the next tick — and `seek_work` is the only
+        // place that runs incrementally.
+        let needs_step_forward = direction == Direction::Backward
+            && matches!(self.anchor, Anchor::On { .. });
         self.start_seek(
             stepper,
             direction,
-            SeekDestination::Search(regex, search_anchor),
+            SeekDestination::Search {
+                regex,
+                search_anchor,
+                needs_step_forward,
+            },
         );
     }
 
@@ -2229,12 +2263,47 @@ impl Viewport {
             return;
         };
 
+        // When doing a backwards search from somewhere inside the anchor record,
+        // we need to move the stepper forward so that the next
+        // `step_backward()` we take will see the anchor record.  It would be
+        // tempting to just do this in `start_seek_for_search()`, but even
+        // though this is only one step, it could involve a lot of work.  In
+        // the context where that function is called, that's problematic because
+        // there will be no progress shown to the user and they won't be able to
+        // interrupt it.  But this context is built for exactly this kind of
+        // operation.
+        if let SeekDestination::Search { needs_step_forward, .. } =
+            &mut seek.seek_to
+            && *needs_step_forward
+        {
+            match seek.stepper.step_forward() {
+                Some(_) => {
+                    *needs_step_forward = false;
+                }
+                None => {
+                    if seek.stepper.is_exhausted(Direction::Forward) {
+                        // This should be impossible because the stepper ought
+                        // to have been pointed at the anchor record and the
+                        // step forward ought to have returned it.  But if this
+                        // happens, just proceed like we would have.
+                        *needs_step_forward = false;
+                    } else {
+                        // There may be more records, but we hit the per-
+                        // operation limit.  The caller will try again later.
+                        return;
+                    }
+                }
+            }
+        }
+
         // XXX-dap this could end up doing very little work
         let Some(next) = seek.stepper.step(seek.direction) else {
             if seek.stepper.is_exhausted(seek.direction) {
                 self.seek_finish(None);
             }
 
+            // There may be more records, but we hit the per-operation limit.
+            // The caller will try again later.
             return;
         };
 
@@ -2280,44 +2349,73 @@ impl Viewport {
                     self.seek_finish(Some((next, LineIdx(0))));
                 }
             }
-            SeekDestination::Search(regex, search_anchor) => {
+            SeekDestination::Search { regex, search_anchor, .. } => {
                 // Render the record so we can see if the regex matches any of
                 // the rendered text.
                 // XXX-dap is this what it was doing before?  what if it gets
                 // line-wrapped?
                 let lines = format_record(&next, &self.render_options);
 
-                // The search starts from the anchor *line*.  But since we're
-                // using a stepper(), we're always walking in units of an entire
-                // record.  That means that we started with the whole anchor
-                // record, even if the anchor line was somewhere past the start
-                // of that record.  We must skip any lines from the anchor
-                // record that are prior to the anchor line, lest we report
-                // search results in the wrong direction!
+                // Decide which lines of this record are candidates.  We work
+                // in units of an entire record, but a search is logically
+                // anchored at a particular *line*.  So if we're looking at the
+                // anchor record, then we'll limit our search to only the lines
+                // after the current anchor (for a forward search) or before it
+                // (for a backward search).  For non-anchor records, we'll look
+                // at all of the lines.
                 //
-                // If `search_anchor` says we should skip the anchor line, then
-                // we need to skip that one, too.
+                //  - Forward: the anchor record's range starts at either the
+                //    anchor line itself (`SearchAnchor::Include`) or one past
+                //    it (`SearchAnchor::Skip`).
+                //  - Backward: the anchor record's range stops at — but
+                //    excludes — the anchor line, matching the less/vim
+                //    convention that a backward search never lands on the
+                //    cursor's current line.  `SearchAnchor` does not enter
+                //    the calculation for backward direction.
+                //
+                // We then iterate that range in the search direction so a
+                // record with multiple matches returns the match closest to
+                // the user.
                 // XXX-dap TODO-test
-                let nskip = match &self.anchor {
-                    Anchor::On { key, line } => {
-                        if RecordKey::from_record(&next) == *key {
-                            assert!(*line < lines.len());
-                            match search_anchor {
-                                SearchAnchor::Include => *line,
-                                SearchAnchor::Skip => *line + 1,
-                            }
-                        } else {
-                            0
-                        }
+                let anchor_line_in_this_record = match &self.anchor {
+                    Anchor::On { key, line }
+                        if RecordKey::from_record(&next) == *key =>
+                    {
+                        Some(*line)
                     }
-                    Anchor::Empty | Anchor::PinFront | Anchor::PinBack => 0,
+                    Anchor::On { .. }
+                    | Anchor::Empty
+                    | Anchor::PinFront
+                    | Anchor::PinBack => None,
                 };
+                let (start, end) =
+                    match (seek.direction, anchor_line_in_this_record) {
+                        (Direction::Forward, Some(line)) => {
+                            assert!(line < lines.len());
+                            let s = match search_anchor {
+                                SearchAnchor::Include => line,
+                                SearchAnchor::Skip => line + 1,
+                            };
+                            (s.min(lines.len()), lines.len())
+                        }
+                        (Direction::Backward, Some(line)) => {
+                            assert!(line < lines.len());
+                            (0, line)
+                        }
+                        _ => (0, lines.len()),
+                    };
 
-                for (i, line) in lines.into_iter().skip(nskip).enumerate() {
-                    if regex.is_match(&line) {
-                        self.seek_finish(Some((next, LineIdx(i + nskip))));
-                        return;
+                let hit = match seek.direction {
+                    Direction::Forward => {
+                        (start..end).find(|&i| regex.is_match(&lines[i]))
                     }
+                    Direction::Backward => {
+                        (start..end).rev().find(|&i| regex.is_match(&lines[i]))
+                    }
+                };
+                if let Some(i) = hit {
+                    self.seek_finish(Some((next, LineIdx(i))));
+                    return;
                 }
             }
         }
