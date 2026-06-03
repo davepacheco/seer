@@ -300,6 +300,41 @@ Tradeoffs to keep in mind:
 
 ### Misc TODO
 
+Finish getting back to feature-complete with Viewport instead of Streamview:
+- document the new Viewport and related stuff
+- document design considerations that went into Viewport?  These are in
+  review/streamview.md
+- I feel like there was some reason I convinced myself that we still need
+  `viewport_top` -- oh right, it's to be able to scroll down some number of
+  lines *within* the anchor record.
+- doing a filter and then navigating immediately crashes
+- using "exclude" leaves you in select mode after selecting something to exclude
+- 'G' doesn't work
+- see all XXX-dap's
+- implement cursor_before_record() (must be needed for bookmarks)
+- fix up all tests
+- implement new tests
+  - including the "j → k → j → k → j" seek test it mentioned ("on a fixture with a mix of single-line and multi-line records")
+  - including searching with various cases: multiple matches in the anchor
+    record, searches in both directions from a line in between
+- retest all functionality (including bookmarks)
+- consider having constructing of a new Viewport copy as much of the information
+  from the previous Viewport as possible to avoid rerendering everything
+- there's likely a bug where if you apply a new filter and it matches no
+  records, then the window is unchanged.  It's not totally obvious how to fix this.  Right now, that happens because:
+  - when you apply a new filter, we re-seek to the current anchor cursor (which
+    makes sense because when you apply a new filter, we kind of have to throw
+    everything away).
+  - seeking to _anything_ replaces the window only on success.  (If you *search*
+    for something and don't find it, you don't want to replace the window.)
+  - we could have seek to cursor somehow not do this?
+    - need to make sure this is the right thing in various cases:
+      - other uses of seek_to_cursor (`g`, `G`, bookmark lookup)
+      - behaves acceptably if the user hits ^C.  I don't think that's the case
+	here?
+- re-plumb through progress and stats
+- rip out Streamview -- it should be basically unused now
+
 Polish / bugs:
 - confirmation dialog boxes need work
 - second search (e.g., by time):
@@ -317,6 +352,8 @@ Polish / bugs:
 - should look at more than just one first/last record in source in case there are SMF records
 - I think it's probably a bug that stepper() claims you can change the filter.
   WHat if it's a date filteR?  That changes the sources.
+- sources (or engine) should verify that name/hostname is consistent within a
+  file and that dates are ordered within a file
 
 Features:
 - parse SMF entries
@@ -326,5 +363,12 @@ Features:
 - 'Y' (`seer` command) should be able to show same records without reference to the session
 
 Code cleanup:
+- what are the Anchor::Pin* variants for?  Do we need them any more?
 - need to teach Claude about slog_error_chain -- see SourceError
 - need a better way to report out-of-order sources
+- split up bin/seer.rs:
+  - dialog
+  - tab
+  - rendering? input handling?
+  - sessions (belongs in library anyway)
+  - what else?
