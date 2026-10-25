@@ -1,0 +1,4 @@
+- Currently reviewing spec/core-model.md with Claude.
+  - I'm a little worried we're getting bogged down in edge cases around timestamps.  I can't tell if this is important design work or a distraction.  As usual, it feels like every time we knock out one thing, we generate two more.
+- Thought is next to write specs for Viewport and the TUI
+- Then go re-implement Viewport and TUI

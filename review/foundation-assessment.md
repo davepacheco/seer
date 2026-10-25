@@ -57,6 +57,11 @@ These gaps should be planned for.  None of them requires a redesign.
   `src/engine/merge.rs`).  In a merged view, SMF lines from one file will
   therefore appear in the wrong place.  SMF is the most important format after
   bunyan, so this needs a real design.
+- **The storage layer assumes that each record is one line.**  `scan_forward`
+  reads one line at a time, and `read_record_before` searches backward for the
+  previous newline.  Other formats, such as CockroachDB logs, have records
+  that span several lines.  Each format will need to say where its records
+  begin.  `spec/core-model.md` describes one way to do that.
 - **`Event` has the bunyan fields built into it.**  CockroachDB logs and
   syslog will need a more general record type.
 - **Seeking by time is a linear scan.**  Each file is sorted by time, so a
